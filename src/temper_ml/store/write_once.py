@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 from uuid import uuid4
 
 from temper_ml.domain.projections import ContentIdentity, HashProjection, content_identity
-from temper_ml.store.canonical_json import dumps_canonical_json, loads_canonical_json
+from temper_ml.store.canonical_json import (
+    CanonicalJsonError,
+    dumps_canonical_json,
+    loads_canonical_json,
+)
 
 
 class WriteOnceError(RuntimeError):
@@ -60,8 +65,18 @@ class WriteOnceStore:
             raise
         return WrittenRecord(identity=identity, path=path)
 
-    def read_projected_json(self, area: str, identity: ContentIdentity) -> Any:
-        return loads_canonical_json(self._immutable_path(area, identity).read_bytes())
+    def read_projected_json(
+        self, area: str, projection: HashProjection, identity: ContentIdentity
+    ) -> Mapping[str, Any]:
+        try:
+            record = loads_canonical_json(self._immutable_path(area, identity).read_bytes())
+        except CanonicalJsonError as exc:
+            raise WriteOnceCorrupt(f"immutable content is not canonical JSON: {identity}") from exc
+        if not isinstance(record, Mapping):
+            raise WriteOnceCorrupt(f"immutable content is not a JSON object: {identity}")
+        if content_identity(projection, record) != identity:
+            raise WriteOnceCorrupt(f"identity path does not match stored content: {identity}")
+        return record
 
     def write_derived_state(self, name: str, state: Mapping[str, Any]) -> Path:
         path = self.root / "derived" / _safe_relative_path(name).with_suffix(".json")
@@ -78,10 +93,12 @@ class WriteOnceStore:
 
 
 def _safe_relative_path(value: str) -> Path:
+    if value.startswith(("/", "\\")) or ":" in value:
+        raise WriteOnceError(f"absolute paths are not allowed: {value!r}")
     candidate = Path(value)
     if candidate.is_absolute():
         raise WriteOnceError(f"absolute paths are not allowed: {value!r}")
-    parts = candidate.parts
+    parts = tuple(part for chunk in value.split("/") for part in chunk.split("\\"))
     if not parts or any(part in ("", ".", "..") for part in parts):
         raise WriteOnceError(f"path traversal is not allowed: {value!r}")
-    return candidate
+    return Path(*parts)
