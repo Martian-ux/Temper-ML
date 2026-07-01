@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if ! command -v uv >/dev/null 2>&1; then
-  echo "uv is required to set up Temper ML development dependencies." >&2
-  exit 127
-fi
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-uv sync --dev
+"${PYTHON:-python}" scripts/temper-gate.py setup

@@ -1,20 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-usage() {
-  cat <<'USAGE'
-Usage: bash scripts/temper-fixture-walkthrough.sh --help
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-TML-001 provides this command target for the future deterministic fixture
-walkthrough. The walkthrough execution path is intentionally deferred until the
-fixture skeleton stage.
-USAGE
-}
-
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  usage
+if [[ $# -eq 0 || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  "${PYTHON:-python}" scripts/temper-gate.py fixture-help
   exit 0
 fi
 
-usage >&2
+"${PYTHON:-python}" scripts/temper-gate.py fixture-help >&2
 exit 2

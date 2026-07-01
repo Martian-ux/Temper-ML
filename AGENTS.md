@@ -41,7 +41,15 @@ deliberately public fixture hashes are allowed.
 
 ## Setup and Test Commands
 
-- Set up development dependencies: `bash scripts/codex-cloud-setup.sh`
-- Run repository maintenance checks: `bash scripts/codex-cloud-maintenance.sh`
-- Run unit tests: `uv run pytest tests/unit`
-- Show the fixture walkthrough command help: `bash scripts/temper-fixture-walkthrough.sh --help`
+- Primary cross-platform gate: `python scripts/temper-gate.py all`
+- Set up development dependencies: `python scripts/temper-gate.py setup`
+- Run repository maintenance checks: `python scripts/temper-gate.py maintenance`
+- Run unit tests: `python scripts/temper-gate.py unit`
+- Show the fixture walkthrough command help: `python scripts/temper-gate.py fixture-help`
+- If `uv` is missing and a temporary network bootstrap is acceptable, add
+  `--bootstrap-uv temp` before the subcommand. This installs uv only into a
+  process-local temporary directory and does not change global PATH.
+- Bash wrappers remain available for Git Bash and Linux callers:
+  `bash scripts/codex-cloud-setup.sh`,
+  `bash scripts/codex-cloud-maintenance.sh`, and
+  `bash scripts/temper-fixture-walkthrough.sh --help`.
