@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "temper-ml"
+version = "0.1.0"
+description = "Local-first model experimentation foundations for Temper ML."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Temper ML Contributors" }]
+dependencies = []
+
+[project.scripts]
+temper = "temper_ml.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0,<10.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

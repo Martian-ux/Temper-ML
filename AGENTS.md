@@ -38,3 +38,10 @@ deliberately public fixture hashes are allowed.
 ## Subagents
 
 - Do not use fast mode for subagents.
+
+## Setup and Test Commands
+
+- Set up development dependencies: `bash scripts/codex-cloud-setup.sh`
+- Run repository maintenance checks: `bash scripts/codex-cloud-maintenance.sh`
+- Run unit tests: `uv run pytest tests/unit`
+- Show the fixture walkthrough command help: `bash scripts/temper-fixture-walkthrough.sh --help`

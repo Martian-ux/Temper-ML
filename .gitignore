@@ -22,6 +22,7 @@ credentials/
 
 # Temper runtime and private project state
 .temper/
+.temper-fixture-output/
 data/
 datasets/
 models/

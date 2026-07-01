@@ -1,0 +1,1 @@
+"""Temper-owned domain primitives."""
