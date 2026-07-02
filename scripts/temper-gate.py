@@ -113,12 +113,15 @@ def run_fixture_help() -> int:
     return 0
 
 
-def run_direct_python_checks() -> int:
+def run_direct_python_checks(
+    uv_command: Sequence[str],
+    uv_env: dict[str, str] | None,
+) -> int:
     for command in (
-        ["python", "-m", "compileall", "-q", "src"],
-        ["python", "-m", "pytest", "tests/unit"],
+        ["run", "python", "-m", "compileall", "-q", "src"],
+        ["run", "python", "-m", "pytest", "tests/unit"],
     ):
-        status = run_command(command)
+        status = run_uv(command, uv_command, uv_env)
         if status != 0:
             return status
     return 0
@@ -136,7 +139,7 @@ def run_all(uv_command: Sequence[str], uv_env: dict[str, str] | None) -> int:
         lambda: run_setup(uv_command, uv_env),
         lambda: run_maintenance(uv_command, uv_env),
         run_fixture_help,
-        run_direct_python_checks,
+        lambda: run_direct_python_checks(uv_command, uv_env),
         run_diff_hygiene,
     ):
         status = gate()

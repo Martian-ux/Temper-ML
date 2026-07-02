@@ -112,6 +112,114 @@ def test_explicit_temp_bootstrap_uses_python_module_outside_repo(monkeypatch, tm
     assert str(bootstrap_dir) in calls[1]["env"]["PYTHONPATH"]
 
 
+def test_temp_bootstrap_install_failure_propagates_and_skips_uv_gates(monkeypatch, tmp_path):
+    gate = load_gate_module()
+    calls = []
+    bootstrap_dir = tmp_path / "temper-uv-bootstrap"
+
+    class FakeTemporaryDirectory:
+        def __enter__(self):
+            return str(bootstrap_dir)
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def fail_bootstrap(command, *, cwd=None, env=None):
+        calls.append({"command": command, "cwd": cwd, "env": env})
+        return subprocess.CompletedProcess(command, 23)
+
+    monkeypatch.setattr(gate.shutil, "which", lambda name: None)
+    monkeypatch.setattr(gate.tempfile, "TemporaryDirectory", lambda prefix: FakeTemporaryDirectory())
+    monkeypatch.setattr(gate.subprocess, "run", fail_bootstrap)
+
+    assert gate.main(["--bootstrap-uv", "temp", "all"]) == 23
+    assert [call["command"] for call in calls] == [
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--target",
+            str(bootstrap_dir),
+            "uv",
+        ]
+    ]
+
+
+def test_all_routes_dependency_python_checks_through_resolved_uv(monkeypatch):
+    gate = load_gate_module()
+    calls = []
+    uv_command = [sys.executable, "-m", "uv"]
+    uv_env = {"PYTHONPATH": "synthetic-bootstrap-path"}
+
+    monkeypatch.setattr(gate.shutil, "which", lambda name: "git" if name == "git" else None)
+    monkeypatch.setattr(gate.subprocess, "run", successful_run(calls))
+
+    assert gate.run_all(uv_command, uv_env) == 0
+
+    assert [call["command"] for call in calls] == [
+        [*uv_command, "sync", "--dev"],
+        [*uv_command, "run", "python", "-m", "compileall", "-q", "src"],
+        [*uv_command, "run", "pytest", "tests/unit"],
+        [*uv_command, "run", "python", "-m", "compileall", "-q", "src"],
+        [*uv_command, "run", "python", "-m", "pytest", "tests/unit"],
+        ["git", "diff", "--check"],
+    ]
+    assert [call["env"] for call in calls[:5]] == [uv_env] * 5
+
+
+def test_all_propagates_uv_failure_and_short_circuits_later_gates(monkeypatch):
+    gate = load_gate_module()
+    calls = []
+
+    def fail_maintenance_compile(command, *, cwd=None, env=None):
+        calls.append({"command": command, "cwd": cwd, "env": env})
+        status = 41 if command[1:4] == ["run", "python", "-m"] else 0
+        return subprocess.CompletedProcess(command, status)
+
+    monkeypatch.setattr(gate.shutil, "which", lambda name: name)
+    monkeypatch.setattr(gate.subprocess, "run", fail_maintenance_compile)
+
+    assert gate.main(["all"]) == 41
+    assert [call["command"] for call in calls] == [
+        ["uv", "sync", "--dev"],
+        ["uv", "run", "python", "-m", "compileall", "-q", "src"],
+    ]
+
+
+def test_all_runs_diff_hygiene_only_after_earlier_gates_succeed(monkeypatch):
+    gate = load_gate_module()
+    events = []
+
+    monkeypatch.setattr(
+        gate,
+        "run_setup",
+        lambda uv_command, uv_env: events.append("setup") or 0,
+    )
+    monkeypatch.setattr(
+        gate,
+        "run_maintenance",
+        lambda uv_command, uv_env: events.append("maintenance") or 0,
+    )
+    monkeypatch.setattr(gate, "run_fixture_help", lambda: events.append("fixture-help") or 0)
+    monkeypatch.setattr(
+        gate,
+        "run_direct_python_checks",
+        lambda uv_command, uv_env: events.append("direct-python-checks") or 0,
+    )
+    monkeypatch.setattr(gate, "run_diff_hygiene", lambda: events.append("diff-hygiene") or 0)
+
+    assert gate.run_all(["uv"], None) == 0
+    assert events == [
+        "setup",
+        "maintenance",
+        "fixture-help",
+        "direct-python-checks",
+        "diff-hygiene",
+    ]
+
+
 def test_fixture_help_does_not_spawn_bash(monkeypatch, capsys):
     gate = load_gate_module()
 
