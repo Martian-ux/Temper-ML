@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Canonical JSON fixtures are byte-level identity vectors.
+tests/fixtures/identity/*.json text eol=lf

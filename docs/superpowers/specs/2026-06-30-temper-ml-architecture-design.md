@@ -1,675 +1,395 @@
-# Temper ML Architecture and Reuse Design
+# Temper ML v1 Architecture Decisions
 
-**Status:** Approved direction, amended after unified-product architecture review, implementation not started
-**Date:** 2026-06-30
-**Repository:** `Martian-ux/Temper-ML`
+**Status:** Approved product direction, superseding the former provider-first architecture
+**Date:** 2026-07-09
+**Authority:** Product-grill decisions are the governing v1 specification.
+**Scope:** Local-first LLM adapter experimentation for one semi-technical user.
 
-## 1. Product Thesis
+This document governs v1 product boundary and design decisions. The adopted
+implementation order is the July 9 execution roadmap at
+`docs/superpowers/plans/2026-07-09-temper-ml-v1-execution-roadmap.md`; the
+July 1 plan is retained only as a historical planning reference.
 
-Temper ML is a unified, local-first browser workbench for model experimentation.
-It owns the supported visible workflow for creating projects, importing and
-validating datasets, configuring experiments and training, running jobs,
-tracking status, comparing candidates, evaluating outputs, conducting blind
-review, registering artifacts, issuing recommendations, and managing narrow
-local sweeps.
+## 1. Product Boundary
 
-Temper's central product value is rigorous, composable evaluation inside one
-coherent product. It should make it difficult to mistake a plausible-looking
-result for a demonstrated improvement, and it should not ask a normal user to
-assemble a workflow from MLflow, Optuna Dashboard, Argilla, DVC Studio,
-Axolotl, LLaMA Factory, Noah, or another external interface.
+Temper v1 is an LLM adapter experimentation product. It helps a user train,
+evaluate, compare, reproduce, retain, and select adapters without managing
+scripts, trainer dashboards, artifact folders, and informal evaluation notes.
 
-Temper owns the user experience, product workflow, canonical records, and
-evaluation evidence. External systems should normally be consumed as libraries,
-headless services, command-line engines, runtimes, or storage providers. Their
-dashboards and domain models do not define Temper's interface. Temper may
-recreate a narrow visible feature when that is simpler and more coherent than
-exposing a general-purpose external application.
+The primary workflows are:
 
-Temper owns:
+1. Create and train an adapter.
+2. Evaluate and select an adapter.
+3. Iterate reproducibly through cloning, replay, bounded experiment loops, and
+   compatible adapter merging.
 
-- projects and project policy;
-- dataset import, validation, immutable version identity, and validation
-  evidence;
-- experiment and training configuration;
-- run history, status, logs, normalized failures, interruption evidence, and
-  retry evidence;
-- native metric storage sufficient for supported workflows;
-- charts, comparison views, evaluation suites, explicit gates, and
-  recommendations;
-- blind review for the initial supported scale;
-- artifact registration and lifecycle events;
-- basic local sweep management after the single-run path is proven;
-- local execution controls and diagnostics;
-- all supported navigation and workflow pages.
+Temper v1 is not a general machine-learning platform. It does not support
+classical ML, arbitrary PyTorch programs, full-model pretraining, a general
+deployment system, a general chat client, or a hosted control plane. v1 must
+support LoRA adapters at minimum; the merge workflow is LoRA-only.
 
-Temper does not attempt complete feature parity with MLflow, DVC, Optuna,
-Argilla, Prefect, Axolotl, LLaMA Factory, Noah, or any other mature project.
+## 2. Governing Principles
 
-## 2. Chosen Approach
-
-Temper is a standalone repository and product. Noah is its first compatibility
-workflow and known-good reference system, not Temper's architectural foundation
-and not a permanent training-provider decision.
+- Temper owns the normal user workflow, project identity, dataset identity,
+  manifests, run lifecycle, metrics, artifacts, retention state, and evidence.
+- PyTorch, Transformers, PEFT, Accelerate, quantization libraries, optimizers,
+  and tokenizers provide ML machinery. They do not own Temper's product model.
+- An external trainer, tracker, or runtime is never Temper's source of truth.
+  Its IDs, files, logs, and metrics are provider evidence or external
+  references attached to Temper records.
+- Normal users never need an external dashboard to complete a supported
+  workflow. Optional integrations remain subordinate to Temper's UI and
+  records.
+- Canonical records are immutable and hash-addressed. Derived views, caches,
+  and local indexes are rebuildable conveniences.
+- Evidence and user decisions are separate. An override cannot rewrite or hide
+  the evidence that preceded it.
+- Every automated action is bounded and explainable. No v1 operation silently
+  changes a scientific intention, a project policy, or a production system.
 
 The dependency direction is:
 
-```text
-Temper UI
-  -> Temper application services
-    -> Temper domain and canonical store
-      -> Temper-owned ports
-        -> headless providers, libraries, runtimes, storage, and compatibility adapters
-```
+    Temper UI
+      -> Temper application services
+        -> Temper domain and canonical store
+          -> Temper-owned adapter runtime
+            -> PyTorch / Transformers / PEFT / Accelerate / tokenizer and quantization libraries
+          -> isolated compatibility backends and optional integrations
 
-Temper core never imports a Noah recipe, assumes Noah dataset fields, treats an
-external service as canonical, or delegates normal navigation to an external
-dashboard. A separate process does not imply a separate product experience:
-Temper may invoke a headless backend while still owning records, errors, charts,
-state, and workflow.
+## 3. Runtime Ownership and Compatibility Boundaries
 
-The GitHub repository is the canonical development source of truth. A clean
-checkout of a pushed branch or commit must contain everything required to
-understand, modify, test, and review Temper without access to a maintainer
-workstation or untracked local files.
+Temper owns the primary v1 training runtime behavior:
 
-### Integration Hierarchy
+- resolution of recipes into manifests;
+- preparation of the rendered training dataset;
+- launch, cancellation, recovery, checkpoints, retention, and ingestion;
+- lifecycle events, metrics, logs, artifact verification, and provenance; and
+- the UI and CLI behavior surrounding a run.
 
-When introducing an external project, Temper uses the least product-fragmenting
-and lowest-maintenance integration that satisfies the supported behavior:
+The runtime may call mature libraries for training, tokenization, scheduling,
+optimization, checkpoint serialization, and quantization. It captures library
+versions and resolved runtime configuration in run evidence.
 
-1. Use it as a normal library.
-2. Use a stable local API.
-3. Invoke a pinned CLI or subprocess.
-4. Extract or adapt a narrowly scoped subsystem.
-5. Maintain a full fork only when other approaches are inadequate and the
-   maintenance burden is justified.
+External trainer products may be studied or used as isolated compatibility
+backends when a measured capability gap justifies them. They are not the normal
+v1 path, cannot define the primary manifest schema, and cannot become
+authoritative for artifacts, metrics, lifecycle state, or recommendations.
 
-Provider-specific configuration remains in the provider adapter unless it
-represents a genuinely shared product concept. External dashboards may exist as
-optional developer or diagnostic tools, but they are not part of the supported
-user workflow.
+Noah may remain the first compatibility workflow and fixture source, but its
+fields, thresholds, dataset behavior, and existing trainer stay outside Temper
+core. Noah compatibility follows the generic adapter-runtime vertical slice; it
+does not gate it.
 
-### Rejected Alternatives
+## 4. Project, Task, Models, and Compatibility
 
-**Full custom rewrite:** Reimplementing trainers, tracking systems, standard
-metrics, quantization, storage engines, or inference runtimes would delay the
-product while creating maintenance work outside Temper's differentiator.
+### Project and Task Contract
 
-**Thin dashboard or launcher:** Directly exposing MLflow, DVC, trainer,
-Optuna, and annotation dashboards would fragment identity and workflow. Temper
-must present one project model and one user experience.
+A Temper project represents one adapter purpose or task, not a general lab
+folder. Its immutable project policy binds:
 
-**Noah renamed as Temper:** Noah-specific fields, evaluation assumptions,
-trainer choices, and promotion policy would leak into core and make later
-workloads expensive or misleading.
+- task definition and rendering contract;
+- evaluation policy and case suites;
+- readiness policy;
+- retention policy;
+- approved recipe families; and
+- baseline and recommendation policy.
 
-## 3. Product Boundaries
+A project may contain multiple base models. All artifacts in the project remain
+interpretable against the same primary task definition, evaluation policy,
+regression cases, confirmation suites, and readiness expectations.
 
-### Native Temper Features
+### Compatibility Groups
 
-Temper natively implements deliberately narrow versions of features central to
-its identity:
+Each base-model and adapter configuration belongs to explicit compatibility
+groups. A group records at least the base-model revision, tokenizer revision,
+chat or rendering template, adapter type, target modules, and applicable
+runtime-target constraints.
 
-| Native feature | v0.1 intent |
+Temper records relationships separately so it never infers compatibility from a
+friendly model name:
+
+- **comparable:** candidates can be evaluated against the same declared task
+  policy and compared through its objectives;
+- **merge-compatible:** adapters satisfy the required base-model, tokenizer,
+  adapter-type, target-module, and merge-method constraints;
+- **resume-compatible:** a run can safely use a retained checkpoint and its
+  exact training state; and
+- **deployment-compatible:** an artifact has passed checks for a declared
+  runtime target.
+
+### Baselines
+
+Temper supports three independent baseline concepts:
+
+- **per-model baseline:** whether an adapter improves its own base model;
+- **project champion:** whether a candidate improves the current best artifact
+  for the task under the comparison policy; and
+- **fixed reference baseline:** whether a candidate improves a stable,
+  policy-pinned project reference.
+
+Each evaluation result states which comparisons were applicable, executed,
+unavailable, or invalid because the compatibility policy did not permit them.
+
+## 5. Dataset Pipeline
+
+Temper owns a narrow, deterministic pipeline for LLM adapter training. v1
+imports JSON, JSONL, CSV, and supported Hugging Face datasets through explicit
+import adapters. It does not become a spreadsheet editor or a general dataflow
+engine.
+
+For each dataset version, Temper records:
+
+1. source descriptors and import contract;
+2. field mapping and task rendering configuration;
+3. validation results, invalid-row exclusions, and reasons;
+4. deterministic filtering and deduplication rules;
+5. token-length analysis and exact tokenizer identity;
+6. deterministic split rules and resulting membership;
+7. the exact rendered training text or a reproducible rendering projection;
+8. preview examples and summary statistics; and
+9. immutable content identity and provenance.
+
+Temper may diagnose data quality and issue correction reports. Users correct an
+authoritative source outside Temper, then reimport and compare versions.
+Unsupported transformations happen outside Temper through a strict
+import-and-provenance contract.
+
+## 6. Recipes, Hardware, Experiments, and Runs
+
+### Recipe-First Configuration
+
+Temper presents versioned recipes rather than an empty expert form. A recipe
+captures user-facing choices such as training profile, adapter size, memory
+mode, quantization, training duration, checkpoint policy, evaluation intensity,
+and retention policy.
+
+Recipe resolution produces an immutable manifest containing exact technical
+settings, including adapter targets, rank, alpha, dropout, learning rate,
+effective batch size, sequence length, optimizer, precision, gradient
+accumulation, seed, schedule, checkpoint cadence, and relevant library
+versions. Expert overrides are explicit recipe inputs, never hidden mutations.
+
+### Hardware-Aware Resolution
+
+Recipes resolve against declared machine constraints and a captured hardware
+capability profile. Before launch, Temper shows every resolved change, estimate,
+and constraint that affected it.
+
+Hardware identity belongs to a run. Hardware requirements and resolved training
+configuration belong to an experiment. Replaying on a different machine must
+not silently change an experiment. If the original manifest cannot run
+unchanged, Temper offers an assisted adaptation that creates a derived
+experiment with a visible manifest diff and an adapted-reproduction label.
+
+### Experiment and Run Semantics
+
+An experiment is immutable scientific intention: the task and project-policy
+revisions, dataset version, base-model and tokenizer identities, recipe and
+resolution, evaluation policy, compatibility group, and declared hardware
+requirements.
+
+A run is one execution attempt of an experiment. Retries after interruption
+create new runs under the same experiment. Changes to a seed, dataset version,
+adapter setting, training steps, runtime or library version, recipe resolution,
+or hardware-driven training configuration create a derived experiment.
+
+Temper supports two reproduction modes:
+
+- **strict replay:** run the original resolved manifest unchanged; and
+- **assisted adapted replay:** derive and label a new experiment when the
+  original cannot run on the available machine.
+
+Adapted results must never be presented as exact reproductions.
+
+## 7. Artifacts, Retention, and Cleanup
+
+An adapter artifact records its adapter type, content identity, base-model and
+tokenizer identities, compatibility groups, producing run, parent artifacts,
+storage locations, integrity evidence, and lineage.
+
+Full retention is the default. Canonical manifests, hashes, lifecycle events,
+final metrics, recommendation evidence, and cleanup records are retained by
+ordinary cleanup. Heavy bytes may include checkpoints, optimizer state, cached
+datasets, duplicated model files, rendered-data caches, logs, and final adapter
+files.
+
+Temper provides a cleanup menu that calculates, before deletion:
+
+- physical bytes freed after shared references;
+- retained and deleted byte classes;
+- loss of resumability, inspectability, final-adapter availability, cached
+  dataset convenience, or debugging evidence; and
+- affected runs and artifacts.
+
+Deleting heavy bytes creates immutable lifecycle events and cleanup receipts. It
+never changes a canonical manifest or falsely implies that an artifact is still
+locally available.
+
+## 8. Evaluation, Review, and Playground
+
+### Evaluation Modes and Integrity
+
+Before a run, a user selects one of: no quality evaluation, light evaluation,
+full suite, or an experiment loop. Every mode performs artifact-integrity
+validation after training: verify the artifact exists, hashes correctly, loads
+against the intended base model, has the expected structure, and has complete
+provenance. Quality evaluation is separate from integrity validation.
+
+v1 uses deterministic checks, held-out loss, task metrics, format checks,
+development cases, regression cases, confirmation cases, and recorded human
+review. v1 does not use model judges or an unexplained universal quality score.
+
+### Case Suites and Soft Sealing
+
+- **development cases** guide iteration;
+- **regression cases** prevent known failures from returning; and
+- **confirmation cases** support final validation after candidate selection.
+
+Confirmation suites are soft-sealed, not access-controlled secrets. Inspecting
+or modifying them changes their evidence state. States include sealed,
+unsealed, modified, contaminated, and retired; reports must disclose the state
+used by every recommendation.
+
+### Human Review and the Playground
+
+Structured solo review in the playground is valid v1 recommendation evidence
+when its prompts, settings, outputs, notes, ratings, and reviewer declarations
+are recorded. Formal blind packets are stronger evidence when appropriate but
+are optional. When blind review is used, Temper performs a mechanical leak audit
+and requires sealed judgments before reveal.
+
+The playground is an evaluation instrument, not a general-purpose chat client.
+It supports side-by-side comparison, synchronized prompts, optional hidden
+identities, inference controls, saved outputs, notes, ratings, prompt replay,
+and conversion of discovered failures into development or regression cases. It
+does not provide assistant memory, character chat, or a daily chat experience.
+
+## 9. Recommendations, Registry, and Readiness
+
+Recommendations are policy-based. A policy declares hard qualifiers, advisory
+metrics, optimization objectives, baseline comparisons, and readiness checks.
+Temper reports conflicting results explicitly rather than collapsing them into a
+hidden quality score.
+
+Evidence status and user decision status are distinct:
+
+| Evidence status | User decision status |
 | --- | --- |
-| Canonical records | Project, dataset, task, experiment, run, artifact, evaluation, review, registry, and sweep records |
-| Run history | Local run attempts, lifecycle events, status, retry/interruption evidence, logs, and normalized failures |
-| Metrics and charts | Metric records and chart-ready views sufficient for the supported vertical slice |
-| Candidate comparison | Baseline/candidate comparison through Temper evaluation records and UI |
-| Dataset evidence | Dataset validation, immutable version identity, source evidence, and excluded-row evidence |
-| Evaluation and gates | Eval Packs, suites, explicit gates, recommendations, and limitations |
-| Blind review | Packet identity, leak audit, sealed judgments, reveal event, and initial-scale reviewer workflow |
-| Artifact registry | Registration and lifecycle events over immutable artifact identities |
-| Local execution | Launch, cancellation, status, diagnostics, retry, and recovery evidence |
-| Basic sweeps | Explicit parameter lists, grid/random scheduling, trial queue/status/cancellation, and trial comparison |
-| Browser interface | One coherent loopback application over application services |
-
-### Reused Engines and Algorithms
-
-Temper continues to reuse difficult, mature, non-differentiating capabilities:
-
-| Capability | Likely reuse mode |
-| --- | --- |
-| PyTorch, Transformers, PEFT | Runtime/library dependency |
-| Existing quantization implementations | Runtime/library dependency |
-| Trainer runtimes including current Noah trainer, Axolotl, Unsloth, LLaMA Factory, or TRL | Headless provider behind a Temper training contract when justified |
-| Standard evaluation metrics | Library dependency or narrow adapter |
-| Optuna samplers and pruning algorithms | Hidden optimization engine only when advanced optimization is introduced |
-| Sentence-transformer or similar embedding models | Runtime/library dependency for disclosed evaluators |
-| ONNX Runtime | Runtime dependency for future compact-model execution or export |
-| Storage SDKs and database engines | Storage provider/runtime dependency |
-| Model-serving runtimes | Headless runtime behind Temper inference/evaluation ports |
-| MLflow | Optional subordinate compatibility and tracking adapter |
-
-Temper may expose its own optimization UI while using Optuna internally. It may
-expose its own training configuration while invoking a headless training
-backend. It may display its own metrics while optionally mirroring records to
-MLflow.
-
-### Noah Components That Must Remain Noah-Specific
-
-- `ai_draft` and `your_revision` field interpretation;
-- rewriting and humanization instructions;
-- public-humanizer dataset import and filtering recipes;
-- prose-only generation assumptions;
-- the fixed seven-prompt evaluation cycle;
-- fixed entity-preservation counts and thresholds;
-- adapter-strength sweep policy;
-- Noah's current default adapter and promotion policy;
-- guessed style, rating, notes, or tags in the Noah registry;
-- production mutation guards specific to the Noah application.
-
-These belong to a Noah compatibility adapter, recipe, task definition, Eval
-Pack, and project policy.
-
-## 4. Canonical Domain Model
-
-The complete vocabulary is defined now, but v0.1 implements only behavior
-exercised by the supported product slice. The vocabulary is not permission to
-create speculative modules, a public plugin marketplace, or empty adapters.
-
-### Project and ProjectPolicy
-
-A project is a stable local workspace with generated identity, display
-metadata, project policy, canonical store, and configured integration
-references. `ProjectPolicy` is an immutable, hash-addressed revision of
-decisions that affect interpretation or lifecycle, including gates, review,
-reveal, baseline, retention, and provider capability policy.
-
-### Dataset and DatasetSchema
-
-A dataset is a logical collection. Each imported state becomes an immutable
-version. A dataset version records source evidence, normalized schema, splits,
-record counts, content hashes, validator identity/configuration, validation
-results, excluded-row evidence, and provenance. Dataset version identity is
-derived from canonical metadata and content hashes, never absolute file paths.
-
-### TaskDefinition
-
-A task definition maps dataset fields into inputs, expected outputs, rendering
-rules, objectives, and required backend capabilities. Core does not assume
-prose, rewriting, or Noah source/target field names.
-
-### Experiment and Training Request
-
-An experiment is an immutable scientific intention represented by a resolved
-manifest. It binds project/policy revision, dataset and task revisions, base
-model and tokenizer identities, canonical training request, baseline/candidate
-definitions, evaluation suite revision, code/environment evidence, and requested
-optional integrations.
-
-The canonical training request contains shared product concepts only. Provider
-switches should not require rewriting project, evaluation, review, artifact, or
-registry records.
-
-### Run and Provider Evidence
-
-A run is one execution attempt of an experiment, evaluation, review, or sweep
-trial. It has immutable request and provider-request records, hash-linked
-lifecycle events, derived state, logs, normalized failures, and terminal result
-evidence. Retries create new run IDs and never overwrite prior attempts.
-
-Each training provider accepts a fully resolved canonical training request and
-returns normalized evidence:
-
-- provider identity and version;
-- exact resolved provider request;
-- code revision and environment summary;
-- dataset, base-model, and tokenizer identities;
-- training state events;
-- logs and normalized failures;
-- output artifact descriptors and hashes;
-- metrics and completion status.
-
-### ModelArtifact and Registry
-
-A model artifact is an immutable model-bearing output or reference. It records
-artifact kind, content hash or immutable upstream revision, producing run,
-parent artifacts, base-model compatibility, task/runtime compatibility,
-storage references, provenance, and creation evidence.
-
-The registry is an append-only event stream and derived view over immutable
-artifacts. Registration, recommendation, promotion, deprecation, and retirement
-are explicit lifecycle events. Registration never implies promotion.
-
-### Evaluator, EvalPack, EvaluationSuite, and Gate
-
-An evaluator is one versioned measurement instrument. An Eval Pack is an
-immutable distribution of evaluators and evidence required to interpret them.
-An evaluation suite composes Eval Pack evaluators, comparison variants,
-aggregation rules, and gates. A gate is a simple, explicit rule that returns
-`passed`, `failed`, or `inconclusive`; it performs no side effects.
-
-Suites may combine deterministic checks, standard metrics, compact evaluators,
-optional larger judges, and blind human review. Every component result is shown
-before any disclosed aggregate. Temper never presents an unexplained universal
-quality score.
-
-### HumanReview
-
-Human review records blind packet hash, item ordering, variant aliases, review
-instructions, judgments, reviewer provenance, and reveal state. Packet creation,
-leak audit, judgments, and reveal are immutable lifecycle records. Review-facing
-payloads cannot expose internal mappings before judgments are sealed.
-
-### Sweep
-
-A sweep is a Temper-owned set of trial records over a frozen experiment family.
-The initial native sweep feature supports explicit parameter lists, grid search,
-random search, trial queue, trial status, trial cancellation, and trial
-comparison through normal Temper evaluation. It does not recreate advanced
-Optuna samplers, pruning algorithms, distributed studies, or multi-objective
-optimization infrastructure. When advanced optimization becomes necessary,
-Temper may use Optuna as a hidden engine while retaining Temper-owned trial
-identities, records, UI, evaluation, and recommendations.
-
-### ExternalReference
-
-An external reference links a canonical Temper record to another system. MLflow
-run IDs, DVC revisions, trainer job IDs, lab-server handles, and similar values
-are external references only; they never replace Temper IDs or hashes.
-
-## 5. Identity and Source-of-Truth Rules
-
-Temper distinguishes logical identity, execution identity, and content
-identity:
-
-| Record | Logical/execution identity | Content identity |
-| --- | --- | --- |
-| Project | Generated `project_id` | Not applicable |
-| Project policy | Stable policy ID | Policy-revision hash |
-| Dataset | Generated `dataset_id` | Dataset-version hash |
-| Task definition | Stable task name/ID | Task-revision hash |
-| Experiment | Generated `experiment_id` | Manifest SHA-256 |
-| Run/trial | Generated attempt ID | Request, provider-request, result, and event-head hashes |
-| Model artifact | Generated `artifact_id` | Byte, bundle, or immutable upstream-revision identity |
-| Eval Pack | Stable pack ID | Pack-revision hash |
-| Evaluation suite | Stable suite ID | Suite-revision hash |
-| Evaluation execution | Generated evaluation run ID | Result hash |
-| Human review | Generated review ID | Packet, audit, judgment-set, and reveal hashes |
-| Registry | Project registry ID | Append-only event-head hash |
-| Sweep | Generated sweep ID | Frozen sweep definition hash |
-
-Every content identity names a projection version. Record schema versions and
-identity-projection versions are separate. The domain prefix prevents equal JSON
-from different record types sharing an identity accidentally.
-
-External references are metadata attached to canonical records. Temper remains
-fully inspectable and usable when an optional external service is unavailable.
-
-## 6. Canonical Local Store
-
-The v0.1 project keeps canonical metadata under `.temper/`:
-
-```text
-project.temper.json
-.temper/
-  datasets/<dataset-id>/<version-hash>/dataset.json
-  tasks/<task-id>/<revision-hash>/task.json
-  policies/<policy-id>/<revision-hash>/policy.json
-  experiments/<experiment-id>/<manifest-sha256>/manifest.json
-  experiments/<experiment-id>/index.json
-  runs/<run-id>/request.json
-  runs/<run-id>/provider-request.json
-  runs/<run-id>/result.json
-  runs/<run-id>/events/<sequence>-<event-hash>.json
-  runs/<run-id>/state.json
-  runs/<run-id>/logs/
-  artifacts/<artifact-id>/artifact.json
-  eval-packs/<pack-id>/<revision-hash>/pack.json
-  suites/<suite-id>/<revision-hash>/suite.json
-  evaluations/<evaluation-run-id>/
-  reviews/<review-id>/
-  sweeps/<sweep-id>/sweep.json
-  sweeps/<sweep-id>/trials/<trial-id>/trial.json
-  registry/events/<sequence>-<event-hash>.json
-  registry/state.json
-```
-
-Large datasets, checkpoints, and models may remain outside the metadata store.
-Canonical records reference them by content hash and storage reference. Readers
-verify hash-addressed records and bundle members. Mutable index/state files are
-derived conveniences and are never scientific evidence.
-
-## 7. Adapter and Dependency Boundaries
-
-Temper-owned ports are narrow and capability-oriented. Adapters depend on
-Temper ports; Temper domain code never depends on adapter implementations.
-Every adapter translates canonical requests into fully resolved provider
-requests and stores that translation before execution.
-
-### TrainingProvider Contract
-
-A training provider must:
-
-- describe supported task and artifact capabilities;
-- validate a canonical training request;
-- resolve a complete provider request;
-- launch, observe, cancel when supported, and recover or report interruption;
-- collect logs, metrics, artifacts, and normalized failures;
-- return typed outputs and evidence without mutating project policy or registry
-  promotion state.
-
-Provider-specific fields live in a namespaced adapter record. They do not become
-Temper domain fields unless they are genuinely shared concepts.
-
-### EvaluationBackend and InferenceRuntime
-
-Evaluation backends validate suite requirements, resolve evaluators and runtime
-requirements, launch or resume evaluation, and return typed raw results and
-provenance. Inference runtimes load content-identified artifacts and generate or
-predict through a task contract. Temper owns the visible evaluation, comparison,
-review, and inference workflow even when the runtime is external.
-
-### TrackingService and MLflow
-
-MLflow is an optional subordinate compatibility and tracking adapter. Temper
-v0.1 must not depend on the MLflow dashboard. Temper natively shows required run
-history, metrics, charts, logs, failures, evaluation summaries, artifact
-references, and recommendations. MLflow may optionally receive mirrored
-parameters, metrics, artifact references, run references, and evaluation
-summaries. Temper remains authoritative and fully usable while MLflow is stopped
-or unavailable.
-
-## 8. Noah Compatibility Boundary
-
-Noah remains the first compatibility workflow and known-good reference system.
-Temper separates the Noah workflow from any particular Noah training
-implementation.
-
-```text
-Noah workflow
-├── Dataset recipe
-├── Task definition
-├── Eval Pack
-├── Baseline and project policy
-└── Training provider
-    ├── Existing Noah Transformers/PEFT trainer
-    ├── Axolotl
-    ├── Unsloth
-    └── LLaMA Factory
-```
-
-The Noah workflow consists of:
-
-1. **Noah dataset recipe:** Recognizes Noah-compatible fields and invokes or
-   recreates the required preparation and filtering behavior.
-2. **Noah task definition:** Defines rewrite inputs, outputs, instruction
-   rendering, and model capabilities.
-3. **Noah Eval Pack:** Wraps baseline/candidate evaluation, fixed prompts,
-   entity checks, style checks, blind-review preparation, and documented
-   limitations.
-4. **Noah baseline and project policy:** Defines the frozen reference baseline,
-   recommendation thresholds, review behavior, artifact policy, and the rule
-   that v0.1 produces a recommendation without mutating Noah production.
-5. **Training provider:** Selected independently through the backend bake-off.
-
-Noah's current Transformers/PEFT trainer remains the fallback and parity
-reference unless another provider clearly performs better through measured
-evidence. It is not permanently authoritative merely because it already works.
-
-Temper stores both its canonical request and the exact provider-side
-translation. Noah-specific fields and thresholds remain confined to the Noah
-recipe, task definition, Eval Pack, adapter, and project policy.
-
-## 9. Training Backend Bake-Off and Selection Policy
-
-Before committing to the long-term default real training backend, Temper runs a
-bounded backend comparison using one frozen workload and an equivalent training
-contract.
-
-At minimum, compare:
-
-1. existing Noah Transformers/PEFT trainer;
-2. Axolotl;
-3. Unsloth Core, if the current AMD/ROCm environment supports the required
-   workflow reliably;
-4. LLaMA Factory only if setup and parity requirements remain reasonably
-   bounded.
-
-The benchmark controls, as closely as each backend permits: dataset snapshot,
-train/validation split, rendered training text, tokenizer revision, chat
-template, sequence length, LoRA target modules, LoRA rank, LoRA alpha, LoRA
-dropout, quantization mode, optimizer, learning-rate schedule, effective batch
-size, gradient accumulation, seed, optimizer steps, evaluation frequency,
-checkpoint frequency, base-model revision, and precision settings.
-
-The comparison measures: peak VRAM, host RAM, swap usage, tokens or samples per
-second, setup and model-load time, total wall time, training stability,
-validation loss, final Temper evaluation results, blind-review results when
-practical, adapter compatibility, reproducibility across repeated runs,
-cancellation behavior, recovery behavior, quality of emitted logs and evidence,
-difficulty of integration, and provider-specific code Temper must maintain.
-
-Temper must not declare a backend better based only on advertised benchmarks.
-The default provider is selected using measured performance, memory use, output
-quality, reproducibility, ROCm reliability, evidence capture, integration
-complexity, and maintenance burden. Temper may support multiple providers
-through explicit internal adapters without building a generalized public plugin
-marketplace.
-
-## 10. Compact Evaluator Models and Task-Specific Models
-
-Small, narrowly scoped model training remains a future product direction outside
-v0.1. Temper should not call this TinyML unless targeting microcontrollers or
-similarly constrained embedded systems. Preferred terms include **Compact
-Evaluator Models**, **Task-Specific Models**, and **Evaluator Studio**.
-
-Possible future use cases include style classification, tone classification,
-entity-preservation detection, hallucination-risk detection, pairwise ranking,
-quality classification, regression scoring, routing, safety classification,
-dataset filtering, and small local evaluators packaged into Eval Packs.
-
-A later workflow may define a narrow task and schema, import or label data,
-train a compact model, evaluate held-out data, calibrate thresholds, record
-intended domain and limitations, version the model as a Temper artifact, package
-it into an Eval Pack, optionally export it to ONNX or another compact format,
-and use it as one disclosed evaluator within a larger suite.
-
-Compact evaluators must not produce unexplained universal quality scores. They
-require explicit task definitions, versioned datasets, held-out evaluation,
-calibration evidence, declared limitations, maturity status, versioned artifact
-identity, and clear disclosure when used in a suite. This direction comes after
-core training, evaluation, review, registry, and the unified interface are
-proven.
-
-## 11. v0.1 Vertical Slice and Sequencing
-
-The first release supports one coherent local Temper workflow. The graphical
-workflow appears early with fixture-backed behavior before real hardware
-integrations are complete.
-
-Recommended sequence:
-
-1. Repository scaffolding and public-safe setup.
-2. Canonical identity and persistence primitives.
-3. Deterministic fixture walking skeleton.
-4. Minimal fixture-backed Temper UI.
-5. Training provider contract.
-6. Backend bake-off and parity testing.
-7. Noah compatibility contracts.
-8. Selected real training provider integration.
-9. Real evaluation, review, and inference integration.
-10. UI expansion and operational hardening.
-11. Basic sweeps.
-12. Additional providers or integrations only when justified.
-
-The early UI demonstrates create/open project, import a synthetic fixture
-dataset, validate it, freeze an experiment, launch a deterministic fixture run,
-inspect run status and metrics, compare baseline and candidate, open a
-blind-review packet, register a synthetic artifact, and view an evaluation
-recommendation. It must use application services and must never write canonical
-records directly.
-
-### v0.1 Constraints
-
-- one local user and one local project at a time;
-- Noah as the first compatibility workflow;
-- selected real training provider must earn default status through bake-off;
-- adapter artifacts only for training output;
-- one Noah Eval Pack and one blind-review flow;
-- explicit all-of gates with `passed`, `failed`, or `inconclusive` outcomes;
-- optional subordinate MLflow mirroring only;
-- local browser application served on loopback;
-- basic sweeps only after the single-run workflow is proven;
-- no cloud account or hosted control plane;
-- no generalized plugin discovery or public dynamic plugin loader;
-- no automatic production promotion;
-- no compact-model training in v0.1.
-
-## 12. Failure Handling and Recovery
-
-- Temper writes the canonical experiment manifest, run request, and resolved
-  provider request before invoking an external backend.
-- Immutable requests, provider requests, completed results, event entries, and
-  review evidence are never rewritten by later status.
-- External invocation evidence is public-safe and excludes private paths,
-  hostnames, usernames, PIDs, IP addresses, private artifact IDs, and private
-  retrieval URIs.
-- Metadata locks cover only atomic event/state transactions and are released by
-  the operating system when a process exits.
-- Startup verifies event sequence, predecessor hashes, and idempotency keys,
-  then rebuilds derived state before accepting new events.
-- Interrupted runs retain append-only events and may be marked interrupted or
-  resumed when the provider supports it.
-- Retry always creates a new run attempt.
-- Missing MLflow does not invalidate an otherwise complete canonical run.
-- Dataset, artifact, or manifest hash mismatch fails closed.
-- Invalid Eval Packs or suites fail before model execution.
-- Partial evaluation results remain diagnostic evidence but cannot satisfy a
-  gate.
-- Mechanical leak audit must pass for every reviewer-facing representation.
-- Registry writes are atomic and single-writer.
-- No failed adapter call can silently mutate project policy or production state.
-
-## 13. Deferred Integrations
-
-Integrations are added only after a demonstrated limitation. The table describes
-likely reuse mode; it does not imply Temper will expose or embed external
-dashboards.
-
-| Integration | Likely reuse mode | Justifying condition |
-| --- | --- | --- |
-| Axolotl | Headless training provider | Bake-off shows bounded setup, better capability, efficiency, or maintainability |
-| Unsloth Core | Library/headless training provider | ROCm workflow is reliable and measured results justify integration |
-| LLaMA Factory | Headless training provider | Setup and parity remain bounded and coverage materially improves the product |
-| TRL | Library/headless provider | Preference or reinforcement workflows become an approved product slice |
-| Optuna | Hidden optimization engine | Native basic sweeps become insufficient and advanced samplers/pruning are needed |
-| MLflow | Optional compatibility/tracking adapter | Mirroring helps diagnostics or interoperability without becoming authoritative |
-| DVC | Storage/lineage provider or narrow adapter | Native hashes and storage references cannot meet a proven dataset need |
-| Git LFS | Storage provider | Versioned large public files must live with repository history and costs are acceptable |
-| Pandera | Validation library | Tabular validation exceeds native schema clarity or performance |
-| Hydra | Configuration library | Configuration composition creates demonstrated duplication or unsafe overrides |
-| Hugging Face Evaluate | Metric library | A maintained metric is better reused than implemented natively |
-| lm-evaluation-harness or Lighteval | Headless evaluation engine | Standard benchmark coverage becomes a supported workflow |
-| Sentence Transformers | Runtime/library dependency | A calibrated semantic evaluator is approved |
-| Argilla or annotation platform | Optional external workflow/adapter | Native blind review cannot support required reviewer scale |
-| Prefect | Headless orchestration engine | Local execution controls become insufficient for demonstrated multi-step workloads |
-| ONNX Runtime | Runtime dependency | Compact evaluators or exported non-generative models need optimized local execution |
-| Microsoft Olive | Optimization engine | Measured deployment optimization needs exceed direct ONNX/export tooling |
-| Automatic artifact cleanup | Native lifecycle feature using storage providers | Retained bytes create observed disk pressure that explicit manual inventory cannot manage safely |
-
-Temper may recreate a narrow visible feature when doing so creates a simpler,
-more coherent product while continuing to reuse difficult algorithms and
-infrastructure underneath. A full fork is a last resort.
-
-## 14. Explicit Non-Goals
-
-v0.1 will not:
-
-- completely reimplement MLflow;
-- completely reimplement Optuna;
-- completely reimplement DVC;
-- completely reimplement Argilla;
-- completely reimplement Prefect;
-- completely reimplement Axolotl or LLaMA Factory;
-- expose a collection of linked or embedded external dashboards;
-- build a generalized plugin marketplace;
-- include a public dynamic plugin loader;
-- build a distributed orchestration platform;
-- create team accounts, billing, permissions, or a hosted control plane;
-- implement an advanced optimizer from scratch;
-- become a general annotation platform;
-- create a universal evaluator score;
-- train compact task-specific models;
-- perform automatic production promotion;
-- support every trainer, model type, task, or artifact kind;
-- commit secrets, private datasets, licensed model weights, generated
-  checkpoints, or unsuitable large binary artifacts to Git;
-- implement abstractions not exercised by a supported product slice.
-
-## 15. Repository, Cloud, and Operator Ownership
-
-The canonical remote is `https://github.com/Martian-ux/Temper-ML`. `main`
-remains the integration branch. No source, test, document, commit message, or
-fixture may encode a maintainer's local checkout path or other non-public
-machine identity.
-
-The GitHub repository contains application source, schemas, tests, small
-synthetic fixtures, documentation, handoff contracts, root setup instructions,
-pinned dependencies, repository-owned setup/maintenance scripts, and sample
-configuration with secret names but no secret values. No supported development
-or review workflow may depend on an untracked local script, absolute workstation
-path, unpushed commit, private notes, or already-configured Noah checkout.
-
-The Noah compatibility boundary is represented by versioned schemas, contract
-fixtures, and adapter tests. Real hardware validation is capability-gated and
-cannot be claimed from a cloud-only fixture run.
-
-## 16. Implementation Decomposition
-
-The bounded v0.1 plan uses a small working vertical slice over speculative
-breadth:
-
-1. Establish public-safe repository scaffolding and setup.
-2. Implement canonical identity and persistence primitives.
-3. Build a deterministic fixture walking skeleton over application services.
-4. Add the minimal fixture-backed browser UI early.
-5. Define the Temper-owned training provider contract.
-6. Run backend bake-off and parity tests.
-7. Add Noah workflow contracts and fixtures.
-8. Integrate the selected real training provider while preserving the fixture
-   path.
-9. Integrate real evaluation, review, and inference behind Temper UI.
-10. Expand UI and harden local execution, diagnostics, cancellation, retry, and
-    recovery.
-11. Add native basic sweeps.
-12. Add more providers or integrations only when a supported product slice
-    justifies them.
-
-Every file and abstraction in the implementation plan must support an
-acceptance-tested behavior in the current stage. The first milestone remains
-bounded and executable.
-
-## 17. Acceptance Criteria
-
-The architecture is successful when:
-
-- Temper remains a standalone local-first product with one coherent browser
-  workflow;
-- normal users are not required to navigate external dashboards;
-- the complete fixture flow is operable from one Temper project before real
-  hardware integrations are complete;
-- Noah remains the first compatibility workflow while its current trainer is
-  only the fallback and parity reference;
-- the selected real training provider earns its role through measured bake-off
-  evidence;
-- Temper can support multiple providers without becoming a public plugin
-  marketplace;
-- Temper remains inspectable and usable with MLflow stopped;
-- native run history, metrics, charts, comparison, review, registry, and basic
-  sweeps remain deliberately narrow;
-- mature engines and algorithms are reused behind Temper-owned records and UI;
-- compact task-specific model training is preserved for later and excluded from
-  v0.1;
-- every result traces to immutable dataset, manifest, code, model, evaluator,
-  provider, artifact, and runtime identities;
-- no Noah-specific field or fixed threshold appears in Temper core;
-- provider-specific configuration is confined to adapters;
-- interrupted or failed runs leave coherent local evidence;
-- a blind review cannot open before leak audit or reveal before judgments are
-  sealed;
-- registering an artifact does not promote it or mutate Noah production;
-- no section implies complete parity with an external tool or requires users to
-  leave Temper for normal operation.
+| passed policy | selected |
+| failed policy | rejected |
+| inconclusive | pinned |
+| unevaluated | deprecated |
+| contaminated | archived |
+| subjective-only | deployment override |
+
+Users may select or approve a warned artifact, but the override does not alter
+the evidence. Temper strongly prompts for an optional override reason and
+records it as a separate decision event.
+
+Deployment readiness is an assessment, not a deployment system. For a declared
+runtime target, Temper reports:
+
+- **ready:** required checks passed;
+- **approved by user:** user approved despite evidence warnings;
+- **not ready:** required checks failed; or
+- **unevaluated:** no readiness decision is possible.
+
+Temper v1 does not manage production runtime state, rollout, traffic, or
+production mutation.
+
+## 10. Iteration, Optimization, and Merging
+
+Manual iteration lets a user choose the next experiment. Optimized iteration
+uses a declared search space, hard qualifiers, objectives, budgets, and
+stopping conditions to select the next trial.
+
+Every automated loop has explicit limits on one or more of trial count, wall
+time, GPU time, disk budget, and stopping criteria. The loop emits normal
+experiments and runs; it cannot hide a configuration change or create an
+unbounded background process. A separate confirmation suite evaluates the
+selected candidate after the loop to reduce evaluator overfitting.
+
+The normal v1 selection policy is lexicographic:
+
+1. pass hard qualifiers;
+2. maximize the primary objective;
+3. preserve secondary objectives; and
+4. prefer smaller, faster, or cheaper candidates when quality is effectively
+   tied.
+
+Pareto views may expose real tradeoffs among qualified candidates.
+
+Adapter merging generates derived candidates and never promises improvement.
+The initial merge workflow requires LoRA adapters with the same base-model and
+tokenizer revisions, compatible target modules, integrity-verified parents, and
+a maintained merge method. The resulting artifact records immutable parent
+lineage and is evaluated against every parent before recommendation.
+
+## 11. Local Store, Recovery, and Privacy
+
+Canonical records live under a project-local .temper store. Hash-addressed
+records are immutable; lifecycle events are append-only; derived state can be
+rebuilt from events. Large bytes may live in configured local storage, but are
+referenced by verified identities and lifecycle receipts.
+
+Before invoking the runtime, Temper writes immutable experiment and resolved
+runtime-request records. It captures public-safe logs, metrics, checkpoints,
+artifact-ingestion receipts, failures, cancellation, and recovery events.
+Interrupted runs retain evidence and can be resumed only when their retained
+state is resume-compatible.
+
+Canonical records and default exports must not contain secrets, private URLs,
+local usernames, absolute paths, hostnames, process IDs, IP or MAC addresses,
+or private artifact identifiers. Optional external references remain namespaced
+and are redacted for public export.
+
+## 12. User Interface and Commands
+
+The loopback UI and CLI expose the same application services. The UI never
+writes canonical records directly. Normal navigation covers project setup,
+dataset import, recipe resolution, preflight, run control, logs, metrics,
+evaluation, playground review, recommendation, registry decisions, cleanup,
+replay, loops, merge candidates, and readiness assessment.
+
+The CLI provides inspectable equivalents for status, manifest inspection,
+verification, replay planning, cleanup planning, and fixture workflows. It is
+not a second product surface with different scientific semantics.
+
+## 13. Explicit v1 Non-Goals
+
+v1 does not:
+
+- become a general ML platform or arbitrary training-script launcher;
+- make an external trainer product the normal training path;
+- expose linked or embedded external dashboards as the normal workflow;
+- use model judges or a hidden universal quality score;
+- become a general data editor, annotation system, chat client, or deployment
+  control plane;
+- support unrestricted background optimization, distributed orchestration, or a
+  public plugin marketplace;
+- hard-lock confirmation data as a substitute for transparent evidence state;
+- automatically promote, deploy, or mutate production artifacts; or
+- commit private data, model weights, checkpoints, or private operational
+  identifiers to the public repository.
+
+## 14. v1 Acceptance Criteria
+
+The architecture is successful when a clean checkout can demonstrate a
+synthetic end-to-end project that:
+
+1. imports and freezes a deterministic LLM dataset version;
+2. resolves a versioned recipe into an inspectable manifest;
+3. runs a Temper-owned adapter-runtime fixture path with canonical evidence;
+4. verifies the resulting artifact even when quality evaluation is disabled;
+5. evaluates applicable baselines and an explicit policy;
+6. records playground or blind-review evidence with honest confidence labels;
+7. retains, inventories, and safely cleans heavy bytes without deleting
+   canonical evidence;
+8. creates strict and adapted replay plans without conflating them;
+9. runs a bounded iteration loop and evaluates its selected candidate with a
+   confirmation suite;
+10. creates and evaluates a compatible merged LoRA candidate; and
+11. records a deployment-readiness assessment without controlling deployment.
+
+Every result must trace to immutable task, dataset, recipe, manifest, runtime,
+base-model, tokenizer, evaluation-policy, artifact, and decision identities.
