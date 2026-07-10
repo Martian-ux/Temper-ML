@@ -147,7 +147,7 @@ def test_temp_bootstrap_install_failure_propagates_and_skips_uv_gates(monkeypatc
     ]
 
 
-def test_all_routes_dependency_python_checks_through_resolved_uv(monkeypatch):
+def test_all_runs_dependency_checks_once_through_resolved_uv(monkeypatch):
     gate = load_gate_module()
     calls = []
     uv_command = [sys.executable, "-m", "uv"]
@@ -162,11 +162,9 @@ def test_all_routes_dependency_python_checks_through_resolved_uv(monkeypatch):
         [*uv_command, "sync", "--dev"],
         [*uv_command, "run", "python", "-m", "compileall", "-q", "src"],
         [*uv_command, "run", "pytest", "tests/unit"],
-        [*uv_command, "run", "python", "-m", "compileall", "-q", "src"],
-        [*uv_command, "run", "python", "-m", "pytest", "tests/unit"],
         ["git", "diff", "--check"],
     ]
-    assert [call["env"] for call in calls[:5]] == [uv_env] * 5
+    assert [call["env"] for call in calls[:3]] == [uv_env] * 3
 
 
 def test_all_propagates_uv_failure_and_short_circuits_later_gates(monkeypatch):
@@ -203,11 +201,6 @@ def test_all_runs_diff_hygiene_only_after_earlier_gates_succeed(monkeypatch):
         lambda uv_command, uv_env: events.append("maintenance") or 0,
     )
     monkeypatch.setattr(gate, "run_fixture_help", lambda: events.append("fixture-help") or 0)
-    monkeypatch.setattr(
-        gate,
-        "run_direct_python_checks",
-        lambda uv_command, uv_env: events.append("direct-python-checks") or 0,
-    )
     monkeypatch.setattr(gate, "run_diff_hygiene", lambda: events.append("diff-hygiene") or 0)
 
     assert gate.run_all(["uv"], None) == 0
@@ -215,7 +208,6 @@ def test_all_runs_diff_hygiene_only_after_earlier_gates_succeed(monkeypatch):
         "setup",
         "maintenance",
         "fixture-help",
-        "direct-python-checks",
         "diff-hygiene",
     ]
 
