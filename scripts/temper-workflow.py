@@ -50,7 +50,17 @@ PUBLIC_ROUTE = {
     "mechanical_change": ("terra-medium", {"medium"}),
     "normal_implementation": ("terra-high", {"high"}),
     "protected_boundary_implementation": ("terra-high", {"high"}),
-    "technical_review": ("terra-high", {"high"}),
+    "cold_technical_review": ("terra-high", {"high"}),
+}
+AUTHORIZATION_PHASES = {
+    "PROPOSED": {"RECONCILE"},
+    "REVIEWED_WITH_CORRECTIONS": {"RECONCILE"},
+    "MAINTAINER_AUTHORIZED": {"RECONCILE", "DELIBERATE", "DECIDE", "PLAN"},
+    "IMPLEMENTATION_READY": {"PLAN", "DISPATCH"},
+    "IMPLEMENTING": {"DISPATCH", "VERIFY"},
+    "VERIFIED": {"VERIFY"},
+    "INTEGRATION_AUTHORIZED": {"INTEGRATE"},
+    "INTEGRATED": {"CLOSE"},
 }
 REQUIRED_TASK_FIELDS = {
     "task_key",
@@ -112,6 +122,43 @@ def normalized_path(value: Any) -> str:
     return path.as_posix()
 
 
+def paths_overlap(first: str, second: str) -> bool:
+    """Return whether two normalized paths are equal or share a file-tree boundary."""
+
+    return first == second or first.startswith(f"{second}/") or second.startswith(f"{first}/")
+
+
+def _identity(value: Any, exact_base: str) -> dict[str, str]:
+    value = _as_object(value, "identity")
+    kind = value.get("type")
+    base = value.get("base")
+    if kind not in {"git_commit", "patch"}:
+        raise WorkflowError("identity type must be git_commit or patch")
+    if base != exact_base:
+        raise WorkflowError("identity base does not match the authoritative base")
+    subject = "head" if kind == "git_commit" else "patch"
+    if not isinstance(value.get(subject), str) or not value[subject]:
+        raise WorkflowError(f"{kind} identity requires a non-empty {subject}")
+    return {"type": kind, "base": base, subject: value[subject]}
+
+
+def _structured_references(value: Any, label: str, task_key: str, identity: dict[str, str]) -> list[dict[str, Any]]:
+    references = _as_list(value, label)
+    if not references:
+        raise WorkflowError(f"{label} must not be empty")
+    result = []
+    for reference in references:
+        reference = _as_object(reference, label)
+        if reference.get("task_key") != task_key:
+            raise WorkflowError(f"{label} must bind the handoff task")
+        if not isinstance(reference.get("reference"), str) or not reference["reference"]:
+            raise WorkflowError(f"{label} reference is required")
+        if _identity(reference.get("identity"), identity["base"]) != identity:
+            raise WorkflowError(f"{label} identity does not match the handoff")
+        result.append(reference)
+    return result
+
+
 def validate_route(route: Any, task_class: str | None = None) -> None:
     route = _as_object(route, "route")
     selected_model = route.get("selected_model")
@@ -166,17 +213,11 @@ def validate_state(state: Any) -> dict[str, Any]:
         raise WorkflowError("unsupported or missing schema_version")
     if state.get("phase") not in PHASES:
         raise WorkflowError("unknown workflow phase")
-    if state.get("authorization_state") not in {
-        "PROPOSED",
-        "REVIEWED_WITH_CORRECTIONS",
-        "MAINTAINER_AUTHORIZED",
-        "IMPLEMENTATION_READY",
-        "IMPLEMENTING",
-        "VERIFIED",
-        "INTEGRATION_AUTHORIZED",
-        "INTEGRATED",
-    }:
+    authorization_state = state.get("authorization_state")
+    if authorization_state not in AUTHORIZATION_PHASES:
         raise WorkflowError("unknown authorization state")
+    if state["phase"] not in AUTHORIZATION_PHASES[authorization_state]:
+        raise WorkflowError("authorization state is incompatible with workflow phase")
     mission = _as_object(state.get("mission"), "mission")
     if not isinstance(mission.get("priority"), str) or not mission["priority"]:
         raise WorkflowError("active mission priority is required")
@@ -190,7 +231,7 @@ def validate_state(state: Any) -> dict[str, Any]:
         if key != validate_task(task, exact_base=repository["exact_base"])["task_key"]:
             raise WorkflowError("task registry key does not match task_key")
     ownership = _as_list(state.get("ownership"), "ownership")
-    active_paths: set[str] = set()
+    active_paths: list[str] = []
     active_keys: set[str] = set()
     for lease in ownership:
         lease = _as_object(lease, "ownership lease")
@@ -203,10 +244,10 @@ def validate_state(state: Any) -> dict[str, Any]:
             raise WorkflowError("duplicate active ownership task key")
         active_keys.add(key)
         paths = [normalized_path(path) for path in _as_list(lease.get("paths"), "ownership paths")]
-        overlap = active_paths.intersection(paths)
+        overlap = [(existing, path) for existing in active_paths for path in paths if paths_overlap(existing, path)]
         if overlap:
-            raise WorkflowError(f"active ownership path collision: {sorted(overlap)!r}")
-        active_paths.update(paths)
+            raise WorkflowError(f"active ownership path collision: {overlap!r}")
+        active_paths.extend(paths)
     workers = _as_list(state.get("workers"), "workers")
     seen_worker_refs: set[str] = set()
     for worker in workers:
@@ -259,8 +300,23 @@ def transition(state: dict[str, Any], target: str) -> dict[str, Any]:
     validate_state(state)
     if target not in ALLOWED_TRANSITIONS[state["phase"]]:
         raise WorkflowError(f"invalid transition {state['phase']} -> {target}")
+    if target == "INTEGRATE":
+        raise WorkflowError("integration transition requires maintainer integration authorization")
+    if target not in AUTHORIZATION_PHASES[state["authorization_state"]]:
+        raise WorkflowError("authorization state is incompatible with workflow phase")
     state["phase"] = target
     return {"phase": target}
+
+
+def _transition_with_authorization(state: dict[str, Any], target: str, authorization_state: str) -> None:
+    """Apply a coordinator-controlled phase and lifecycle update atomically."""
+
+    validate_state(state)
+    if target not in ALLOWED_TRANSITIONS[state["phase"]]:
+        raise WorkflowError(f"invalid transition {state['phase']} -> {target}")
+    state["phase"] = target
+    state["authorization_state"] = authorization_state
+    validate_state(state)
 
 
 def authorize(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
@@ -270,10 +326,15 @@ def authorize(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
     target = record.get("authorization_state", "MAINTAINER_AUTHORIZED")
     if target not in {"MAINTAINER_AUTHORIZED", "INTEGRATION_AUTHORIZED"}:
         raise WorkflowError("only maintainer authorization states may be granted")
-    if target == "INTEGRATION_AUTHORIZED" and state["phase"] != "INTEGRATE":
-        raise WorkflowError("integration authorization is only valid in INTEGRATE")
+    if target == "MAINTAINER_AUTHORIZED":
+        if state["phase"] != "RECONCILE" or state["authorization_state"] not in {"PROPOSED", "REVIEWED_WITH_CORRECTIONS", "MAINTAINER_AUTHORIZED"}:
+            raise WorkflowError("maintainer authorization is only valid from reconciliation")
+    else:
+        _authorize_integration(state, record)
     state["authorization_state"] = target
-    return {"authorization_state": target, "actor": "maintainer"}
+    if target == "INTEGRATION_AUTHORIZED":
+        state["phase"] = "INTEGRATE"
+    return {"authorization_state": target, "actor": "maintainer", "phase": state["phase"]}
 
 
 def register_task(state: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
@@ -281,6 +342,8 @@ def register_task(state: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]
     task = validate_task(task, exact_base=state["repository"]["exact_base"])
     if state["authorization_state"] != "MAINTAINER_AUTHORIZED":
         raise WorkflowError("authoritative state is not maintainer-authorized")
+    if state["phase"] != "RECONCILE":
+        raise WorkflowError("task registration is only valid in RECONCILE")
     key = task["task_key"]
     if key in state["tasks"]:
         raise WorkflowError("task key is already registered")
@@ -296,6 +359,8 @@ def _require_implementation_authorization(state: dict[str, Any]) -> None:
 def acquire_ownership(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
     validate_state(state)
     _require_implementation_authorization(state)
+    if state["phase"] != "PLAN":
+        raise WorkflowError("ownership acquisition is only valid in PLAN")
     key = record.get("task_key")
     task = state["tasks"].get(key)
     if task is None:
@@ -304,10 +369,14 @@ def acquire_ownership(state: dict[str, Any], record: dict[str, Any]) -> dict[str
     if set(paths) != set(task["owned_paths"]):
         raise WorkflowError("ownership paths must exactly match the task paths")
     for lease in state["ownership"]:
-        if lease.get("active") and (lease.get("task_key") == key or set(lease["paths"]).intersection(paths)):
-            raise WorkflowError("task-key or exact-path ownership collision")
+        if lease.get("active") and (
+            lease.get("task_key") == key
+            or any(paths_overlap(normalized_path(existing), path) for existing in lease["paths"] for path in paths)
+        ):
+            raise WorkflowError("task-key or path ownership collision")
     lease = {"task_key": key, "paths": paths, "active": True}
     state["ownership"].append(lease)
+    state["authorization_state"] = "IMPLEMENTATION_READY"
     return lease
 
 
@@ -341,7 +410,8 @@ def _check_writer_capacity(state: dict[str, Any], record: dict[str, Any]) -> Non
 
 def register_worker(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
     validate_state(state)
-    _require_implementation_authorization(state)
+    if state["authorization_state"] != "IMPLEMENTING" or state["phase"] != "DISPATCH":
+        raise WorkflowError("worker registration is only valid for an implementing dispatch")
     key = record.get("task_key")
     if key not in state["tasks"]:
         raise WorkflowError("worker requires a registered task")
@@ -413,12 +483,17 @@ def record_evidence(state: dict[str, Any], record: dict[str, Any]) -> dict[str, 
 
 def record_verification(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
     validate_state(state)
+    if state["phase"] != "VERIFY" or state["authorization_state"] not in {"IMPLEMENTING", "VERIFIED"}:
+        raise WorkflowError("verification recording is only valid in VERIFY")
     for name in ("subject", "command", "scope", "environment", "side_effects", "status"):
         if name not in record:
             raise WorkflowError(f"verification {name} is required")
     if record["status"] not in {"PASS", "FAIL", "UNKNOWN", "NON_REUSABLE"}:
         raise WorkflowError("unknown verification status")
+    _identity(record["subject"], state["repository"]["exact_base"])
     state["verification"].append(copy.deepcopy(record))
+    if record["status"] == "PASS":
+        state["authorization_state"] = "VERIFIED"
     return {"recorded": "verification", "count": len(state["verification"])}
 
 
@@ -428,7 +503,13 @@ def verification_reuse(record: dict[str, Any], subject: dict[str, Any], requeste
     required = ("subject", "command", "scope", "environment", "side_effects", "status")
     if any(name not in record for name in required) or record.get("status") != "PASS":
         return {"reusable": False, "status": "NON_REUSABLE"}
-    if record["subject"] != subject or record.get("invalidated"):
+    try:
+        exact_base = subject.get("base")
+        if not isinstance(exact_base, str) or _identity(subject, exact_base) != _identity(record["subject"], exact_base):
+            return {"reusable": False, "status": "NON_REUSABLE"}
+    except WorkflowError:
+        return {"reusable": False, "status": "NON_REUSABLE"}
+    if record.get("invalidated"):
         return {"reusable": False, "status": "NON_REUSABLE"}
     if not isinstance(requested, dict) or any(
         name not in requested or record[name] != requested[name]
@@ -471,6 +552,8 @@ def compile_context(state: dict[str, Any]) -> dict[str, Any]:
 
 def ingest_handoff(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
     validate_state(state)
+    if state["phase"] != "DISPATCH" or state["authorization_state"] != "IMPLEMENTING":
+        raise WorkflowError("handoff ingestion is only valid in an implementing dispatch")
     key = record.get("task_key")
     task = state["tasks"].get(key)
     if task is None:
@@ -486,9 +569,21 @@ def ingest_handoff(state: dict[str, Any], record: dict[str, Any]) -> dict[str, A
     changed = [normalized_path(path) for path in _as_list(record.get("changed_paths"), "changed_paths")]
     if not set(changed).issubset(task["owned_paths"]):
         raise WorkflowError("handoff changed paths exceed task ownership")
-    for name in ("identity", "route", "acceptance_evidence", "verification", "scope_safety", "open_findings", "integration_guidance"):
+    for name in ("identity", "route", "acceptance_evidence", "verification", "applied_decisions", "verification_references", "scope_safety", "open_findings", "integration_guidance"):
         if name not in record:
             raise WorkflowError(f"handoff {name} is required")
+    identity = _identity(record["identity"], state["repository"]["exact_base"])
+    applied_decisions = _structured_references(record["applied_decisions"], "handoff applied_decisions", key, identity)
+    verification_references = _structured_references(record["verification_references"], "handoff verification_references", key, identity)
+    for decision in applied_decisions:
+        if not any(
+            evidence.get("kind") == "decision"
+            and evidence.get("task_key") == key
+            and evidence.get("reference") == decision["reference"]
+            and evidence.get("subject") == identity
+            for evidence in state["evidence"]
+        ):
+            raise WorkflowError("handoff applied decision is not an authoritative task decision")
     if not _as_list(record["acceptance_evidence"], "handoff acceptance_evidence"):
         raise WorkflowError("handoff acceptance_evidence must not be empty")
     if not _as_list(record["verification"], "handoff verification"):
@@ -497,7 +592,11 @@ def ingest_handoff(state: dict[str, Any], record: dict[str, Any]) -> dict[str, A
     if any(record["route"].get(field) != task["route"].get(field) for field in ("selected_model", "selected_effort")):
         raise WorkflowError("handoff selected route does not match its task")
     worker["status"] = "COMPLETE"
-    state["handoffs"].append(copy.deepcopy(record))
+    stored = copy.deepcopy(record)
+    stored["identity"] = identity
+    stored["applied_decisions"] = applied_decisions
+    stored["verification_references"] = verification_references
+    state["handoffs"].append(stored)
     if state["phase"] == "DISPATCH":
         transition(state, "VERIFY")
     return {"task_key": key, "worker_reference": worker_reference, "ingested": True}
@@ -516,7 +615,7 @@ def review_required(task: dict[str, Any], triggers: list[str]) -> dict[str, Any]
 
 
 def next_action(state: dict[str, Any]) -> str:
-    if state["authorization_state"] != "MAINTAINER_AUTHORIZED" and state["phase"] != "INTEGRATE":
+    if state["authorization_state"] in {"PROPOSED", "REVIEWED_WITH_CORRECTIONS"}:
         return "STOP_FOR_MAINTAINER_AUTHORIZATION"
     if any(worker.get("status") == "SPAWN_UNKNOWN" for worker in state["workers"]):
         return "RECONCILE_AMBIGUOUS_SPAWN"
@@ -576,13 +675,52 @@ def _integration_evidence(
     }
 
 
+def _matching_handoff_verification(handoff: dict[str, Any], verification: dict[str, Any]) -> bool:
+    reference = verification.get("reference")
+    return any(
+        item.get("reference") == reference
+        and item.get("task_key") == handoff["task_key"]
+        and item.get("identity") == handoff["identity"]
+        for item in handoff.get("verification_references", [])
+    )
+
+
+def _authorize_integration(state: dict[str, Any], record: dict[str, Any]) -> None:
+    if state["phase"] != "VERIFY" or state["authorization_state"] != "VERIFIED":
+        raise WorkflowError("integration authorization requires a verified candidate in VERIFY")
+    key = record.get("task_key")
+    if key not in state["tasks"]:
+        raise WorkflowError("integration authorization requires a registered task_key")
+    handoff = _latest_handoff(state, key)
+    if handoff is None:
+        raise WorkflowError("integration authorization requires a completed handoff")
+    identity = _identity(record.get("identity"), state["repository"]["exact_base"])
+    if identity != handoff["identity"]:
+        raise WorkflowError("integration authorization identity does not match the handoff")
+    decision = _as_object(record.get("applied_decision"), "applied_decision")
+    if decision not in handoff["applied_decisions"]:
+        raise WorkflowError("integration authorization requires a matching applied decision")
+    reference = record.get("verification_reference")
+    if not isinstance(reference, str) or not reference:
+        raise WorkflowError("integration authorization requires a verification reference")
+    verification = next((item for item in reversed(state["verification"]) if item.get("reference") == reference), None)
+    if verification is None or not _matching_handoff_verification(handoff, verification):
+        raise WorkflowError("integration authorization requires a handoff-bound verification reference")
+    requested = record.get("verification_request")
+    if verification_reuse(verification, identity, requested)["reusable"] is not True:
+        raise WorkflowError("integration authorization requires a matching reusable PASS verification")
+    review = _review_for_task(state, key)
+    if review is not None and (review.get("status") != "PASS" or review.get("subject") != identity):
+        raise WorkflowError("integration authorization requires a passing review of the exact subject")
+
+
 def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
     validate_state(state)
     if state["phase"] == "INTEGRATE":
         return _advance_result(state, advanced=False, next_step="AWAIT_MAINTAINER_INTEGRATION_AUTHORIZATION", transitions=[])
     if state["phase"] == "CLOSE":
         return _advance_result(state, advanced=False, next_step="STOP", transitions=[])
-    if state["authorization_state"] != "MAINTAINER_AUTHORIZED":
+    if state["authorization_state"] not in {"MAINTAINER_AUTHORIZED", "IMPLEMENTATION_READY", "IMPLEMENTING", "VERIFIED"}:
         return _advance_result(state, advanced=False, next_step="STOP_FOR_MAINTAINER_AUTHORIZATION", transitions=[])
     if any(worker.get("status") == "SPAWN_UNKNOWN" for worker in state["workers"]):
         return _advance_result(state, advanced=False, next_step="RECONCILE_AMBIGUOUS_SPAWN", transitions=[])
@@ -600,7 +738,8 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
         transitions.append(target)
 
     if state["phase"] == "PLAN":
-        _require_implementation_authorization(state)
+        if state["authorization_state"] != "IMPLEMENTATION_READY":
+            return _advance_result(state, advanced=False, next_step="ACQUIRE_REQUIRED_OWNERSHIP", transitions=transitions)
         if not any(lease.get("active") and lease.get("task_key") == key for lease in state["ownership"]):
             raise WorkflowError("dispatch requires an active ownership lease")
         if any(worker.get("task_key") == key and worker.get("status") in ACTIVE_WORKER_STATES for worker in state["workers"]):
@@ -619,6 +758,7 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
             raise WorkflowError("manual dispatch intent already exists")
         state["workers"].append(intent)
         transition(state, "DISPATCH")
+        state["authorization_state"] = "IMPLEMENTING"
         transitions.append("DISPATCH")
         return _advance_result(
             state,
@@ -644,6 +784,10 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
             transitions=transitions,
             verification_subject=copy.deepcopy(subject),
         )
+    if state["authorization_state"] != "VERIFIED":
+        return _advance_result(state, advanced=False, next_step="RUN_OR_RECORD_REQUIRED_VERIFICATION", transitions=transitions)
+    if not _matching_handoff_verification(handoff, reusable_verification):
+        return _advance_result(state, advanced=False, next_step="RUN_OR_RECORD_REQUIRED_VERIFICATION", transitions=transitions)
     triggers = record.get("review_triggers", [])
     if not isinstance(triggers, list) or not all(isinstance(trigger, str) for trigger in triggers):
         raise WorkflowError("review_triggers must be a JSON array of strings")
@@ -678,18 +822,16 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
                     return _advance_result(state, advanced=False, next_step="REPAIR_LIMIT_REACHED", transitions=transitions)
                 review["repair_cycles"] = 1
                 review["status"] = "REPAIR_IN_PROGRESS"
-                transition(state, "PLAN")
+                _transition_with_authorization(state, "PLAN", "MAINTAINER_AUTHORIZED")
                 transitions.append("PLAN")
                 return _advance_result(state, advanced=True, next_step="REPAIR_CYCLE_PERMITTED", transitions=transitions, review_packet=copy.deepcopy(review))
             else:
                 raise WorkflowError("review_status must be PASS or REPAIR_REQUIRED")
         if review["status"] != "PASS":
             return _advance_result(state, advanced=False, next_step="AWAIT_COLD_REVIEW", transitions=transitions, review_packet=copy.deepcopy(review))
-    transition(state, "INTEGRATE")
-    transitions.append("INTEGRATE")
     return _advance_result(
         state,
-        advanced=True,
+        advanced=False,
         next_step="AWAIT_MAINTAINER_INTEGRATION_AUTHORIZATION",
         transitions=transitions,
         integration_evidence=_integration_evidence(key, handoff, reusable_verification, review),
