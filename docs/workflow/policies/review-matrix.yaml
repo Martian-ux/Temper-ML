@@ -1,0 +1,35 @@
+phase1_public_review_rows:
+  routine_administration:
+    default: no_independent_review
+    required_evidence: [read_only_identity_checks, classification_check]
+    elevate_when: [public_safety, accepted_authority_change, conflicting_evidence]
+    elevated_route: terra_high_cold
+  mechanical_change:
+    default: no_independent_review
+    required_evidence: [targeted_diff_check, targeted_tool_check]
+    elevate_when: [public_boundary_touched, semantic_change_detected, weak_evidence]
+    elevated_route: terra_high_cold
+  normal_implementation:
+    default: no_independent_review_when_low_risk_and_well_verified
+    required_evidence: [strong_targeted_verification, exact_base_and_head_or_patch, clear_acceptance]
+    elevate_when: [cross_domain_effects, weak_acceptance_evidence, compatibility, dependency_change, public_repository_safety, irreversible_effects, integration_uncertainty, conflicting_evidence, maintainer_requirement]
+    elevated_route: terra_high_cold
+  cold_technical_review:
+    default: one_cold_terra_high_when_triggered
+    required_evidence: [exact_subject_identity, rubric, evidence_refs, no_write_ownership]
+    elevate_when: [one_concrete_unresolved_finding_after_review]
+    elevated_route: bounded_second_perspective_only
+  maintainer_decision_gate:
+    default: maintainer_gate
+    required_evidence: [decision_delta, constraints, verified_evidence, viable_options_when_needed]
+    elevate_when: [authority_or_risk_acceptance_required]
+    elevated_route: maintainer
+phase1_multiplicity_policy:
+  one_review_subject_identity: exact_base_plus_head_or_stable_patch_identity
+  multiple_triggers: strengthen_one_rubric_without_creating_another_reviewer
+  default_reviewer_count: 1
+  protected_boundary_review: exactly_one_cold_terra_high
+  second_reviewer_requires: [one_specific_unresolved_finding, recorded_reason_for_independent_perspective]
+  automatic_stacking: prohibited
+  public_rule: "Reviewers and model perspectives do not stack automatically. Unexercised premium or diversity review routes remain private."
+  file_count_alone_triggers_review: false
