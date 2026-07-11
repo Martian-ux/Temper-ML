@@ -10,8 +10,13 @@ def test_layout_separates_immutable_events_and_records_from_mutable_state(
 ) -> None:
     layout = StoreLayout(tmp_path)
 
-    assert layout.run_events("run-1") == tmp_path / ".temper" / "runs" / "run-1" / "events"
-    assert layout.run_state("run-1") == tmp_path / ".temper" / "runs" / "run-1" / "state.json"
+    assert (
+        layout.run_events("run-1") == tmp_path / ".temper" / "runs" / "run-1" / "events"
+    )
+    assert (
+        layout.run_state("run-1")
+        == tmp_path / ".temper" / "runs" / "run-1" / "state.json"
+    )
     assert layout.registry_events() == tmp_path / ".temper" / "registry" / "events"
     assert layout.registry_state() == tmp_path / ".temper" / "registry" / "state.json"
     assert layout.artifact_record("artifact-1") == (

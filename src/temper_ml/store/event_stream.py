@@ -11,7 +11,11 @@ import re
 from typing import Any, Iterator, TypeVar
 from uuid import uuid4
 
-from temper_ml.domain.projections import ContentIdentity, HashProjection, content_identity
+from temper_ml.domain.projections import (
+    ContentIdentity,
+    HashProjection,
+    content_identity,
+)
 from temper_ml.store.canonical_json import (
     CanonicalJsonError,
     dumps_canonical_json,
@@ -103,7 +107,8 @@ class EventStream:
                 if dumps_canonical_json(event.request_fields()) == requested:
                     return event
                 raise EventConflict(
-                    f"idempotency key conflicts with existing event: {request.idempotency_key!r}"
+                    "idempotency key conflicts with existing event: "
+                    f"{request.idempotency_key!r}"
                 )
 
             sequence = len(events) + 1
@@ -140,7 +145,9 @@ class EventStream:
             if path.name.startswith(".") and path.name.endswith(".tmp"):
                 continue
             if path.is_symlink() or not path.is_file() or path.suffix != ".json":
-                raise EventStreamCorrupt(f"unexpected event stream entry: {path.name!r}")
+                raise EventStreamCorrupt(
+                    f"unexpected event stream entry: {path.name!r}"
+                )
             paths.append(path)
         paths.sort()
         events: list[StoredEvent] = []
@@ -157,13 +164,19 @@ class EventStream:
             except (OSError, CanonicalJsonError, UnicodeError) as exc:
                 raise EventStreamCorrupt(f"invalid event content: {path.name}") from exc
             if not isinstance(envelope, dict):
-                raise EventStreamCorrupt(f"event envelope is not an object: {path.name}")
+                raise EventStreamCorrupt(
+                    f"event envelope is not an object: {path.name}"
+                )
             _validate_envelope(envelope, path.name)
             sequence = envelope["sequence"]
             if sequence != expected_sequence or filename_sequence != sequence:
-                raise EventStreamCorrupt(f"event sequence is not contiguous: {path.name}")
+                raise EventStreamCorrupt(
+                    f"event sequence is not contiguous: {path.name}"
+                )
             if envelope["predecessor_hash"] != predecessor:
-                raise EventStreamCorrupt(f"event predecessor link mismatch: {path.name}")
+                raise EventStreamCorrupt(
+                    f"event predecessor link mismatch: {path.name}"
+                )
             key = envelope["idempotency_key"]
             if key in seen_keys:
                 raise EventStreamCorrupt(f"duplicate event idempotency key: {key!r}")
@@ -243,11 +256,11 @@ def _metadata_lock(path: Path) -> Iterator[None]:
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
             try:
                 yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:

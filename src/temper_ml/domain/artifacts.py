@@ -9,7 +9,11 @@ from pathlib import Path, PurePosixPath
 import stat
 from typing import Iterable
 
-from temper_ml.domain.projections import ContentIdentity, HashProjection, content_identity
+from temper_ml.domain.projections import (
+    ContentIdentity,
+    HashProjection,
+    content_identity,
+)
 
 BUNDLE_PROJECTION = HashProjection("artifact.bundle", "v1")
 BUNDLE_SCHEMA_VERSION = "v1"
@@ -61,7 +65,9 @@ def byte_identity(data: bytes) -> ContentIdentity:
     return ContentIdentity("sha256", hashlib.sha256(data).hexdigest())
 
 
-def file_identity(path: Path | str, *, chunk_size: int = 1024 * 1024) -> ContentIdentity:
+def file_identity(
+    path: Path | str, *, chunk_size: int = 1024 * 1024
+) -> ContentIdentity:
     """Stream a regular file into SHA-256 using bounded memory."""
 
     if chunk_size <= 0:
@@ -71,7 +77,9 @@ def file_identity(path: Path | str, *, chunk_size: int = 1024 * 1024) -> Content
     if stat.S_ISLNK(mode):
         raise ArtifactError(f"artifact member is a symlink: {candidate.name!r}")
     if not stat.S_ISREG(mode):
-        raise ArtifactError(f"artifact member is not a regular file: {candidate.name!r}")
+        raise ArtifactError(
+            f"artifact member is not a regular file: {candidate.name!r}"
+        )
     digest = hashlib.sha256()
     with candidate.open("rb") as handle:
         while chunk := handle.read(chunk_size):
@@ -88,8 +96,10 @@ def build_bundle_manifest(
     if bundle_root.is_symlink() or not bundle_root.is_dir():
         raise ArtifactError("bundle root must be a non-symlink directory")
 
-    explicit = member_paths is not None
-    raw_paths = list(member_paths) if explicit else _enumerated_paths(bundle_root)
+    if member_paths is None:
+        raw_paths = _enumerated_paths(bundle_root)
+    else:
+        raw_paths = list(member_paths)
     normalized: list[str] = []
     seen: set[str] = set()
     for raw_path in raw_paths:
@@ -147,11 +157,15 @@ def _validate_member_path(value: str) -> str:
     if not isinstance(value, str) or not value:
         raise ArtifactError("bundle member path must be a non-empty string")
     if "\\" in value:
-        raise ArtifactError(f"backslashes are not allowed in bundle member paths: {value!r}")
+        raise ArtifactError(
+            f"backslashes are not allowed in bundle member paths: {value!r}"
+        )
     if value.startswith("/") or os.path.isabs(value):
         raise ArtifactError(f"absolute bundle member paths are not allowed: {value!r}")
     if len(value) >= 2 and value[1] == ":":
-        raise ArtifactError(f"drive-qualified bundle member paths are not allowed: {value!r}")
+        raise ArtifactError(
+            f"drive-qualified bundle member paths are not allowed: {value!r}"
+        )
     path = PurePosixPath(value)
     if path.is_absolute() or any(part in ("", ".", "..") for part in value.split("/")):
         raise ArtifactError(f"unsafe bundle member path: {value!r}")

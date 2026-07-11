@@ -25,7 +25,9 @@ def test_incomplete_temporary_files_are_ignored(tmp_path: Path) -> None:
 def test_unrecognized_non_temporary_entry_fails_closed(tmp_path: Path) -> None:
     stream = EventStream(tmp_path / "events")
     stream.append(EventRequest("one", "created", {}))
-    (stream.directory / "unrecognized.partial").write_bytes(b"not a Temper temporary file")
+    (stream.directory / "unrecognized.partial").write_bytes(
+        b"not a Temper temporary file"
+    )
 
     with pytest.raises(EventStreamCorrupt, match="unexpected"):
         stream.read_verified()
@@ -35,7 +37,11 @@ def test_sequence_gap_fails_closed(tmp_path: Path) -> None:
     stream = EventStream(tmp_path / "events")
     stream.append(EventRequest("one", "created", {}))
     second = stream.append(EventRequest("two", "updated", {}))
-    second.path.rename(second.path.with_name(second.path.name.replace("00000000000000000002", "00000000000000000003")))
+    second.path.rename(
+        second.path.with_name(
+            second.path.name.replace("00000000000000000002", "00000000000000000003")
+        )
+    )
 
     with pytest.raises(EventStreamCorrupt, match="sequence"):
         stream.read_verified()

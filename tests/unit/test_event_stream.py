@@ -38,8 +38,6 @@ def test_rebuild_reduces_only_verified_events(tmp_path: Path) -> None:
     stream.append(EventRequest("one", "counter.added", {"amount": 2}))
     stream.append(EventRequest("two", "counter.added", {"amount": 3}))
 
-    result = stream.rebuild(
-        0, lambda state, event: state + event.payload["amount"]
-    )
+    result = stream.rebuild(0, lambda state, event: state + event.payload["amount"])
 
     assert result == 5
