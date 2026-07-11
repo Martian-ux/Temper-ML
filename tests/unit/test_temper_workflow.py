@@ -41,7 +41,12 @@ def task(key="task-one", paths=None, task_class="normal_implementation"):
         "verification": ["unit test"],
         "review": ["matrix"],
         "review_triggers": [],
-        "route": {"selected_model": "terra-high", "selected_effort": "high", "observed_model": "UNVERIFIED", "observed_effort": "UNVERIFIED"},
+        "route": {
+            "selected_model": "terra-high",
+            "selected_effort": "high",
+            "observed_model": "UNVERIFIED",
+            "observed_effort": "UNVERIFIED",
+        },
         "stop_conditions": ["scope drift"],
         "authorization_state": "MAINTAINER_AUTHORIZED",
         "classification": "protected_boundary_implementation",
@@ -63,23 +68,46 @@ def task(key="task-one", paths=None, task_class="normal_implementation"):
 
 
 def verification_request():
-    return {"command": ["python", "-m", "pytest"], "scope": ["tests/unit"], "environment": {"lock": "committed"}, "side_effects": []}
+    return {
+        "command": ["python", "-m", "pytest"],
+        "scope": ["tests/unit"],
+        "environment": {"lock": "committed"},
+        "side_effects": [],
+    }
 
 
 def final_gate_request():
-    return {"command": ["python", "scripts/temper-gate.py", "all"], "scope": ["repository"], "environment": {"lock": "committed"}, "side_effects": []}
+    return {
+        "command": ["python", "scripts/temper-gate.py", "all"],
+        "scope": ["repository"],
+        "environment": {"lock": "committed"},
+        "side_effects": [],
+    }
 
 
 def verification_record(subject=IDENTITY, key="task-one", **extra):
-    value = {"task_key": key, "reference": "verification:unit", "subject": subject, **verification_request(), "status": "PASS"}
+    value = {
+        "task_key": key,
+        "reference": "verification:unit",
+        "subject": subject,
+        **verification_request(),
+        "status": "PASS",
+    }
     value.update(extra)
     return value
 
 
 def decision(key="task-one", identity=IDENTITY):
     return {
-        "kind": "decision", "task_key": key, "reference": "decision:task-one", "subject": identity,
-        "authoritative_provenance": {"task_key": key, "subject": identity, "authority_reference": f"authority:{key}"},
+        "kind": "decision",
+        "task_key": key,
+        "reference": "decision:task-one",
+        "subject": identity,
+        "authoritative_provenance": {
+            "task_key": key,
+            "subject": identity,
+            "authority_reference": f"authority:{key}",
+        },
     }
 
 
@@ -92,8 +120,17 @@ def handoff(key="task-one", worker_reference="writer-one", identity=IDENTITY, **
         "route": {"selected_model": "terra-high", "selected_effort": "high"},
         "acceptance_evidence": ["focused test"],
         "verification": ["unit test"],
-        "applied_decisions": [{"task_key": key, "reference": "decision:task-one", "identity": identity}],
-        "verification_references": [{"task_key": key, "reference": "verification:unit", "identity": identity, "verification_request": verification_request()}],
+        "applied_decisions": [
+            {"task_key": key, "reference": "decision:task-one", "identity": identity}
+        ],
+        "verification_references": [
+            {
+                "task_key": key,
+                "reference": "verification:unit",
+                "identity": identity,
+                "verification_request": verification_request(),
+            }
+        ],
         "scope_safety": "owned paths only",
         "open_findings": [],
         "integration_guidance": "maintainer decision required",
@@ -120,10 +157,43 @@ def completed_candidate(workflow, value, key="task-one"):
     dispatch_worker(workflow, value, key)
     workflow.record_evidence(value, decision(key))
     workflow.ingest_handoff(value, handoff(key))
-    workflow.record_evidence(value, {"kind": "verifier_registration", "task_key": key, "subject": IDENTITY, **final_gate_request(), "verifier_reference": "verifier:final", "accepted": True})
+    workflow.record_evidence(
+        value,
+        {
+            "kind": "verifier_registration",
+            "task_key": key,
+            "subject": IDENTITY,
+            **final_gate_request(),
+            "verifier_reference": "verifier:final",
+            "accepted": True,
+        },
+    )
     workflow.record_verification(value, verification_record(key=key))
-    workflow.record_verification(value, {"task_key": key, "reference": "verification:public", "subject": IDENTITY, "command": ["python", "scripts/public-safety.py"], "scope": ["repository"], "environment": {"lock": "committed"}, "side_effects": [], "status": "PASS", "verification_type": "public_safety"})
-    workflow.record_verification(value, {"task_key": key, "reference": "verification:gate", "subject": IDENTITY, **final_gate_request(), "status": "PASS", "verifier_reference": "verifier:final"})
+    workflow.record_verification(
+        value,
+        {
+            "task_key": key,
+            "reference": "verification:public",
+            "subject": IDENTITY,
+            "command": ["python", "scripts/public-safety.py"],
+            "scope": ["repository"],
+            "environment": {"lock": "committed"},
+            "side_effects": [],
+            "status": "PASS",
+            "verification_type": "public_safety",
+        },
+    )
+    workflow.record_verification(
+        value,
+        {
+            "task_key": key,
+            "reference": "verification:gate",
+            "subject": IDENTITY,
+            **final_gate_request(),
+            "status": "PASS",
+            "verifier_reference": "verifier:final",
+        },
+    )
 
 
 def test_canonical_cold_technical_review_class_is_routed():
@@ -137,11 +207,19 @@ def test_authorization_phase_pairs_and_operations_fail_closed():
     value = state(workflow)
     workflow.register_task(value, task())
     with pytest.raises(workflow.WorkflowError, match="only valid in PLAN"):
-        workflow.acquire_ownership(value, {"task_key": "task-one", "paths": ["scripts/example.py"]})
+        workflow.acquire_ownership(
+            value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+        )
     to_plan(workflow, value)
-    workflow.acquire_ownership(value, {"task_key": "task-one", "paths": ["scripts/example.py"]})
-    with pytest.raises(workflow.WorkflowError, match="only valid for an implementing dispatch"):
-        workflow.register_worker(value, {"reference": "writer-one", "task_key": "task-one"})
+    workflow.acquire_ownership(
+        value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+    )
+    with pytest.raises(
+        workflow.WorkflowError, match="only valid for an implementing dispatch"
+    ):
+        workflow.register_worker(
+            value, {"reference": "writer-one", "task_key": "task-one"}
+        )
     with pytest.raises(workflow.WorkflowError, match="incompatible"):
         workflow.validate_state({**value, "phase": "VERIFY"})
 
@@ -151,7 +229,9 @@ def test_transition_cannot_walk_to_integration_or_grant_it_without_prerequisites
     value = state(workflow)
     workflow.register_task(value, task())
     to_plan(workflow, value)
-    workflow.acquire_ownership(value, {"task_key": "task-one", "paths": ["scripts/example.py"]})
+    workflow.acquire_ownership(
+        value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+    )
     workflow.advance(value, {"task_key": "task-one"})
     workflow.register_worker(value, {"reference": "writer-one", "task_key": "task-one"})
     workflow.record_evidence(value, decision())
@@ -159,7 +239,10 @@ def test_transition_cannot_walk_to_integration_or_grant_it_without_prerequisites
     with pytest.raises(workflow.WorkflowError, match="integration transition requires"):
         workflow.transition(value, "INTEGRATE")
     with pytest.raises(workflow.WorkflowError, match="verified candidate"):
-        workflow.authorize(value, {"actor": "maintainer", "authorization_state": "INTEGRATION_AUTHORIZED"})
+        workflow.authorize(
+            value,
+            {"actor": "maintainer", "authorization_state": "INTEGRATION_AUTHORIZED"},
+        )
 
 
 def test_path_collisions_include_ancestor_descendant_and_cross_platform_normalization():
@@ -171,14 +254,19 @@ def test_path_collisions_include_ancestor_descendant_and_cross_platform_normaliz
     workflow.acquire_ownership(value, {"task_key": "parent", "paths": ["scripts"]})
     value["authorization_state"] = "MAINTAINER_AUTHORIZED"
     with pytest.raises(workflow.WorkflowError, match="path ownership collision"):
-        workflow.acquire_ownership(value, {"task_key": "child", "paths": ["scripts/demo.py"]})
+        workflow.acquire_ownership(
+            value, {"task_key": "child", "paths": ["scripts/demo.py"]}
+        )
 
 
 def test_handoff_rejects_untyped_wrong_base_or_empty_subject_identities():
     workflow = load_workflow_module()
     for identity, message in (
         ({"base": BASE, "patch": "sha256:synthetic"}, "identity type"),
-        ({"type": "patch", "base": "wrong-base", "patch": "sha256:synthetic"}, "identity base"),
+        (
+            {"type": "patch", "base": "wrong-base", "patch": "sha256:synthetic"},
+            "identity base",
+        ),
         ({"type": "patch", "base": BASE, "patch": ""}, "non-empty patch"),
     ):
         value = state(workflow)
@@ -198,16 +286,32 @@ def test_handoff_requires_authoritative_structured_decisions_and_references():
         workflow.ingest_handoff(value, handoff())
     workflow.record_evidence(value, decision())
     invalid = handoff()
-    invalid["verification_references"] = [{"task_key": "other", "reference": "verification:unit", "identity": IDENTITY}]
+    invalid["verification_references"] = [
+        {"task_key": "other", "reference": "verification:unit", "identity": IDENTITY}
+    ]
     with pytest.raises(workflow.WorkflowError, match="bind the handoff task"):
         workflow.ingest_handoff(value, invalid)
 
 
 def test_verification_reuse_requires_typed_exact_subject_and_stable_inputs():
     workflow = load_workflow_module()
-    complete = verification_record(untracked_inputs_relevant=True, untracked_inputs=[{"content_identity": "sha256:synthetic", "role": "fixture", "scope": "tests"}])
-    assert workflow.verification_reuse(complete, IDENTITY, verification_request()) == {"reusable": True, "status": "REUSABLE"}
-    assert workflow.verification_reuse(complete, {"type": "patch", "base": BASE, "patch": ""}, verification_request()) == {"reusable": False, "status": "NON_REUSABLE"}
+    complete = verification_record(
+        untracked_inputs_relevant=True,
+        untracked_inputs=[
+            {
+                "content_identity": "sha256:synthetic",
+                "role": "fixture",
+                "scope": "tests",
+            }
+        ],
+    )
+    assert workflow.verification_reuse(complete, IDENTITY, verification_request()) == {
+        "reusable": True,
+        "status": "REUSABLE",
+    }
+    assert workflow.verification_reuse(
+        complete, {"type": "patch", "base": BASE, "patch": ""}, verification_request()
+    ) == {"reusable": False, "status": "NON_REUSABLE"}
 
 
 def test_integration_requires_matching_handoff_bound_reusable_pass_and_decision():
@@ -215,7 +319,13 @@ def test_integration_requires_matching_handoff_bound_reusable_pass_and_decision(
     value = state(workflow)
     workflow.register_task(value, task())
     completed_candidate(workflow, value)
-    assert workflow.advance(value, {"task_key": "task-one", "verification_request": verification_request()})["next_action"] == "AWAIT_MAINTAINER_INTEGRATION_AUTHORIZATION"
+    assert (
+        workflow.advance(
+            value,
+            {"task_key": "task-one", "verification_request": verification_request()},
+        )["next_action"]
+        == "AWAIT_MAINTAINER_INTEGRATION_AUTHORIZATION"
+    )
     request = {
         "actor": "maintainer",
         "authorization_state": "INTEGRATION_AUTHORIZED",
@@ -225,7 +335,11 @@ def test_integration_requires_matching_handoff_bound_reusable_pass_and_decision(
         "verification_reference": "verification:unit",
         "verification_request": verification_request(),
     }
-    assert workflow.authorize(value, request) == {"authorization_state": "INTEGRATION_AUTHORIZED", "actor": "maintainer", "phase": "INTEGRATE"}
+    assert workflow.authorize(value, request) == {
+        "authorization_state": "INTEGRATION_AUTHORIZED",
+        "actor": "maintainer",
+        "phase": "INTEGRATE",
+    }
 
 
 def test_integration_rejects_wrong_verification_identity_or_reference():
@@ -234,8 +348,13 @@ def test_integration_rejects_wrong_verification_identity_or_reference():
     workflow.register_task(value, task())
     completed_candidate(workflow, value)
     bad = {
-        "actor": "maintainer", "authorization_state": "INTEGRATION_AUTHORIZED", "task_key": "task-one", "identity": IDENTITY,
-        "applied_decision": handoff()["applied_decisions"][0], "verification_reference": "other", "verification_request": verification_request(),
+        "actor": "maintainer",
+        "authorization_state": "INTEGRATION_AUTHORIZED",
+        "task_key": "task-one",
+        "identity": IDENTITY,
+        "applied_decision": handoff()["applied_decisions"][0],
+        "verification_reference": "other",
+        "verification_request": verification_request(),
     }
     with pytest.raises(workflow.WorkflowError, match="handoff-bound verification"):
         workflow.authorize(value, bad)
@@ -269,7 +388,16 @@ def test_task_validation_rejects_recursive_delegation_and_unknown_selection():
 def test_state_rejects_orphan_active_writer_and_duplicate_task_key():
     workflow = load_workflow_module()
     value = state(workflow)
-    value["workers"].append({"reference": "orphan", "task_key": "missing", "task_class": "normal_implementation", "writer": True, "status": "ACTIVE", "route": task()["route"]})
+    value["workers"].append(
+        {
+            "reference": "orphan",
+            "task_key": "missing",
+            "task_class": "normal_implementation",
+            "writer": True,
+            "status": "ACTIVE",
+            "route": task()["route"],
+        }
+    )
     with pytest.raises(workflow.WorkflowError, match="registered matching task"):
         workflow.validate_state(value)
     value = state(workflow)
@@ -287,7 +415,10 @@ def test_handoff_completes_worker_before_ownership_can_release():
         workflow.release_ownership(value, {"task_key": "task-one"})
     workflow.record_evidence(value, decision())
     workflow.ingest_handoff(value, handoff())
-    assert workflow.release_ownership(value, {"task_key": "task-one"}) == {"task_key": "task-one", "released": True}
+    assert workflow.release_ownership(value, {"task_key": "task-one"}) == {
+        "task_key": "task-one",
+        "released": True,
+    }
 
 
 def test_handoff_rejects_empty_evidence_and_route_mismatch():
@@ -310,7 +441,9 @@ def test_context_is_typed_and_does_not_replay_evidence_transcripts():
     workflow = load_workflow_module()
     value = state(workflow)
     workflow.register_task(value, task())
-    value["evidence"].append({"kind": "note", "subject": {"id": "synthetic"}, "transcript": "do not copy"})
+    value["evidence"].append(
+        {"kind": "note", "subject": {"id": "synthetic"}, "transcript": "do not copy"}
+    )
     context = workflow.compile_context(value)
     assert context["mission"]["priority"] == "bounded workflow"
     assert "evidence" not in context
@@ -323,10 +456,18 @@ def test_verification_binding_rejects_cross_task_reference_reuse():
     workflow.register_task(value, task())
     workflow.register_task(value, task("task-two", ["tests/example.py"]))
     completed_candidate(workflow, value)
-    workflow.record_verification(value, {**verification_record(key="task-two"), "reference": "verification:task-two"})
+    workflow.record_verification(
+        value,
+        {**verification_record(key="task-two"), "reference": "verification:task-two"},
+    )
     request = {
-        "actor": "maintainer", "authorization_state": "INTEGRATION_AUTHORIZED", "task_key": "task-one", "identity": IDENTITY,
-        "applied_decision": handoff()["applied_decisions"][0], "verification_reference": "verification:task-two", "verification_request": verification_request(),
+        "actor": "maintainer",
+        "authorization_state": "INTEGRATION_AUTHORIZED",
+        "task_key": "task-one",
+        "identity": IDENTITY,
+        "applied_decision": handoff()["applied_decisions"][0],
+        "verification_reference": "verification:task-two",
+        "verification_request": verification_request(),
     }
     with pytest.raises(workflow.WorkflowError, match="handoff-bound verification"):
         workflow.authorize(value, request)
@@ -341,12 +482,27 @@ def test_integration_requires_cold_review_final_gate_and_public_safety_evidence(
     workflow.advance(value, record)
     workflow.advance(value, {**record, "review_status": "PASS"})
     request = {
-        "actor": "maintainer", "authorization_state": "INTEGRATION_AUTHORIZED", "task_key": "task-one", "identity": IDENTITY,
-        "applied_decision": handoff()["applied_decisions"][0], "verification_reference": "verification:unit", "verification_request": verification_request(),
+        "actor": "maintainer",
+        "authorization_state": "INTEGRATION_AUTHORIZED",
+        "task_key": "task-one",
+        "identity": IDENTITY,
+        "applied_decision": handoff()["applied_decisions"][0],
+        "verification_reference": "verification:unit",
+        "verification_request": verification_request(),
     }
     with pytest.raises(workflow.WorkflowError, match="registered-verifier"):
         workflow.authorize(value, request)
-    workflow.record_verification(value, {"task_key": "task-one", "reference": "verification:gate-after-review", "subject": IDENTITY, **final_gate_request(), "status": "PASS", "verifier_reference": "verifier:final"})
+    workflow.record_verification(
+        value,
+        {
+            "task_key": "task-one",
+            "reference": "verification:gate-after-review",
+            "subject": IDENTITY,
+            **final_gate_request(),
+            "status": "PASS",
+            "verifier_reference": "verifier:final",
+        },
+    )
     assert workflow.authorize(value, request)["phase"] == "INTEGRATE"
 
 
@@ -357,7 +513,9 @@ def test_registered_risk_trigger_cannot_be_omitted_from_advance():
     record["review_triggers"] = ["public_repository_safety"]
     workflow.register_task(value, record)
     completed_candidate(workflow, value)
-    result = workflow.advance(value, {"task_key": "task-one", "verification_request": verification_request()})
+    result = workflow.advance(
+        value, {"task_key": "task-one", "verification_request": verification_request()}
+    )
     assert result["next_action"] == "AWAIT_COLD_REVIEW"
     assert result["review_packet"]["subject"] == IDENTITY
 
@@ -365,19 +523,43 @@ def test_registered_risk_trigger_cannot_be_omitted_from_advance():
 def test_final_and_public_safety_evidence_use_registered_verifier_and_latest_result():
     workflow = load_workflow_module()
     request = {
-        "actor": "maintainer", "authorization_state": "INTEGRATION_AUTHORIZED", "task_key": "task-one", "identity": IDENTITY,
-        "applied_decision": handoff()["applied_decisions"][0], "verification_reference": "verification:unit", "verification_request": verification_request(),
+        "actor": "maintainer",
+        "authorization_state": "INTEGRATION_AUTHORIZED",
+        "task_key": "task-one",
+        "identity": IDENTITY,
+        "applied_decision": handoff()["applied_decisions"][0],
+        "verification_reference": "verification:unit",
+        "verification_request": verification_request(),
     }
     arbitrary = state(workflow)
     workflow.register_task(arbitrary, task())
     completed_candidate(workflow, arbitrary)
     with pytest.raises(workflow.WorkflowError, match="prior accepted"):
-        workflow.record_verification(arbitrary, {"task_key": "task-one", "reference": "verification:arbitrary-gate", "subject": IDENTITY, **final_gate_request(), "status": "PASS", "verifier_reference": "unregistered:label"})
+        workflow.record_verification(
+            arbitrary,
+            {
+                "task_key": "task-one",
+                "reference": "verification:arbitrary-gate",
+                "subject": IDENTITY,
+                **final_gate_request(),
+                "status": "PASS",
+                "verifier_reference": "unregistered:label",
+            },
+        )
 
     stale_gate = state(workflow)
     workflow.register_task(stale_gate, task())
     completed_candidate(workflow, stale_gate)
-    workflow.record_verification(stale_gate, {"task_key": "task-one", "reference": "verification:gate", "subject": IDENTITY, **final_gate_request(), "status": "FAIL"})
+    workflow.record_verification(
+        stale_gate,
+        {
+            "task_key": "task-one",
+            "reference": "verification:gate",
+            "subject": IDENTITY,
+            **final_gate_request(),
+            "status": "FAIL",
+        },
+    )
     assert stale_gate["authorization_state"] == "VERIFIED"
     with pytest.raises(workflow.WorkflowError, match="registered-verifier"):
         workflow.authorize(stale_gate, request)
@@ -385,7 +567,19 @@ def test_final_and_public_safety_evidence_use_registered_verifier_and_latest_res
     stale_safety = state(workflow)
     workflow.register_task(stale_safety, task())
     completed_candidate(workflow, stale_safety)
-    workflow.record_verification(stale_safety, {"task_key": "task-one", "reference": "verification:public", "subject": IDENTITY, "command": ["python", "scripts/public-safety.py"], "scope": ["repository"], "environment": {"lock": "committed"}, "side_effects": [], "status": "FAIL"})
+    workflow.record_verification(
+        stale_safety,
+        {
+            "task_key": "task-one",
+            "reference": "verification:public",
+            "subject": IDENTITY,
+            "command": ["python", "scripts/public-safety.py"],
+            "scope": ["repository"],
+            "environment": {"lock": "committed"},
+            "side_effects": [],
+            "status": "FAIL",
+        },
+    )
     with pytest.raises(workflow.WorkflowError, match="public-safety"):
         workflow.authorize(stale_safety, request)
 
@@ -411,32 +605,50 @@ def test_decision_authority_must_match_registered_task_authority():
     with pytest.raises(workflow.WorkflowError, match="authoritative"):
         workflow.record_evidence(value, unrelated)
     workflow.record_evidence(value, decision())
-    value["evidence"][-1]["authoritative_provenance"]["authority_reference"] = "authority:unrelated"
+    value["evidence"][-1]["authoritative_provenance"]["authority_reference"] = (
+        "authority:unrelated"
+    )
     with pytest.raises(workflow.WorkflowError, match="authoritative"):
         workflow.validate_state(value)
 
 
 def test_read_only_tasks_and_windows_absolute_paths_cannot_be_written():
     workflow = load_workflow_module()
-    for path in ("C:\\work\\file.py", "C:work\\file.py", "\\rooted\\file.py", "\\\\server\\share\\file.py", "\\\\?\\C:\\file.py", "/repo/file.py"):
+    for path in (
+        "C:\\work\\file.py",
+        "C:work\\file.py",
+        "\\rooted\\file.py",
+        "\\\\server\\share\\file.py",
+        "\\\\?\\C:\\file.py",
+        "/repo/file.py",
+    ):
         with pytest.raises(workflow.WorkflowError, match="unsafe owned path"):
             workflow.normalized_path(path)
     value = state(workflow)
     workflow.register_task(value, task(task_class="cold_technical_review"))
     to_plan(workflow, value)
     with pytest.raises(workflow.WorkflowError, match="read-only"):
-        workflow.acquire_ownership(value, {"task_key": "task-one", "paths": ["scripts/example.py"]})
+        workflow.acquire_ownership(
+            value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+        )
 
 
-def test_routine_tasks_are_read_only_and_worker_flags_or_routes_cannot_override_task_policy():
+def test_routine_task_policy_cannot_be_overridden_by_worker_flags_or_routes():
     workflow = load_workflow_module()
     routine = task(task_class="routine_administration")
-    routine["route"] = {"selected_model": "luna_or_cheapest", "selected_effort": "low", "observed_model": "UNVERIFIED", "observed_effort": "UNVERIFIED"}
+    routine["route"] = {
+        "selected_model": "luna_or_cheapest",
+        "selected_effort": "low",
+        "observed_model": "UNVERIFIED",
+        "observed_effort": "UNVERIFIED",
+    }
     value = state(workflow)
     workflow.register_task(value, routine)
     to_plan(workflow, value)
     with pytest.raises(workflow.WorkflowError, match="read-only"):
-        workflow.acquire_ownership(value, {"task_key": "task-one", "paths": ["scripts/example.py"]})
+        workflow.acquire_ownership(
+            value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+        )
 
     candidate = state(workflow)
     implementation = task()
@@ -444,13 +656,21 @@ def test_routine_tasks_are_read_only_and_worker_flags_or_routes_cannot_override_
     implementation["route"]["observed_effort"] = "high"
     workflow.register_task(candidate, implementation)
     to_plan(workflow, candidate)
-    workflow.acquire_ownership(candidate, {"task_key": "task-one", "paths": ["scripts/example.py"]})
+    workflow.acquire_ownership(
+        candidate, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+    )
     workflow.advance(candidate, {"task_key": "task-one"})
     with pytest.raises(workflow.WorkflowError, match="derived"):
-        workflow.register_worker(candidate, {"reference": "writer-one", "task_key": "task-one", "writer": False})
+        workflow.register_worker(
+            candidate,
+            {"reference": "writer-one", "task_key": "task-one", "writer": False},
+        )
     mismatched = task()["route"]
     with pytest.raises(workflow.WorkflowError, match="supplied route"):
-        workflow.register_worker(candidate, {"reference": "writer-one", "task_key": "task-one", "route": mismatched})
+        workflow.register_worker(
+            candidate,
+            {"reference": "writer-one", "task_key": "task-one", "route": mismatched},
+        )
 
 
 def test_guarded_second_writer_is_reachable_and_third_or_unguarded_writer_is_rejected():
@@ -461,16 +681,30 @@ def test_guarded_second_writer_is_reachable_and_third_or_unguarded_writer_is_rej
     workflow.register_task(value, task("task-three", ["scripts/three.py"]))
     to_plan(workflow, value)
     for key in ("task-one", "task-two", "task-three"):
-        workflow.acquire_ownership(value, {"task_key": key, "paths": value["tasks"][key]["owned_paths"]})
+        workflow.acquire_ownership(
+            value, {"task_key": key, "paths": value["tasks"][key]["owned_paths"]}
+        )
     workflow.advance(value, {"task_key": "task-one"})
     workflow.register_worker(value, {"reference": "writer-one", "task_key": "task-one"})
     with pytest.raises(workflow.WorkflowError, match="durable task-specific"):
-        workflow.register_worker(value, {"reference": "writer-two", "task_key": "task-two"})
+        workflow.register_worker(
+            value, {"reference": "writer-two", "task_key": "task-two"}
+        )
     with pytest.raises(workflow.WorkflowError, match="independence guard"):
         workflow.advance(value, {"task_key": "task-two"})
     guards = {name: True for name in workflow.REQUIRED_SECOND_WRITER_GUARDS}
-    assert workflow.advance(value, {"task_key": "task-two", "independence_guards": guards})["advanced"] is True
-    assert workflow.register_worker(value, {"reference": "writer-two", "task_key": "task-two"})["status"] == "ACTIVE"
+    assert (
+        workflow.advance(
+            value, {"task_key": "task-two", "independence_guards": guards}
+        )["advanced"]
+        is True
+    )
+    assert (
+        workflow.register_worker(
+            value, {"reference": "writer-two", "task_key": "task-two"}
+        )["status"]
+        == "ACTIVE"
+    )
     del value["workers"][1]["independence_guards"]
     with pytest.raises(workflow.WorkflowError, match="independence guard"):
         workflow.validate_state(value)
@@ -479,22 +713,50 @@ def test_guarded_second_writer_is_reachable_and_third_or_unguarded_writer_is_rej
         workflow.validate_state(value)
     value["workers"][1]["independence_guards"] = guards
     with pytest.raises(workflow.WorkflowError, match="third"):
-        workflow.advance(value, {"task_key": "task-three", "independence_guards": guards})
+        workflow.advance(
+            value, {"task_key": "task-three", "independence_guards": guards}
+        )
 
 
-def test_duplicate_task_attempt_and_ambiguous_spawn_reconciliation_are_rejected_or_durable():
+def test_duplicate_task_and_ambiguous_spawn_are_rejected_or_durable():
     workflow = load_workflow_module()
     value = state(workflow)
     workflow.register_task(value, task())
     to_plan(workflow, value)
-    workflow.acquire_ownership(value, {"task_key": "task-one", "paths": ["scripts/example.py"]})
+    workflow.acquire_ownership(
+        value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+    )
     workflow.advance(value, {"task_key": "task-one"})
-    value["workers"].append({"reference": "duplicate", "task_key": "task-one", "task_class": "normal_implementation", "writer": True, "status": "ACTIVE", "route": task()["route"], "attempt": 2, "monitor": workflow._new_monitor("ACTIVE")})
+    value["workers"].append(
+        {
+            "reference": "duplicate",
+            "task_key": "task-one",
+            "task_class": "normal_implementation",
+            "writer": True,
+            "status": "ACTIVE",
+            "route": task()["route"],
+            "attempt": 2,
+            "monitor": workflow._new_monitor("ACTIVE"),
+        }
+    )
     with pytest.raises(workflow.WorkflowError, match="for a task"):
         workflow.validate_state(value)
     value["workers"].pop()
-    assert workflow.reconcile_worker(value, {"reference": "manual:task-one", "status": "SPAWN_UNKNOWN", "ambiguity_reference": "ambiguity:synthetic"})["status"] == "SPAWN_UNKNOWN"
-    assert workflow.reconcile_worker(value, {"reference": "manual:task-one"})["retry"] == "BLOCKED"
+    assert (
+        workflow.reconcile_worker(
+            value,
+            {
+                "reference": "manual:task-one",
+                "status": "SPAWN_UNKNOWN",
+                "ambiguity_reference": "ambiguity:synthetic",
+            },
+        )["status"]
+        == "SPAWN_UNKNOWN"
+    )
+    assert (
+        workflow.reconcile_worker(value, {"reference": "manual:task-one"})["retry"]
+        == "BLOCKED"
+    )
     value["workers"][0]["ambiguity_reference"] = ""
     with pytest.raises(workflow.WorkflowError, match="ambiguity_reference"):
         workflow.validate_state(value)
@@ -505,11 +767,18 @@ def test_late_verifier_registration_cannot_authorize_a_persisted_gate_result():
     value = state(workflow)
     workflow.register_task(value, task())
     completed_candidate(workflow, value)
-    registration = next(item for item in value["evidence"] if item["kind"] == "verifier_registration")
+    registration = next(
+        item for item in value["evidence"] if item["kind"] == "verifier_registration"
+    )
     registration["sequence"] = value["verification"][-1]["sequence"] + 1
     request = {
-        "actor": "maintainer", "authorization_state": "INTEGRATION_AUTHORIZED", "task_key": "task-one", "identity": IDENTITY,
-        "applied_decision": handoff()["applied_decisions"][0], "verification_reference": "verification:unit", "verification_request": verification_request(),
+        "actor": "maintainer",
+        "authorization_state": "INTEGRATION_AUTHORIZED",
+        "task_key": "task-one",
+        "identity": IDENTITY,
+        "applied_decision": handoff()["applied_decisions"][0],
+        "verification_reference": "verification:unit",
+        "verification_request": verification_request(),
     }
     with pytest.raises(workflow.WorkflowError, match="prior accepted"):
         workflow.authorize(value, request)
@@ -532,20 +801,55 @@ def test_newer_fail_invalidates_only_its_task_verification_pass():
     completed_candidate(workflow, value)
     workflow.record_verification(value, {**verification_record(), "status": "FAIL"})
     assert value["authorization_state"] == "IMPLEMENTING"
-    assert workflow.advance(value, {"task_key": "task-one", "verification_request": verification_request()})["next_action"] == "RUN_OR_RECORD_REQUIRED_VERIFICATION"
+    assert (
+        workflow.advance(
+            value,
+            {"task_key": "task-one", "verification_request": verification_request()},
+        )["next_action"]
+        == "RUN_OR_RECORD_REQUIRED_VERIFICATION"
+    )
     different_request = state(workflow)
     workflow.register_task(different_request, task())
     completed_candidate(workflow, different_request)
-    workflow.record_verification(different_request, {"task_key": "task-one", "reference": "verification:other", "subject": IDENTITY, "command": ["python", "-m", "pytest", "tests/other"], "scope": ["tests/other"], "environment": {"lock": "committed"}, "side_effects": [], "status": "FAIL"})
+    workflow.record_verification(
+        different_request,
+        {
+            "task_key": "task-one",
+            "reference": "verification:other",
+            "subject": IDENTITY,
+            "command": ["python", "-m", "pytest", "tests/other"],
+            "scope": ["tests/other"],
+            "environment": {"lock": "committed"},
+            "side_effects": [],
+            "status": "FAIL",
+        },
+    )
     assert different_request["authorization_state"] == "VERIFIED"
-    assert workflow._reusable_verification(different_request, "task-one", IDENTITY, verification_request())["status"] == "PASS"
+    assert (
+        workflow._reusable_verification(
+            different_request, "task-one", IDENTITY, verification_request()
+        )["status"]
+        == "PASS"
+    )
     separate = state(workflow)
     workflow.register_task(separate, task())
     workflow.register_task(separate, task("task-two", ["tests/example.py"]))
     completed_candidate(workflow, separate)
-    workflow.record_verification(separate, {**verification_record(key="task-two"), "reference": "verification:task-two", "status": "FAIL"})
+    workflow.record_verification(
+        separate,
+        {
+            **verification_record(key="task-two"),
+            "reference": "verification:task-two",
+            "status": "FAIL",
+        },
+    )
     assert separate["authorization_state"] == "VERIFIED"
-    assert workflow._reusable_verification(separate, "task-one", IDENTITY, verification_request())["status"] == "PASS"
+    assert (
+        workflow._reusable_verification(
+            separate, "task-one", IDENTITY, verification_request()
+        )["status"]
+        == "PASS"
+    )
 
 
 def test_worker_heartbeat_backs_off_without_replaying_context_or_spawning_duplicates():
@@ -553,17 +857,29 @@ def test_worker_heartbeat_backs_off_without_replaying_context_or_spawning_duplic
     value = state(workflow)
     workflow.register_task(value, task())
     to_plan(workflow, value)
-    workflow.acquire_ownership(value, {"task_key": "task-one", "paths": ["scripts/example.py"]})
+    workflow.acquire_ownership(
+        value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+    )
     workflow.advance(value, {"task_key": "task-one"})
     first = workflow.monitor_worker(value, {"reference": "manual:task-one", "now": 100})
-    assert first == {"action": "WAIT_UNTIL_HEARTBEAT", "reference": "manual:task-one", "interval_seconds": 120, "next_check_at": 220}
+    assert first == {
+        "action": "WAIT_UNTIL_HEARTBEAT",
+        "reference": "manual:task-one",
+        "interval_seconds": 120,
+        "next_check_at": 220,
+    }
     early = workflow.monitor_worker(value, {"reference": "manual:task-one", "now": 150})
     assert early == first
-    backed_off = workflow.monitor_worker(value, {"reference": "manual:task-one", "now": 220})
+    backed_off = workflow.monitor_worker(
+        value, {"reference": "manual:task-one", "now": 220}
+    )
     assert backed_off["action"] == "WAIT_UNTIL_HEARTBEAT"
     assert backed_off["interval_seconds"] == 240
     assert len(value["workers"]) == 1
-    assert workflow.advance(value, {"task_key": "task-one"})["next_action"] == "AWAIT_MANUAL_WORKER_REFERENCE"
+    assert (
+        workflow.advance(value, {"task_key": "task-one"})["next_action"]
+        == "AWAIT_MANUAL_WORKER_REFERENCE"
+    )
     assert len(value["workers"]) == 1
 
 
@@ -574,13 +890,32 @@ def test_worker_heartbeat_resets_on_change_and_wakes_immediately_for_terminal_ev
     dispatch_worker(workflow, value)
     workflow.monitor_worker(value, {"reference": "writer-one", "now": 0})
     workflow.monitor_worker(value, {"reference": "writer-one", "now": 120})
-    changed = workflow.monitor_worker(value, {"reference": "writer-one", "now": 121, "output_identity": "output:synthetic"})
+    changed = workflow.monitor_worker(
+        value,
+        {"reference": "writer-one", "now": 121, "output_identity": "output:synthetic"},
+    )
     assert changed["action"] == "HEARTBEAT_CHANGED"
     assert changed["interval_seconds"] == 120
-    assert workflow.monitor_worker(value, {"reference": "writer-one", "now": 122, "system_error": True})["reason"] == "SYSTEM_ERROR"
-    assert workflow.monitor_worker(value, {"reference": "writer-one", "now": 123, "maintainer_input": True})["reason"] == "MAINTAINER_INPUT"
-    completed = workflow.monitor_worker(value, {"reference": "writer-one", "now": 124, "status": "COMPLETE"})
-    assert completed == {"action": "WAKE_IMMEDIATELY", "reason": "COMPLETION", "reference": "writer-one"}
+    assert (
+        workflow.monitor_worker(
+            value, {"reference": "writer-one", "now": 122, "system_error": True}
+        )["reason"]
+        == "SYSTEM_ERROR"
+    )
+    assert (
+        workflow.monitor_worker(
+            value, {"reference": "writer-one", "now": 123, "maintainer_input": True}
+        )["reason"]
+        == "MAINTAINER_INPUT"
+    )
+    completed = workflow.monitor_worker(
+        value, {"reference": "writer-one", "now": 124, "status": "COMPLETE"}
+    )
+    assert completed == {
+        "action": "WAKE_IMMEDIATELY",
+        "reason": "COMPLETION",
+        "reference": "writer-one",
+    }
 
 
 def test_worker_heartbeat_requires_durable_ambiguous_spawn_reconciliation():
@@ -588,10 +923,27 @@ def test_worker_heartbeat_requires_durable_ambiguous_spawn_reconciliation():
     value = state(workflow)
     workflow.register_task(value, task())
     to_plan(workflow, value)
-    workflow.acquire_ownership(value, {"task_key": "task-one", "paths": ["scripts/example.py"]})
+    workflow.acquire_ownership(
+        value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+    )
     workflow.advance(value, {"task_key": "task-one"})
     with pytest.raises(workflow.WorkflowError, match="ambiguity_reference"):
-        workflow.monitor_worker(value, {"reference": "manual:task-one", "now": 0, "status": "SPAWN_UNKNOWN"})
-    immediate = workflow.monitor_worker(value, {"reference": "manual:task-one", "now": 0, "status": "SPAWN_UNKNOWN", "ambiguity_reference": "ambiguity:synthetic"})
+        workflow.monitor_worker(
+            value, {"reference": "manual:task-one", "now": 0, "status": "SPAWN_UNKNOWN"}
+        )
+    immediate = workflow.monitor_worker(
+        value,
+        {
+            "reference": "manual:task-one",
+            "now": 0,
+            "status": "SPAWN_UNKNOWN",
+            "ambiguity_reference": "ambiguity:synthetic",
+        },
+    )
     assert immediate["reason"] == "AMBIGUOUS_SPAWN_RECONCILIATION"
-    assert workflow.monitor_worker(value, {"reference": "manual:task-one", "now": 1})["reason"] == "AMBIGUOUS_SPAWN_RECONCILIATION"
+    assert (
+        workflow.monitor_worker(value, {"reference": "manual:task-one", "now": 1})[
+            "reason"
+        ]
+        == "AMBIGUOUS_SPAWN_RECONCILIATION"
+    )
