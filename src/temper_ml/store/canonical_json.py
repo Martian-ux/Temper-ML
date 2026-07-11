@@ -15,13 +15,20 @@ class CanonicalJsonError(ValueError):
 def dumps_canonical_json(value: Any) -> bytes:
     """Encode a JSON value as UTF-8 canonical bytes with one trailing newline."""
 
-    return (_encode(value) + "\n").encode("utf-8")
+    try:
+        return (_encode(value) + "\n").encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise CanonicalJsonError("strings must be valid UTF-8") from exc
 
 
 def loads_canonical_json(data: bytes | str) -> Any:
-    """Read JSON while rejecting duplicate object keys and invalid numbers."""
+    """Read exactly one Temper canonical JSON value."""
 
-    text = data.decode("utf-8") if isinstance(data, bytes) else data
+    try:
+        encoded = data if isinstance(data, bytes) else data.encode("utf-8")
+        text = encoded.decode("utf-8")
+    except UnicodeError as exc:
+        raise CanonicalJsonError("input is not valid UTF-8") from exc
     try:
         value = json.loads(
             text,
@@ -32,6 +39,8 @@ def loads_canonical_json(data: bytes | str) -> Any:
     except json.JSONDecodeError as exc:
         raise CanonicalJsonError(str(exc)) from exc
     _validate(value)
+    if encoded != dumps_canonical_json(value):
+        raise CanonicalJsonError("JSON is not in Temper canonical form")
     return value
 
 

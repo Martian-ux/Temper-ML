@@ -44,17 +44,22 @@ class WriteOnceStore:
     def write_projected_json(
         self, area: str, projection: HashProjection, record: Mapping[str, Any]
     ) -> WrittenRecord:
-        identity = content_identity(projection, record)
-        path = self._immutable_path(area, identity)
         payload = dumps_canonical_json(record)
-        if path.exists():
-            existing = loads_canonical_json(path.read_bytes())
-            if content_identity(projection, existing) != identity:
-                raise WriteOnceCorrupt(f"identity path does not match existing content: {identity}")
+        canonical_record = loads_canonical_json(payload)
+        if not isinstance(canonical_record, Mapping):
+            raise WriteOnceError("immutable records must be JSON objects")
+        identity = content_identity(projection, canonical_record)
+        path = self._immutable_path(area, identity)
+        if path.exists() or path.is_symlink():
+            self._verify_immutable_record(path, projection, identity)
             raise WriteOnceExists(f"immutable content already exists: {identity}")
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_safe_directory(path.parent)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        handle = os.open(path, flags, 0o644)
+        try:
+            handle = os.open(path, flags, 0o644)
+        except FileExistsError:
+            self._verify_immutable_record(path, projection, identity)
+            raise WriteOnceExists(f"immutable content already exists: {identity}") from None
         try:
             with os.fdopen(handle, "wb") as file:
                 file.write(payload)
@@ -68,9 +73,17 @@ class WriteOnceStore:
     def read_projected_json(
         self, area: str, projection: HashProjection, identity: ContentIdentity
     ) -> Mapping[str, Any]:
+        return self._verify_immutable_record(self._immutable_path(area, identity), projection, identity)
+
+    def _verify_immutable_record(
+        self, path: Path, projection: HashProjection, identity: ContentIdentity
+    ) -> Mapping[str, Any]:
+        self._assert_no_symlinks(path)
         try:
-            record = loads_canonical_json(self._immutable_path(area, identity).read_bytes())
-        except CanonicalJsonError as exc:
+            record = loads_canonical_json(path.read_bytes())
+        except FileNotFoundError:
+            raise
+        except (CanonicalJsonError, OSError) as exc:
             raise WriteOnceCorrupt(f"immutable content is not canonical JSON: {identity}") from exc
         if not isinstance(record, Mapping):
             raise WriteOnceCorrupt(f"immutable content is not a JSON object: {identity}")
@@ -80,7 +93,9 @@ class WriteOnceStore:
 
     def write_derived_state(self, name: str, state: Mapping[str, Any]) -> Path:
         path = self.root / "derived" / _safe_relative_path(name).with_suffix(".json")
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_safe_directory(path.parent)
+        if path.is_symlink():
+            raise WriteOnceError(f"symbolic links are not allowed in the store: {path}")
         temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         temp_path.write_bytes(dumps_canonical_json(state))
         os.replace(temp_path, path)
@@ -90,6 +105,45 @@ class WriteOnceStore:
         return self.root / "immutable" / _safe_relative_path(area) / identity.algorithm / (
             identity.value + ".json"
         )
+
+    def _ensure_safe_directory(self, path: Path) -> None:
+        try:
+            relative_path = path.relative_to(self.root)
+        except ValueError as exc:
+            raise WriteOnceError(f"store path escapes root: {path}") from exc
+
+        current = self.root
+        if current.is_symlink():
+            raise WriteOnceError(f"symbolic links are not allowed in the store: {current}")
+        if current.exists():
+            if not current.is_dir():
+                raise WriteOnceError(f"store root is not a directory: {current}")
+        else:
+            current.mkdir(parents=True, exist_ok=True)
+
+        for part in relative_path.parts:
+            current = current / part
+            if current.is_symlink():
+                raise WriteOnceError(f"symbolic links are not allowed in the store: {current}")
+            try:
+                current.mkdir()
+            except FileExistsError:
+                if current.is_symlink() or not current.is_dir():
+                    raise WriteOnceError(f"store path is not a directory: {current}") from None
+
+    def _assert_no_symlinks(self, path: Path) -> None:
+        try:
+            relative_path = path.relative_to(self.root)
+        except ValueError as exc:
+            raise WriteOnceError(f"store path escapes root: {path}") from exc
+
+        current = self.root
+        if current.is_symlink():
+            raise WriteOnceError(f"symbolic links are not allowed in the store: {current}")
+        for part in relative_path.parts:
+            current = current / part
+            if current.is_symlink():
+                raise WriteOnceError(f"symbolic links are not allowed in the store: {current}")
 
 
 def _safe_relative_path(value: str) -> Path:
