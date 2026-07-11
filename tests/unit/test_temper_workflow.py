@@ -514,6 +514,15 @@ def test_late_verifier_registration_cannot_authorize_a_persisted_gate_result():
     with pytest.raises(workflow.WorkflowError, match="prior accepted"):
         workflow.authorize(value, request)
 
+    missing_sequence = state(workflow)
+    workflow.register_task(missing_sequence, task())
+    completed_candidate(workflow, missing_sequence)
+    del missing_sequence["verification"][-1]["sequence"]
+    with pytest.raises(workflow.WorkflowError, match="positive integer sequence"):
+        workflow.validate_state(missing_sequence)
+    with pytest.raises(workflow.WorkflowError, match="positive integer sequence"):
+        workflow.authorize(missing_sequence, request)
+
 
 def test_newer_fail_invalidates_only_its_task_verification_pass():
     workflow = load_workflow_module()

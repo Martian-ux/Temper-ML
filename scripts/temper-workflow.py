@@ -438,15 +438,19 @@ def validate_state(state: Any) -> dict[str, Any]:
         _identity(verification.get("subject"), repository["exact_base"])
         if verification.get("status") not in {"PASS", "FAIL", "UNKNOWN", "NON_REUSABLE"}:
             raise WorkflowError("unknown verification status")
-        if "verifier_reference" in verification and not _registered_verifier(
-            state,
-            key,
-            _identity(verification.get("subject"), repository["exact_base"]),
-            verification,
-            verification.get("verifier_reference"),
-            verification_sequence=verification.get("sequence"),
-        ):
-            raise WorkflowError("verifier-bound verification requires a prior accepted exact task/subject/request verifier registration")
+        if "verifier_reference" in verification:
+            verification_sequence = verification.get("sequence")
+            if isinstance(verification_sequence, bool) or not isinstance(verification_sequence, int) or verification_sequence <= 0:
+                raise WorkflowError("verifier-bound verification requires a positive integer sequence")
+            if not _registered_verifier(
+                state,
+                key,
+                _identity(verification.get("subject"), repository["exact_base"]),
+                verification,
+                verification.get("verifier_reference"),
+                verification_sequence=verification_sequence,
+            ):
+                raise WorkflowError("verifier-bound verification requires a prior accepted exact task/subject/request verifier registration")
     review_keys: set[str] = set()
     for review in state["reviews"]:
         review = _as_object(review, "review")
