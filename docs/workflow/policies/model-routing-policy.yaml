@@ -1,0 +1,43 @@
+status: PROPOSED_NOT_AUTHORIZED
+authority_ref: maintainer-rulings.md#Bounded-maintainer-corrections-accepted
+routes:
+  routine_administration:
+    model: luna_or_cheapest
+    efforts: [low, medium]
+    repository_write: false
+    review: none
+    route_observation: "Record selected values when available; unavailable runtime values remain UNVERIFIED."
+  mechanical_change:
+    model: terra-medium
+    efforts: [medium]
+    repository_write: true_after_maintainer_authorization
+    review: risk_triggered_one_cold_terra_high_if_triggered
+    route_observation: "Prompt wording never proves selection or compliance."
+  normal_implementation:
+    model: terra-high
+    efforts: [high]
+    repository_write: true_after_maintainer_authorization
+    review: risk_triggered_one_cold_terra_high_if_triggered
+    route_observation: "Observed model/effort or compliance may be UNVERIFIED when the platform does not expose them."
+  cold_technical_review:
+    model: terra-high
+    efforts: [high]
+    repository_write: false
+    review: one_cold_reviewer
+    route_observation: "The reviewer has no write ownership and does not stack automatically."
+  maintainer_decision_gate:
+    model: none
+    preparation_model: terra-high
+    actor: maintainer
+    repository_write: false_until_maintainer_decision
+    review: maintainer_gate
+    route_observation: "Maintainer authority is not replaced by a model route."
+elevation_rule: "Routine work uses the least expensive sufficient route. Any elevation requires explicit recorded justification, and automatic review stacking is prohibited. Unexercised premium or diversity routes remain private."
+projection_rule: "Only this section may be used for the initial Phase 1 public routing projection. The full private model and task-class catalog remains private."
+effective_worker_limit:
+  formula: "min(global_workflow_hard_ceiling, current_phase_limit, task_class_limit, task_packet_limit, model_route_limit, available_non_conflicting_ownership_capacity, explicit_maintainer_restriction)"
+  ambiguity_rule: "Unknown or ambiguous ownership reduces available capacity; it never increases it."
+  phase1_default_active_implementation_writers: 1
+  phase1_absolute_writer_ceiling: 2
+  third_implementation_writer: prohibited
+  read_only_reviewers_and_investigators_count_as_writers: false

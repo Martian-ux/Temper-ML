@@ -113,20 +113,6 @@ def run_fixture_help() -> int:
     return 0
 
 
-def run_direct_python_checks(
-    uv_command: Sequence[str],
-    uv_env: dict[str, str] | None,
-) -> int:
-    for command in (
-        ["run", "python", "-m", "compileall", "-q", "src"],
-        ["run", "python", "-m", "pytest", "tests/unit"],
-    ):
-        status = run_uv(command, uv_command, uv_env)
-        if status != 0:
-            return status
-    return 0
-
-
 def run_diff_hygiene() -> int:
     if not shutil.which("git"):
         print("Skipping diff hygiene: git was not found on PATH.", file=sys.stderr)
@@ -139,7 +125,6 @@ def run_all(uv_command: Sequence[str], uv_env: dict[str, str] | None) -> int:
         lambda: run_setup(uv_command, uv_env),
         lambda: run_maintenance(uv_command, uv_env),
         run_fixture_help,
-        lambda: run_direct_python_checks(uv_command, uv_env),
         run_diff_hygiene,
     ):
         status = gate()
@@ -168,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("maintenance", help="Run compile and unit checks through uv.")
     subparsers.add_parser("unit", help="Run unit tests through uv.")
     subparsers.add_parser("fixture-help", help="Show fixture walkthrough help without Bash.")
-    subparsers.add_parser("all", help="Run setup, maintenance, fixture help, direct checks, and diff hygiene.")
+    subparsers.add_parser("all", help="Run setup, maintenance, fixture help, and diff hygiene.")
     return parser
 
 
