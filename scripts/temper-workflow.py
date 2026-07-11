@@ -7,6 +7,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import tempfile
 from pathlib import PurePosixPath
 from typing import Any
@@ -37,6 +38,8 @@ ALLOWED_TRANSITIONS = {
     "CLOSE": set(),
 }
 ACTIVE_WORKER_STATES = {"SPAWN_REQUESTED", "SPAWN_UNKNOWN", "ACTIVE", "WAITING", "BLOCKED"}
+HEARTBEAT_DEFAULT_SECONDS = 120
+HEARTBEAT_MAX_SECONDS = 900
 REQUIRED_SECOND_WRITER_GUARDS = {
     "disjoint_paths",
     "independent_acceptance_criteria",
@@ -51,6 +54,13 @@ PUBLIC_ROUTE = {
     "normal_implementation": ("terra-high", {"high"}),
     "protected_boundary_implementation": ("terra-high", {"high"}),
     "cold_technical_review": ("terra-high", {"high"}),
+}
+TASK_WRITE_CAPABILITY = {
+    "routine_administration": True,
+    "mechanical_change": True,
+    "normal_implementation": True,
+    "protected_boundary_implementation": True,
+    "cold_technical_review": False,
 }
 AUTHORIZATION_PHASES = {
     "PROPOSED": {"RECONCILE"},
@@ -98,6 +108,7 @@ def default_state() -> dict[str, Any]:
         "checkpoints": [],
         "handoffs": [],
         "reviews": [],
+        "event_sequence": 0,
     }
 
 
@@ -116,6 +127,10 @@ def _as_list(value: Any, label: str) -> list[Any]:
 def normalized_path(value: Any) -> str:
     if not isinstance(value, str) or not value:
         raise WorkflowError("owned path must be a non-empty repository-relative string")
+    # PurePosixPath treats drive-relative forms such as C:work as relative.
+    # Reject all Windows absolute/rooted namespaces before normalizing slashes.
+    if value.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", value):
+        raise WorkflowError(f"unsafe owned path: {value!r}")
     path = PurePosixPath(value.replace("\\", "/"))
     if path.is_absolute() or ".." in path.parts or path == ".":
         raise WorkflowError(f"unsafe owned path: {value!r}")
@@ -140,6 +155,73 @@ def _identity(value: Any, exact_base: str) -> dict[str, str]:
     if not isinstance(value.get(subject), str) or not value[subject]:
         raise WorkflowError(f"{kind} identity requires a non-empty {subject}")
     return {"type": kind, "base": base, subject: value[subject]}
+
+
+def _verification_request(record: dict[str, Any]) -> tuple[Any, Any, Any, Any]:
+    required = ("command", "scope", "environment", "side_effects")
+    if any(name not in record for name in required):
+        raise WorkflowError("verification request identity is incomplete")
+    return tuple(copy.deepcopy(record[name]) for name in required)
+
+
+def _next_sequence(state: dict[str, Any]) -> int:
+    state["event_sequence"] += 1
+    return state["event_sequence"]
+
+
+def _new_monitor(status: str) -> dict[str, Any]:
+    return {
+        "interval_seconds": HEARTBEAT_DEFAULT_SECONDS,
+        "max_interval_seconds": HEARTBEAT_MAX_SECONDS,
+        "unchanged_heartbeats": 0,
+        "last_status": status,
+        "last_output_identity": None,
+        "last_repository_evidence": None,
+        "last_heartbeat_at": None,
+        "next_check_at": None,
+    }
+
+
+def _validate_monitor(value: Any, status: str) -> dict[str, Any]:
+    monitor = _as_object(value, "worker monitor")
+    if (
+        not isinstance(monitor.get("interval_seconds"), int)
+        or not isinstance(monitor.get("max_interval_seconds"), int)
+        or monitor["interval_seconds"] < HEARTBEAT_DEFAULT_SECONDS
+        or monitor["max_interval_seconds"] < monitor["interval_seconds"]
+        or monitor["max_interval_seconds"] > HEARTBEAT_MAX_SECONDS
+        or not isinstance(monitor.get("unchanged_heartbeats"), int)
+        or monitor["unchanged_heartbeats"] < 0
+        or monitor.get("last_status") != status
+    ):
+        raise WorkflowError("worker monitor metadata is invalid")
+    for name in ("last_heartbeat_at", "next_check_at"):
+        if monitor.get(name) is not None and (not isinstance(monitor[name], int) or monitor[name] < 0):
+            raise WorkflowError("worker monitor timestamps must be non-negative integers")
+    return monitor
+
+
+def _reset_monitor(monitor: dict[str, Any], status: str) -> None:
+    monitor.update(_new_monitor(status))
+
+
+def _routes_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    return all(first.get(field, "UNVERIFIED") == second.get(field, "UNVERIFIED") for field in ("selected_model", "selected_effort", "observed_model", "observed_effort"))
+
+
+def _has_authoritative_decision(evidence: dict[str, Any], task_key: str, identity: dict[str, str], exact_base: str) -> bool:
+    if evidence.get("kind") != "decision" or evidence.get("task_key") != task_key or evidence.get("subject") != identity:
+        return False
+    try:
+        provenance = _as_object(evidence.get("authoritative_provenance"), "decision authoritative_provenance")
+        return (
+            provenance.get("task_key") == task_key
+            and _identity(provenance.get("subject"), exact_base) == identity
+            and isinstance(provenance.get("authority_reference"), str)
+            and bool(provenance["authority_reference"])
+        )
+    except WorkflowError:
+        return False
 
 
 def _structured_references(value: Any, label: str, task_key: str, identity: dict[str, str]) -> list[dict[str, Any]]:
@@ -171,6 +253,10 @@ def validate_route(route: Any, task_class: str | None = None) -> None:
         value = route.get(observed, "UNVERIFIED")
         if not isinstance(value, str) or not value:
             raise WorkflowError(f"{observed} must be a value or UNVERIFIED")
+    if route.get("observed_model", "UNVERIFIED") not in {"UNVERIFIED", selected_model}:
+        raise WorkflowError("observed_model does not match the selected model")
+    if route.get("observed_effort", "UNVERIFIED") not in {"UNVERIFIED", selected_effort}:
+        raise WorkflowError("observed_effort does not match the selected reasoning effort")
     if task_class in PUBLIC_ROUTE:
         expected_model, efforts = PUBLIC_ROUTE[task_class]
         if selected_model != expected_model or selected_effort not in efforts:
@@ -202,6 +288,18 @@ def validate_task(task: Any, *, exact_base: str | None = None) -> dict[str, Any]
         if not _as_list(task[name], name):
             raise WorkflowError(f"task {name} must not be empty")
     validate_route(task["route"], task["task_class"])
+    authorization = _as_object(task.get("maintainer_authorization"), "task maintainer_authorization")
+    identity = _identity(task.get("subject"), task["exact_base"])
+    if (
+        authorization.get("actor") != "maintainer"
+        or authorization.get("task_key") != key
+        or authorization.get("exact_base") != task["exact_base"]
+        or _identity(authorization.get("subject"), task["exact_base"]) != identity
+        or _identity(authorization.get("task_packet_identity"), task["exact_base"]) != identity
+    ):
+        raise WorkflowError("task maintainer authorization is not bound to the task packet and subject")
+    if not all(isinstance(authorization.get(name), str) and authorization[name] for name in ("authority_reference", "readiness_evidence", "reviewed_corrections_evidence")):
+        raise WorkflowError("task maintainer authorization provenance is incomplete")
     result = copy.deepcopy(task)
     result["owned_paths"] = owned_paths
     return result
@@ -226,6 +324,8 @@ def validate_state(state: Any) -> dict[str, Any]:
     repository = _as_object(state.get("repository"), "repository")
     if not isinstance(repository.get("exact_base"), str) or not repository["exact_base"]:
         raise WorkflowError("authoritative exact base is required")
+    if not isinstance(state.get("event_sequence"), int) or state["event_sequence"] < 0:
+        raise WorkflowError("event_sequence must be a non-negative integer")
     tasks = _as_object(state.get("tasks"), "tasks")
     for key, task in tasks.items():
         if key != validate_task(task, exact_base=repository["exact_base"])["task_key"]:
@@ -250,6 +350,7 @@ def validate_state(state: Any) -> dict[str, Any]:
         active_paths.extend(paths)
     workers = _as_list(state.get("workers"), "workers")
     seen_worker_refs: set[str] = set()
+    active_attempts: set[tuple[str, int]] = set()
     for worker in workers:
         worker = _as_object(worker, "worker")
         reference = worker.get("reference")
@@ -260,6 +361,11 @@ def validate_state(state: Any) -> dict[str, Any]:
         seen_worker_refs.add(reference)
         if worker.get("status") not in ACTIVE_WORKER_STATES | {"COMPLETE", "RETIRED"}:
             raise WorkflowError("unknown worker status")
+        attempt = worker.get("attempt", 1)
+        if not isinstance(attempt, int) or attempt < 1:
+            raise WorkflowError("worker attempt must be a positive integer")
+        if worker.get("status") == "SPAWN_UNKNOWN" and not isinstance(worker.get("ambiguity_reference"), str):
+            raise WorkflowError("ambiguous worker state requires durable ambiguity_reference")
         if worker.get("writer") and worker.get("status") in ACTIVE_WORKER_STATES:
             key = worker.get("task_key")
             task = tasks.get(key)
@@ -268,14 +374,36 @@ def validate_state(state: Any) -> dict[str, Any]:
             if worker.get("task_class") != task["task_class"]:
                 raise WorkflowError("active writer task class does not match its task")
             validate_route(worker.get("route"), worker["task_class"])
-            if any(worker["route"].get(field) != task["route"].get(field) for field in ("selected_model", "selected_effort")):
-                raise WorkflowError("active writer selected route does not match its task")
+            if not _routes_match(worker["route"], task["route"]):
+                raise WorkflowError("active writer route does not match its task")
             if key not in active_keys:
                 raise WorkflowError("active writer has no active ownership lease")
+            attempt_key = (key, attempt)
+            if attempt_key in active_attempts:
+                raise WorkflowError("more than one active or spawn-requested writer exists for a task attempt")
+            active_attempts.add(attempt_key)
+            if not TASK_WRITE_CAPABILITY[task["task_class"]]:
+                raise WorkflowError("read-only task class cannot have a writer")
+        _validate_monitor(worker.get("monitor"), worker["status"])
     if _active_writer_count(state) > 2:
         raise WorkflowError("a third active implementation writer is prohibited")
     for field in ("evidence", "verification", "checkpoints", "handoffs", "reviews"):
         _as_list(state.get(field), field)
+    for evidence in state["evidence"]:
+        evidence = _as_object(evidence, "evidence")
+        if evidence.get("kind") == "decision":
+            key = evidence.get("task_key")
+            if key not in tasks or not _has_authoritative_decision(evidence, key, _identity(evidence.get("subject"), repository["exact_base"]), repository["exact_base"]):
+                raise WorkflowError("decision evidence lacks authoritative task/subject provenance")
+    for verification in state["verification"]:
+        verification = _as_object(verification, "verification record")
+        key = verification.get("task_key")
+        if key not in tasks:
+            raise WorkflowError("verification must bind a registered task_key")
+        _verification_request(verification)
+        _identity(verification.get("subject"), repository["exact_base"])
+        if verification.get("status") not in {"PASS", "FAIL", "UNKNOWN", "NON_REUSABLE"}:
+            raise WorkflowError("unknown verification status")
     review_keys: set[str] = set()
     for review in state["reviews"]:
         review = _as_object(review, "review")
@@ -358,13 +486,16 @@ def _require_implementation_authorization(state: dict[str, Any]) -> None:
 
 def acquire_ownership(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
     validate_state(state)
-    _require_implementation_authorization(state)
+    if state["authorization_state"] not in {"MAINTAINER_AUTHORIZED", "IMPLEMENTATION_READY"}:
+        raise WorkflowError("authoritative state is not currently ready for implementation ownership")
     if state["phase"] != "PLAN":
         raise WorkflowError("ownership acquisition is only valid in PLAN")
     key = record.get("task_key")
     task = state["tasks"].get(key)
     if task is None:
         raise WorkflowError("ownership requires a registered task")
+    if not TASK_WRITE_CAPABILITY[task["task_class"]]:
+        raise WorkflowError("read-only task class cannot acquire WRITE ownership")
     paths = [normalized_path(path) for path in _as_list(record.get("paths"), "paths")]
     if set(paths) != set(task["owned_paths"]):
         raise WorkflowError("ownership paths must exactly match the task paths")
@@ -415,6 +546,10 @@ def register_worker(state: dict[str, Any], record: dict[str, Any]) -> dict[str, 
     key = record.get("task_key")
     if key not in state["tasks"]:
         raise WorkflowError("worker requires a registered task")
+    task = state["tasks"][key]
+    writer = record.get("writer", True)
+    if writer and not TASK_WRITE_CAPABILITY[task["task_class"]]:
+        raise WorkflowError("read-only task class cannot register a writer")
     if not any(lease.get("active") and lease.get("task_key") == key for lease in state["ownership"]):
         raise WorkflowError("worker requires an active ownership lease")
     reference = record.get("reference")
@@ -439,18 +574,20 @@ def register_worker(state: dict[str, Any], record: dict[str, Any]) -> dict[str, 
             raise WorkflowError("task already has an active worker")
         manual_intent["reference"] = reference
         manual_intent["status"] = "ACTIVE"
+        _reset_monitor(manual_intent["monitor"], "ACTIVE")
         return manual_intent
     if any(worker.get("task_key") == key and worker.get("status") in ACTIVE_WORKER_STATES for worker in state["workers"]):
         raise WorkflowError("task already has an active worker")
     _check_writer_capacity(state, record)
-    task = state["tasks"][key]
     worker = {
         "reference": reference,
         "task_key": key,
         "task_class": task["task_class"],
-        "writer": record.get("writer", True),
+        "writer": writer,
         "status": "ACTIVE",
         "route": copy.deepcopy(task["route"]),
+        "attempt": record.get("attempt", 1),
+        "monitor": _new_monitor("ACTIVE"),
     }
     state["workers"].append(worker)
     return worker
@@ -462,13 +599,117 @@ def reconcile_worker(state: dict[str, Any], record: dict[str, Any]) -> dict[str,
     for worker in state["workers"]:
         if worker.get("reference") != reference:
             continue
+        target = record.get("status")
+        if target is not None:
+            allowed = {
+                "SPAWN_REQUESTED": {"ACTIVE", "SPAWN_UNKNOWN", "RETIRED"},
+                "ACTIVE": {"WAITING", "BLOCKED", "COMPLETE", "RETIRED"},
+                "WAITING": {"ACTIVE", "BLOCKED", "COMPLETE", "RETIRED"},
+                "BLOCKED": {"ACTIVE", "WAITING", "RETIRED"},
+                "SPAWN_UNKNOWN": {"RETIRED"},
+            }
+            if target not in allowed.get(worker.get("status"), set()):
+                raise WorkflowError("illegal worker attempt-state transition")
+            if worker.get("status") == "SPAWN_UNKNOWN" and record.get("maintainer_replacement_decision") is not True:
+                raise WorkflowError("SPAWN_UNKNOWN requires a maintainer replacement decision")
+            if target == "SPAWN_UNKNOWN":
+                if not isinstance(record.get("ambiguity_reference"), str) or not record["ambiguity_reference"]:
+                    raise WorkflowError("SPAWN_UNKNOWN requires durable ambiguity_reference")
+                worker["ambiguity_reference"] = record["ambiguity_reference"]
+            worker["status"] = target
+            _reset_monitor(worker["monitor"], target)
+            return {"reference": reference, "status": target}
         if worker.get("status") == "SPAWN_UNKNOWN":
             if record.get("maintainer_replacement_decision") is not True:
                 return {"reference": reference, "status": "SPAWN_UNKNOWN", "retry": "BLOCKED"}
             worker["status"] = "RETIRED"
+            _reset_monitor(worker["monitor"], "RETIRED")
             return {"reference": reference, "status": "RETIRED", "replacement": "MAINTAINER_APPROVED"}
         return {"reference": reference, "status": worker["status"], "retry": "NOT_NEEDED"}
     raise WorkflowError("unknown worker reference")
+
+
+def monitor_worker(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    """Persist deterministic, low-frequency polling guidance for one worker.
+
+    This is deliberately a record operation, not a timer or background service.
+    Callers provide an integer clock value and may wait longer than the returned
+    interval without changing the result's safety properties.
+    """
+
+    validate_state(state)
+    reference = record.get("reference")
+    worker = next((item for item in state["workers"] if item.get("reference") == reference), None)
+    if worker is None:
+        raise WorkflowError("unknown worker reference")
+    now = record.get("now")
+    if not isinstance(now, int) or now < 0:
+        raise WorkflowError("worker monitor requires a non-negative integer now")
+    monitor = _validate_monitor(worker["monitor"], worker["status"])
+    if record.get("system_error") is True:
+        monitor["last_heartbeat_at"] = now
+        monitor["next_check_at"] = now
+        return {"action": "WAKE_IMMEDIATELY", "reason": "SYSTEM_ERROR", "reference": reference}
+    if record.get("maintainer_input") is True:
+        monitor["last_heartbeat_at"] = now
+        monitor["next_check_at"] = now
+        return {"action": "WAKE_IMMEDIATELY", "reason": "MAINTAINER_INPUT", "reference": reference}
+    observed_status = record.get("status", worker["status"])
+    if observed_status not in ACTIVE_WORKER_STATES | {"COMPLETE", "RETIRED"}:
+        raise WorkflowError("unknown monitored worker status")
+    if worker["status"] == "SPAWN_UNKNOWN":
+        return {"action": "WAKE_IMMEDIATELY", "reason": "AMBIGUOUS_SPAWN_RECONCILIATION", "reference": reference}
+    if observed_status != worker["status"]:
+        allowed = {
+            "SPAWN_REQUESTED": {"ACTIVE", "SPAWN_UNKNOWN", "RETIRED"},
+            "ACTIVE": {"WAITING", "BLOCKED", "COMPLETE", "RETIRED"},
+            "WAITING": {"ACTIVE", "BLOCKED", "COMPLETE", "RETIRED"},
+            "BLOCKED": {"ACTIVE", "WAITING", "RETIRED"},
+        }
+        if observed_status not in allowed.get(worker["status"], set()):
+            raise WorkflowError("illegal monitored worker attempt-state transition")
+        if observed_status == "SPAWN_UNKNOWN":
+            ambiguity = record.get("ambiguity_reference")
+            if not isinstance(ambiguity, str) or not ambiguity:
+                raise WorkflowError("SPAWN_UNKNOWN requires durable ambiguity_reference")
+            worker["ambiguity_reference"] = ambiguity
+        worker["status"] = observed_status
+        _reset_monitor(monitor, observed_status)
+        monitor["last_heartbeat_at"] = now
+        monitor["next_check_at"] = now if observed_status in {"COMPLETE", "SPAWN_UNKNOWN"} else now + HEARTBEAT_DEFAULT_SECONDS
+        if observed_status in {"COMPLETE", "SPAWN_UNKNOWN", "RETIRED"}:
+            reason = "COMPLETION" if observed_status == "COMPLETE" else "AMBIGUOUS_SPAWN_RECONCILIATION" if observed_status == "SPAWN_UNKNOWN" else "TERMINAL_STATUS"
+            return {"action": "WAKE_IMMEDIATELY", "reason": reason, "reference": reference}
+        return {"action": "HEARTBEAT_CHANGED", "reference": reference, "interval_seconds": monitor["interval_seconds"], "next_check_at": monitor["next_check_at"]}
+    if worker["status"] in {"COMPLETE", "RETIRED"}:
+        return {"action": "WAKE_IMMEDIATELY", "reason": "TERMINAL_STATUS", "reference": reference}
+    for name in ("output_identity", "repository_evidence"):
+        if name in record and record[name] is not None and (not isinstance(record[name], str) or not record[name]):
+            raise WorkflowError(f"worker monitor {name} must be a non-empty string when supplied")
+    output_identity = record.get("output_identity", monitor["last_output_identity"])
+    repository_evidence = record.get("repository_evidence", monitor["last_repository_evidence"])
+    changed = output_identity != monitor["last_output_identity"] or repository_evidence != monitor["last_repository_evidence"]
+    if changed:
+        _reset_monitor(monitor, worker["status"])
+        monitor["last_output_identity"] = output_identity
+        monitor["last_repository_evidence"] = repository_evidence
+        monitor["last_heartbeat_at"] = now
+        monitor["next_check_at"] = now + HEARTBEAT_DEFAULT_SECONDS
+        return {"action": "HEARTBEAT_CHANGED", "reference": reference, "interval_seconds": monitor["interval_seconds"], "next_check_at": monitor["next_check_at"]}
+    if monitor["last_heartbeat_at"] is None:
+        monitor["last_heartbeat_at"] = now
+        monitor["next_check_at"] = now + monitor["interval_seconds"]
+    elif now >= monitor["next_check_at"]:
+        monitor["interval_seconds"] = min(monitor["interval_seconds"] * 2, monitor["max_interval_seconds"])
+        monitor["unchanged_heartbeats"] += 1
+        monitor["last_heartbeat_at"] = now
+        monitor["next_check_at"] = now + monitor["interval_seconds"]
+    return {
+        "action": "WAIT_UNTIL_HEARTBEAT",
+        "reference": reference,
+        "interval_seconds": monitor["interval_seconds"],
+        "next_check_at": monitor["next_check_at"],
+    }
 
 
 def record_evidence(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
@@ -477,7 +718,22 @@ def record_evidence(state: dict[str, Any], record: dict[str, Any]) -> dict[str, 
         raise WorkflowError("evidence kind is required")
     if not isinstance(record.get("subject"), dict):
         raise WorkflowError("evidence subject is required")
-    state["evidence"].append(copy.deepcopy(record))
+    if record["kind"] == "decision":
+        key = record.get("task_key")
+        if key not in state["tasks"]:
+            raise WorkflowError("decision evidence must bind a registered task")
+        subject = _identity(record["subject"], state["repository"]["exact_base"])
+        provenance = _as_object(record.get("authoritative_provenance"), "decision authoritative_provenance")
+        if (
+            provenance.get("task_key") != key
+            or _identity(provenance.get("subject"), state["repository"]["exact_base"]) != subject
+            or not isinstance(provenance.get("authority_reference"), str)
+            or not provenance["authority_reference"]
+        ):
+            raise WorkflowError("decision evidence lacks authoritative task/subject provenance")
+    stored = copy.deepcopy(record)
+    stored["sequence"] = _next_sequence(state)
+    state["evidence"].append(stored)
     return {"recorded": "evidence", "count": len(state["evidence"])}
 
 
@@ -485,22 +741,44 @@ def record_verification(state: dict[str, Any], record: dict[str, Any]) -> dict[s
     validate_state(state)
     if state["phase"] != "VERIFY" or state["authorization_state"] not in {"IMPLEMENTING", "VERIFIED"}:
         raise WorkflowError("verification recording is only valid in VERIFY")
-    for name in ("subject", "command", "scope", "environment", "side_effects", "status"):
+    key = record.get("task_key")
+    if key not in state["tasks"]:
+        raise WorkflowError("verification requires a registered task_key")
+    for name in ("reference", "subject", "command", "scope", "environment", "side_effects", "status"):
         if name not in record:
             raise WorkflowError(f"verification {name} is required")
+    if not isinstance(record["reference"], str) or not record["reference"]:
+        raise WorkflowError("verification reference is required")
     if record["status"] not in {"PASS", "FAIL", "UNKNOWN", "NON_REUSABLE"}:
         raise WorkflowError("unknown verification status")
-    _identity(record["subject"], state["repository"]["exact_base"])
-    state["verification"].append(copy.deepcopy(record))
+    subject = _identity(record["subject"], state["repository"]["exact_base"])
+    request = _verification_request(record)
+    for existing in state["verification"]:
+        if existing.get("reference") == record["reference"] and not (
+            existing.get("task_key") == key
+            and _identity(existing.get("subject"), state["repository"]["exact_base"]) == subject
+            and _verification_request(existing) == request
+        ):
+            raise WorkflowError("verification reference must be unique to task, subject, and request identity")
+    stored = copy.deepcopy(record)
+    stored["subject"] = subject
+    stored["sequence"] = _next_sequence(state)
+    state["verification"].append(stored)
     if record["status"] == "PASS":
         state["authorization_state"] = "VERIFIED"
+    elif (
+        state["authorization_state"] == "VERIFIED"
+        and (handoff := _latest_handoff(state, key)) is not None
+        and handoff.get("identity") == subject
+    ):
+        state["authorization_state"] = "IMPLEMENTING"
     return {"recorded": "verification", "count": len(state["verification"])}
 
 
 def verification_reuse(record: dict[str, Any], subject: dict[str, Any], requested: Any = None) -> dict[str, Any]:
     record = _as_object(record, "verification record")
     subject = _as_object(subject, "subject")
-    required = ("subject", "command", "scope", "environment", "side_effects", "status")
+    required = ("task_key", "subject", "command", "scope", "environment", "side_effects", "status")
     if any(name not in record for name in required) or record.get("status") != "PASS":
         return {"reusable": False, "status": "NON_REUSABLE"}
     try:
@@ -575,12 +853,14 @@ def ingest_handoff(state: dict[str, Any], record: dict[str, Any]) -> dict[str, A
     identity = _identity(record["identity"], state["repository"]["exact_base"])
     applied_decisions = _structured_references(record["applied_decisions"], "handoff applied_decisions", key, identity)
     verification_references = _structured_references(record["verification_references"], "handoff verification_references", key, identity)
+    for reference in verification_references:
+        if "verification_request" not in reference:
+            raise WorkflowError("handoff verification_references must bind a request identity")
+        _verification_request(reference["verification_request"])
     for decision in applied_decisions:
         if not any(
-            evidence.get("kind") == "decision"
-            and evidence.get("task_key") == key
+            _has_authoritative_decision(evidence, key, identity, state["repository"]["exact_base"])
             and evidence.get("reference") == decision["reference"]
-            and evidence.get("subject") == identity
             for evidence in state["evidence"]
         ):
             raise WorkflowError("handoff applied decision is not an authoritative task decision")
@@ -589,13 +869,15 @@ def ingest_handoff(state: dict[str, Any], record: dict[str, Any]) -> dict[str, A
     if not _as_list(record["verification"], "handoff verification"):
         raise WorkflowError("handoff verification must not be empty")
     validate_route(record["route"], task["task_class"])
-    if any(record["route"].get(field) != task["route"].get(field) for field in ("selected_model", "selected_effort")):
+    if not _routes_match(record["route"], task["route"]):
         raise WorkflowError("handoff selected route does not match its task")
     worker["status"] = "COMPLETE"
+    _reset_monitor(worker["monitor"], "COMPLETE")
     stored = copy.deepcopy(record)
     stored["identity"] = identity
     stored["applied_decisions"] = applied_decisions
     stored["verification_references"] = verification_references
+    stored["sequence"] = _next_sequence(state)
     state["handoffs"].append(stored)
     if state["phase"] == "DISPATCH":
         transition(state, "VERIFY")
@@ -652,11 +934,18 @@ def _review_for_task(state: dict[str, Any], task_key: str) -> dict[str, Any] | N
 
 
 def _reusable_verification(
-    state: dict[str, Any], subject: dict[str, Any], requested: Any
+    state: dict[str, Any], task_key: str, subject: dict[str, Any], requested: Any
 ) -> dict[str, Any] | None:
     for verification in reversed(state["verification"]):
-        if verification_reuse(verification, subject, requested)["reusable"]:
-            return verification
+        if verification.get("task_key") != task_key:
+            continue
+        try:
+            same_subject = _identity(verification.get("subject"), subject["base"]) == subject
+            same_request = _verification_request(verification) == _verification_request(_as_object(requested, "verification request"))
+        except WorkflowError:
+            return None
+        if same_subject and same_request:
+            return verification if verification_reuse(verification, subject, requested)["reusable"] else None
     return None
 
 
@@ -681,6 +970,9 @@ def _matching_handoff_verification(handoff: dict[str, Any], verification: dict[s
         item.get("reference") == reference
         and item.get("task_key") == handoff["task_key"]
         and item.get("identity") == handoff["identity"]
+        and verification.get("task_key") == handoff["task_key"]
+        and verification.get("subject") == handoff["identity"]
+        and _verification_request(item.get("verification_request", {})) == _verification_request(verification)
         for item in handoff.get("verification_references", [])
     )
 
@@ -703,15 +995,50 @@ def _authorize_integration(state: dict[str, Any], record: dict[str, Any]) -> Non
     reference = record.get("verification_reference")
     if not isinstance(reference, str) or not reference:
         raise WorkflowError("integration authorization requires a verification reference")
-    verification = next((item for item in reversed(state["verification"]) if item.get("reference") == reference), None)
+    requested = record.get("verification_request")
+    verification = _reusable_verification(state, key, identity, requested)
+    if verification is not None and verification.get("reference") != reference:
+        verification = None
     if verification is None or not _matching_handoff_verification(handoff, verification):
         raise WorkflowError("integration authorization requires a handoff-bound verification reference")
-    requested = record.get("verification_request")
     if verification_reuse(verification, identity, requested)["reusable"] is not True:
         raise WorkflowError("integration authorization requires a matching reusable PASS verification")
     review = _review_for_task(state, key)
+    if review_required(state["tasks"][key], [])["required"] and review is None:
+        raise WorkflowError("integration authorization requires a passing review of the exact subject")
     if review is not None and (review.get("status") != "PASS" or review.get("subject") != identity):
         raise WorkflowError("integration authorization requires a passing review of the exact subject")
+    review_sequence = review.get("completed_sequence", review.get("sequence", 0)) if review is not None else 0
+    final_gate = next(
+        (
+            item
+            for item in reversed(state["verification"])
+            if item.get("task_key") == key
+            and item.get("subject") == identity
+            and item.get("status") == "PASS"
+            and item.get("command") == ["python", "scripts/temper-gate.py", "all"]
+            and isinstance(item.get("final_verifier"), str)
+            and item["final_verifier"]
+            and item.get("sequence", 0) > handoff.get("sequence", 0)
+            and item.get("sequence", 0) > review_sequence
+        ),
+        None,
+    )
+    if final_gate is None:
+        raise WorkflowError("integration authorization requires exact-subject final-verifier temper-gate all PASS evidence after final assembly")
+    public_safety = next(
+        (
+            item
+            for item in reversed(state["verification"])
+            if item.get("task_key") == key
+            and item.get("subject") == identity
+            and item.get("status") == "PASS"
+            and item.get("verification_type") == "public_safety"
+        ),
+        None,
+    )
+    if public_safety is None:
+        raise WorkflowError("integration authorization requires exact-subject public-safety PASS evidence")
 
 
 def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
@@ -744,6 +1071,8 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
             raise WorkflowError("dispatch requires an active ownership lease")
         if any(worker.get("task_key") == key and worker.get("status") in ACTIVE_WORKER_STATES for worker in state["workers"]):
             raise WorkflowError("task already has an active worker")
+        if not TASK_WRITE_CAPABILITY[task["task_class"]]:
+            raise WorkflowError("read-only task class cannot dispatch a writer")
         validate_route(task["route"], task["task_class"])
         _check_writer_capacity(state, {"writer": True})
         intent = {
@@ -753,6 +1082,8 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
             "writer": True,
             "status": "SPAWN_REQUESTED",
             "route": copy.deepcopy(task["route"]),
+            "attempt": 1,
+            "monitor": _new_monitor("SPAWN_REQUESTED"),
         }
         if any(worker["reference"] == intent["reference"] for worker in state["workers"]):
             raise WorkflowError("manual dispatch intent already exists")
@@ -775,7 +1106,7 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
         return _advance_result(state, advanced=False, next_step="AWAIT_HANDOFF", transitions=transitions)
     subject = _as_object(handoff.get("identity"), "handoff identity")
     requested_verification = record.get("verification_request")
-    reusable_verification = _reusable_verification(state, subject, requested_verification)
+    reusable_verification = _reusable_verification(state, key, subject, requested_verification)
     if reusable_verification is None:
         return _advance_result(
             state,
@@ -804,6 +1135,7 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
                 "route": "terra-high",
                 "write_ownership": "none",
                 "rubric_ref": "docs/workflow/policies/review-matrix.yaml",
+                "sequence": _next_sequence(state),
             }
             state["reviews"].append(review)
             return _advance_result(state, advanced=False, next_step="AWAIT_COLD_REVIEW", transitions=transitions, review_packet=copy.deepcopy(review))
@@ -816,6 +1148,7 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
         if review_status is not None:
             if review_status == "PASS":
                 review["status"] = "PASS"
+                review["completed_sequence"] = _next_sequence(state)
             elif review_status == "REPAIR_REQUIRED":
                 if review["repair_cycles"] >= 1:
                     review["status"] = "REPAIR_LIMIT_REACHED"
@@ -871,7 +1204,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="temper-workflow", description=__doc__)
     parser.add_argument("--state", required=True, help="JSON coordinator record")
     parser.add_argument("--record", help="JSON object for the selected command")
-    parser.add_argument("command", choices=["status", "validate", "transition", "authorize", "validate-task", "register-worker", "reconcile-worker", "acquire-ownership", "release-ownership", "record-evidence", "record-verification", "verification-reuse", "checkpoint", "compile-context", "ingest-handoff", "review-required", "next-action", "advance"])
+    parser.add_argument("command", choices=["status", "validate", "transition", "authorize", "validate-task", "register-worker", "reconcile-worker", "monitor-worker", "acquire-ownership", "release-ownership", "record-evidence", "record-verification", "verification-reuse", "checkpoint", "compile-context", "ingest-handoff", "review-required", "next-action", "advance"])
     return parser
 
 
@@ -895,6 +1228,8 @@ def main(argv: list[str] | None = None) -> int:
             result, changed = register_worker(state, record), True
         elif args.command == "reconcile-worker":
             result, changed = reconcile_worker(state, record), True
+        elif args.command == "monitor-worker":
+            result, changed = monitor_worker(state, record), True
         elif args.command == "acquire-ownership":
             result, changed = acquire_ownership(state, record), True
         elif args.command == "release-ownership":
