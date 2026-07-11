@@ -14,6 +14,11 @@ from temper_ml.domain.projections import (
     HashProjection,
     content_identity,
 )
+from temper_ml.filesystem import (
+    UnsafeFilesystemPath,
+    ensure_safe_directory,
+    safe_path_stat,
+)
 from temper_ml.store.canonical_json import (
     CanonicalJsonError,
     dumps_canonical_json,
@@ -54,7 +59,11 @@ class WriteOnceStore:
             raise WriteOnceError("immutable records must be JSON objects")
         identity = content_identity(projection, canonical_record)
         path = self._immutable_path(area, identity)
-        if path.exists() or path.is_symlink():
+        try:
+            existing = safe_path_stat(path, allow_missing=True)
+        except UnsafeFilesystemPath as exc:
+            raise WriteOnceError(str(exc)) from exc
+        if existing is not None:
             self._verify_immutable_record(path, projection, identity)
             raise WriteOnceExists(f"immutable content already exists: {identity}")
         self._ensure_safe_directory(path.parent)
@@ -108,8 +117,10 @@ class WriteOnceStore:
     def write_derived_state(self, name: str, state: Mapping[str, Any]) -> Path:
         path = self.root / "derived" / _safe_relative_path(name).with_suffix(".json")
         self._ensure_safe_directory(path.parent)
-        if path.is_symlink():
-            raise WriteOnceError(f"symbolic links are not allowed in the store: {path}")
+        try:
+            safe_path_stat(path, allow_missing=True)
+        except UnsafeFilesystemPath as exc:
+            raise WriteOnceError(str(exc)) from exc
         temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         temp_path.write_bytes(dumps_canonical_json(state))
         os.replace(temp_path, path)
@@ -130,30 +141,10 @@ class WriteOnceStore:
         except ValueError as exc:
             raise WriteOnceError(f"store path escapes root: {path}") from exc
 
-        current = self.root
-        if current.is_symlink():
-            raise WriteOnceError(
-                f"symbolic links are not allowed in the store: {current}"
-            )
-        if current.exists():
-            if not current.is_dir():
-                raise WriteOnceError(f"store root is not a directory: {current}")
-        else:
-            current.mkdir(parents=True, exist_ok=True)
-
-        for part in relative_path.parts:
-            current = current / part
-            if current.is_symlink():
-                raise WriteOnceError(
-                    f"symbolic links are not allowed in the store: {current}"
-                )
-            try:
-                current.mkdir()
-            except FileExistsError:
-                if current.is_symlink() or not current.is_dir():
-                    raise WriteOnceError(
-                        f"store path is not a directory: {current}"
-                    ) from None
+        try:
+            ensure_safe_directory(self.root / relative_path)
+        except (OSError, UnsafeFilesystemPath) as exc:
+            raise WriteOnceError(str(exc)) from exc
 
     def _assert_no_symlinks(self, path: Path) -> None:
         try:
@@ -161,17 +152,10 @@ class WriteOnceStore:
         except ValueError as exc:
             raise WriteOnceError(f"store path escapes root: {path}") from exc
 
-        current = self.root
-        if current.is_symlink():
-            raise WriteOnceError(
-                f"symbolic links are not allowed in the store: {current}"
-            )
-        for part in relative_path.parts:
-            current = current / part
-            if current.is_symlink():
-                raise WriteOnceError(
-                    f"symbolic links are not allowed in the store: {current}"
-                )
+        try:
+            safe_path_stat(self.root / relative_path)
+        except UnsafeFilesystemPath as exc:
+            raise WriteOnceError(str(exc)) from exc
 
 
 def _safe_relative_path(value: str) -> Path:

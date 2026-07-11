@@ -33,6 +33,17 @@ def test_conflicting_idempotency_key_fails_closed(tmp_path: Path) -> None:
         stream.append(EventRequest("same-key", "run.created", {"value": 2}))
 
 
+def test_first_append_returns_the_canonicalized_payload(tmp_path: Path) -> None:
+    stream = EventStream(tmp_path / "events")
+    request = EventRequest("one", "created", {"values": ("alpha", "beta")})
+
+    stored = stream.append(request)
+
+    assert stored.payload == {"values": ["alpha", "beta"]}
+    assert stream.append(request) == stored
+    assert stream.read_verified() == (stored,)
+
+
 def test_rebuild_reduces_only_verified_events(tmp_path: Path) -> None:
     stream = EventStream(tmp_path / "events")
     stream.append(EventRequest("one", "counter.added", {"amount": 2}))

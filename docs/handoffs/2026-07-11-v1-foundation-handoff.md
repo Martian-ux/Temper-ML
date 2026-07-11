@@ -32,22 +32,24 @@ order and slice acceptance are governed by
 - Slice 0 repository, dependency-lock, cross-platform gate, fixture, and CI
   baseline.
 - Strict canonical JSON encoding and reading, immutable write-once storage,
-  projection identities, and path/symlink protections.
+  projection identities, and shared symlink/reparse-point path protections.
 - Canonical store layout, hash-linked event stream, artifact and bundle
-  identities, verification, recovery behavior, and adversarial tests.
+  identities, closed bundle verification, stable opened-file snapshots,
+  canonical event payloads, recovery behavior, and adversarial tests.
+- The default gate runs the complete test tree. CI runs the same gate on Ubuntu
+  and Windows.
 - Product architecture and roadmap alignment for local adapter use and the
   Windows/WSL2 ROCm topology.
 - Public-safety checks and repository-local GitHub noreply commit metadata.
 
 ## Verification at handoff
 
-- The full repository gate passed on the pre-handoff implementation head:
-  formatting, lint, typing, compilation, 48 passing unit tests, one expected
-  Windows symlink skip, fixture help, and diff hygiene.
-- The focused persistence adversarial suite passed 21 tests with two expected
-  Windows symlink skips.
-- The publishing task must rerun the full gate on the exact commit containing
-  this handoff and report that result in the pull request.
+- The complete Windows maintenance gate passed after review repair: formatting,
+  lint, typing, compilation, 104 tests, and nine expected capability skips.
+- The focused WSL persistence and gate suite passed all 68 tests, including the
+  symlink-containment cases skipped by the Windows host.
+- The publishing task must run the full gate on the exact repair commit and
+  require both Ubuntu and Windows CI jobs to pass before leaving draft.
 
 ## Next bounded work: finish Slice 1
 
@@ -56,7 +58,8 @@ evidence-service scope:
 
 1. Add typed record envelopes and the projection registry.
 2. Add the redaction service and public-safe dump/export behavior.
-3. Complete byte, record, and bundle verification integration.
+3. Integrate the closed byte, record, and bundle verifiers into typed evidence
+   services.
 4. Add CLI commands for status, dump, verify, and manifest inspection.
 5. Add focused recovery, corruption, unsafe-path, redaction, and CLI tests.
 

@@ -101,6 +101,10 @@ def run_unit(uv_command: Sequence[str], uv_env: dict[str, str] | None) -> int:
     return run_uv(["run", "pytest", "tests/unit"], uv_command, uv_env)
 
 
+def run_tests(uv_command: Sequence[str], uv_env: dict[str, str] | None) -> int:
+    return run_uv(["run", "pytest", "tests"], uv_command, uv_env)
+
+
 def run_format(uv_command: Sequence[str], uv_env: dict[str, str] | None) -> int:
     return run_uv(
         ["run", "ruff", "format", "--check", "src", "tests", "scripts"],
@@ -133,7 +137,7 @@ def run_maintenance(uv_command: Sequence[str], uv_env: dict[str, str] | None) ->
         run_lint,
         run_typecheck,
         run_compile,
-        run_unit,
+        run_tests,
     ):
         status = gate(uv_command, uv_env)
         if status != 0:

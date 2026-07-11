@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Iterator, TypeVar
 from uuid import uuid4
 
@@ -15,6 +16,15 @@ from temper_ml.domain.projections import (
     ContentIdentity,
     HashProjection,
     content_identity,
+)
+from temper_ml.filesystem import (
+    UnsafeFilesystemPath,
+    ensure_safe_directory,
+    is_link_or_reparse,
+    require_safe_directory,
+    require_safe_regular_file,
+    safe_path_stat,
+    same_file_object,
 )
 from temper_ml.store.canonical_json import (
     CanonicalJsonError,
@@ -97,54 +107,78 @@ class EventStream:
         self.directory = Path(directory)
 
     def append(self, request: EventRequest) -> StoredEvent:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        with _metadata_lock(self.directory / ".append.lock"):
-            events = self.read_verified()
-            requested = dumps_canonical_json(request.canonical_fields())
-            for event in events:
-                if event.idempotency_key != request.idempotency_key:
-                    continue
-                if dumps_canonical_json(event.request_fields()) == requested:
-                    return event
-                raise EventConflict(
-                    "idempotency key conflicts with existing event: "
-                    f"{request.idempotency_key!r}"
-                )
+        try:
+            ensure_safe_directory(self.directory)
+            with _metadata_lock(self.directory / ".append.lock"):
+                return self._append_locked(request)
+        except (OSError, UnsafeFilesystemPath) as exc:
+            raise EventStreamCorrupt(f"unsafe event stream path: {exc}") from exc
 
-            sequence = len(events) + 1
-            predecessor = events[-1].identity.value if events else None
-            envelope = {
-                "schema_version": EVENT_SCHEMA_VERSION,
-                "projection_version": EVENT_PROJECTION.version,
-                "sequence": sequence,
-                "predecessor_hash": predecessor,
-                **request.canonical_fields(),
-            }
-            identity = content_identity(EVENT_PROJECTION, envelope)
-            path = self.directory / f"{sequence:020d}-{identity.value}.json"
-            if path.exists():
-                raise EventStreamCorrupt(f"event path already exists: {path.name}")
-            _atomic_write(path, dumps_canonical_json(envelope))
-            return StoredEvent(
-                sequence,
-                predecessor,
-                request.idempotency_key,
-                request.event_type,
-                dict(request.payload),
-                identity,
-                path,
+    def _append_locked(self, request: EventRequest) -> StoredEvent:
+        events = self.read_verified()
+        requested = dumps_canonical_json(request.canonical_fields())
+        canonical_request = loads_canonical_json(requested)
+        if not isinstance(canonical_request, dict) or not isinstance(
+            canonical_request.get("payload"), dict
+        ):
+            raise EventStreamCorrupt("event request did not canonicalize to an object")
+        canonical_payload = canonical_request["payload"]
+        for event in events:
+            if event.idempotency_key != request.idempotency_key:
+                continue
+            if dumps_canonical_json(event.request_fields()) == requested:
+                return event
+            raise EventConflict(
+                "idempotency key conflicts with existing event: "
+                f"{request.idempotency_key!r}"
             )
 
+        sequence = len(events) + 1
+        predecessor = events[-1].identity.value if events else None
+        envelope = {
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "projection_version": EVENT_PROJECTION.version,
+            "sequence": sequence,
+            "predecessor_hash": predecessor,
+            "idempotency_key": request.idempotency_key,
+            "event_type": request.event_type,
+            "payload": canonical_payload,
+        }
+        identity = content_identity(EVENT_PROJECTION, envelope)
+        path = self.directory / f"{sequence:020d}-{identity.value}.json"
+        if safe_path_stat(path, allow_missing=True) is not None:
+            raise EventStreamCorrupt(f"event path already exists: {path.name}")
+        _atomic_write(path, dumps_canonical_json(envelope))
+        return StoredEvent(
+            sequence,
+            predecessor,
+            request.idempotency_key,
+            request.event_type,
+            canonical_payload,
+            identity,
+            path,
+        )
+
     def read_verified(self) -> tuple[StoredEvent, ...]:
-        if not self.directory.exists():
+        try:
+            require_safe_directory(self.directory)
+        except FileNotFoundError:
             return ()
+        except UnsafeFilesystemPath as exc:
+            raise EventStreamCorrupt(f"unsafe event stream path: {exc}") from exc
         paths: list[Path] = []
         for path in self.directory.iterdir():
+            try:
+                require_safe_regular_file(path)
+            except (OSError, UnsafeFilesystemPath) as exc:
+                raise EventStreamCorrupt(
+                    f"unexpected or unsafe event stream entry: {path.name!r}: {exc}"
+                ) from exc
             if path.name == ".append.lock":
                 continue
             if path.name.startswith(".") and path.name.endswith(".tmp"):
                 continue
-            if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+            if path.suffix != ".json":
                 raise EventStreamCorrupt(
                     f"unexpected event stream entry: {path.name!r}"
                 )
@@ -159,9 +193,14 @@ class EventStream:
                 raise EventStreamCorrupt(f"invalid event filename: {path.name!r}")
             filename_sequence = int(match.group(1))
             try:
-                raw = path.read_bytes()
+                raw = _read_regular_bytes(path)
                 envelope = loads_canonical_json(raw)
-            except (OSError, CanonicalJsonError, UnicodeError) as exc:
+            except (
+                OSError,
+                CanonicalJsonError,
+                UnicodeError,
+                UnsafeFilesystemPath,
+            ) as exc:
                 raise EventStreamCorrupt(f"invalid event content: {path.name}") from exc
             if not isinstance(envelope, dict):
                 raise EventStreamCorrupt(
@@ -237,8 +276,26 @@ def _validate_envelope(envelope: dict[str, Any], name: str) -> None:
 def _metadata_lock(path: Path) -> Iterator[None]:
     """Hold a one-byte OS lock that the kernel releases when the handle closes."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as handle:
+    ensure_safe_directory(path.parent)
+    existing = safe_path_stat(path, allow_missing=True)
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise UnsafeFilesystemPath(f"lock path is not a regular file: {path}")
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "r+b") as handle:
+        opened = os.fstat(handle.fileno())
+        current = require_safe_regular_file(path)
+        if (
+            is_link_or_reparse(opened)
+            or not stat.S_ISREG(opened.st_mode)
+            or not same_file_object(opened, current)
+        ):
+            raise UnsafeFilesystemPath(f"lock path changed while opening: {path}")
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
             handle.write(b"\0")
@@ -266,16 +323,67 @@ def _metadata_lock(path: Path) -> Iterator[None]:
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:
+    ensure_safe_directory(path.parent)
+    if safe_path_stat(path, allow_missing=True) is not None:
+        raise UnsafeFilesystemPath(f"event path already exists: {path}")
     temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    if safe_path_stat(temp_path, allow_missing=True) is not None:
+        raise UnsafeFilesystemPath(f"temporary event path already exists: {temp_path}")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
-        with temp_path.open("xb") as handle:
+        descriptor = os.open(temp_path, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+            opened = os.fstat(handle.fileno())
+            if is_link_or_reparse(opened) or not stat.S_ISREG(opened.st_mode):
+                raise UnsafeFilesystemPath(
+                    f"temporary event path is not a safe regular file: {temp_path}"
+                )
+        ensure_safe_directory(path.parent)
+        current_temp = require_safe_regular_file(temp_path)
+        if not same_file_object(opened, current_temp):
+            raise UnsafeFilesystemPath(
+                f"temporary event path changed before commit: {temp_path}"
+            )
+        if safe_path_stat(path, allow_missing=True) is not None:
+            raise UnsafeFilesystemPath(f"event path appeared before commit: {path}")
         os.replace(temp_path, path)
+        require_safe_regular_file(path)
         _fsync_directory(path.parent)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def _read_regular_bytes(path: Path) -> bytes:
+    before = require_safe_regular_file(path)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if (
+            is_link_or_reparse(opened)
+            or not stat.S_ISREG(opened.st_mode)
+            or not same_file_object(before, opened)
+        ):
+            raise UnsafeFilesystemPath(f"event path changed while opening: {path}")
+        data = handle.read()
+        after = os.fstat(handle.fileno())
+    current = require_safe_regular_file(path)
+    if (
+        not same_file_object(opened, after)
+        or not same_file_object(after, current)
+        or len(data) != after.st_size
+    ):
+        raise UnsafeFilesystemPath(f"event path changed while reading: {path}")
+    return data
 
 
 def _fsync_directory(directory: Path) -> None:

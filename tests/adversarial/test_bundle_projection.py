@@ -49,6 +49,20 @@ def test_bundle_rejects_symlink(tmp_path: Path) -> None:
         build_bundle_manifest(tmp_path)
 
 
+def test_bundle_rejects_member_below_symlinked_directory(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.bin").write_bytes(b"synthetic outside bytes")
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable in this test environment")
+
+    with pytest.raises(ArtifactError, match="symlink|reparse"):
+        build_bundle_manifest(tmp_path, ["link/secret.bin"])
+
+
 def test_bundle_verification_rejects_tampered_manifest(tmp_path: Path) -> None:
     (tmp_path / "member.bin").write_bytes(b"public synthetic bytes")
     manifest = build_bundle_manifest(tmp_path)
@@ -62,6 +76,15 @@ def test_bundle_verification_rejects_tampered_manifest(tmp_path: Path) -> None:
 
     with pytest.raises(VerificationError):
         verify_bundle(tmp_path, tampered)
+
+
+def test_bundle_verification_rejects_unlisted_file(tmp_path: Path) -> None:
+    (tmp_path / "member.bin").write_bytes(b"public synthetic bytes")
+    manifest = build_bundle_manifest(tmp_path)
+    (tmp_path / "unexpected-config.json").write_bytes(b"{}\n")
+
+    with pytest.raises(VerificationError, match="member"):
+        verify_bundle(tmp_path, manifest)
 
 
 def test_bundle_rejects_fifo_when_supported(tmp_path: Path) -> None:

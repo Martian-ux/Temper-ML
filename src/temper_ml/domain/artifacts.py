@@ -14,6 +14,13 @@ from temper_ml.domain.projections import (
     HashProjection,
     content_identity,
 )
+from temper_ml.filesystem import (
+    UnsafeFilesystemPath,
+    is_link_or_reparse,
+    require_safe_directory,
+    require_safe_regular_file,
+    same_file_object,
+)
 
 BUNDLE_PROJECTION = HashProjection("artifact.bundle", "v1")
 BUNDLE_SCHEMA_VERSION = "v1"
@@ -59,6 +66,12 @@ class BundleManifest:
         }
 
 
+@dataclass(frozen=True)
+class _FileSnapshot:
+    identity: ContentIdentity
+    size: int
+
+
 def byte_identity(data: bytes) -> ContentIdentity:
     """Return the SHA-256 identity of bytes without path-derived input."""
 
@@ -68,23 +81,9 @@ def byte_identity(data: bytes) -> ContentIdentity:
 def file_identity(
     path: Path | str, *, chunk_size: int = 1024 * 1024
 ) -> ContentIdentity:
-    """Stream a regular file into SHA-256 using bounded memory."""
+    """Hash one stable opened-file snapshot using bounded memory."""
 
-    if chunk_size <= 0:
-        raise ArtifactError("chunk_size must be positive")
-    candidate = Path(path)
-    mode = candidate.lstat().st_mode
-    if stat.S_ISLNK(mode):
-        raise ArtifactError(f"artifact member is a symlink: {candidate.name!r}")
-    if not stat.S_ISREG(mode):
-        raise ArtifactError(
-            f"artifact member is not a regular file: {candidate.name!r}"
-        )
-    digest = hashlib.sha256()
-    with candidate.open("rb") as handle:
-        while chunk := handle.read(chunk_size):
-            digest.update(chunk)
-    return ContentIdentity("sha256", digest.hexdigest())
+    return _snapshot_file(Path(path), chunk_size=chunk_size).identity
 
 
 def build_bundle_manifest(
@@ -93,8 +92,12 @@ def build_bundle_manifest(
     """Build a location-independent manifest for regular files below ``root``."""
 
     bundle_root = Path(root)
-    if bundle_root.is_symlink() or not bundle_root.is_dir():
-        raise ArtifactError("bundle root must be a non-symlink directory")
+    try:
+        require_safe_directory(bundle_root)
+    except (OSError, UnsafeFilesystemPath) as exc:
+        raise ArtifactError(
+            f"bundle root must be a safe non-symlink directory: {exc}"
+        ) from exc
 
     if member_paths is None:
         raw_paths = _enumerated_paths(bundle_root)
@@ -113,16 +116,10 @@ def build_bundle_manifest(
     for relative in normalized:
         candidate = bundle_root.joinpath(*PurePosixPath(relative).parts)
         try:
-            mode = candidate.lstat().st_mode
+            snapshot = _snapshot_file(candidate)
         except FileNotFoundError as exc:
             raise ArtifactError(f"bundle member does not exist: {relative!r}") from exc
-        if stat.S_ISLNK(mode):
-            raise ArtifactError(f"bundle member is a symlink: {relative!r}")
-        if not stat.S_ISREG(mode):
-            raise ArtifactError(f"bundle member is not a regular file: {relative!r}")
-        members.append(
-            BundleMember(relative, file_identity(candidate), candidate.stat().st_size)
-        )
+        members.append(BundleMember(relative, snapshot.identity, snapshot.size))
 
     ordered = tuple(sorted(members, key=lambda member: member.path))
     fields = {
@@ -140,17 +137,94 @@ def build_bundle_manifest(
 
 def _enumerated_paths(root: Path) -> list[str]:
     paths: list[str] = []
-    for candidate in root.rglob("*"):
-        relative = candidate.relative_to(root).as_posix()
-        mode = candidate.lstat().st_mode
-        if stat.S_ISLNK(mode):
-            raise ArtifactError(f"bundle member is a symlink: {relative!r}")
-        if stat.S_ISDIR(mode):
-            continue
-        if not stat.S_ISREG(mode):
-            raise ArtifactError(f"bundle member is not a regular file: {relative!r}")
-        paths.append(relative)
+    pending: list[tuple[Path, str]] = [(root, "")]
+    while pending:
+        directory, prefix = pending.pop()
+        try:
+            require_safe_directory(directory)
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+        except (OSError, UnsafeFilesystemPath) as exc:
+            raise ArtifactError(f"unsafe bundle directory: {exc}") from exc
+        for entry in entries:
+            relative = f"{prefix}/{entry.name}" if prefix else entry.name
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ArtifactError(
+                    f"unable to inspect bundle member: {relative!r}"
+                ) from exc
+            if is_link_or_reparse(info):
+                raise ArtifactError(
+                    f"bundle member is a symlink or reparse point: {relative!r}"
+                )
+            if stat.S_ISDIR(info.st_mode):
+                pending.append((Path(entry.path), relative))
+            elif stat.S_ISREG(info.st_mode):
+                paths.append(relative)
+            else:
+                raise ArtifactError(
+                    f"bundle member is not a regular file: {relative!r}"
+                )
     return paths
+
+
+def _snapshot_file(path: Path, *, chunk_size: int = 1024 * 1024) -> _FileSnapshot:
+    if chunk_size <= 0:
+        raise ArtifactError("chunk_size must be positive")
+    try:
+        require_safe_regular_file(path)
+    except UnsafeFilesystemPath as exc:
+        raise ArtifactError(str(exc)) from exc
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ArtifactError(
+            f"unable to open artifact member safely: {path.name!r}"
+        ) from exc
+
+    digest = hashlib.sha256()
+    bytes_read = 0
+    with os.fdopen(descriptor, "rb") as handle:
+        before = os.fstat(handle.fileno())
+        if is_link_or_reparse(before) or not stat.S_ISREG(before.st_mode):
+            raise ArtifactError(
+                f"artifact member is not a safe regular file: {path.name!r}"
+            )
+        while chunk := handle.read(chunk_size):
+            bytes_read += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(handle.fileno())
+
+    if (
+        _snapshot_signature(before) != _snapshot_signature(after)
+        or bytes_read != after.st_size
+    ):
+        raise ArtifactError(f"artifact member changed during snapshot: {path.name!r}")
+    try:
+        current = require_safe_regular_file(path)
+    except (OSError, UnsafeFilesystemPath) as exc:
+        raise ArtifactError(
+            f"artifact member changed during snapshot: {path.name!r}"
+        ) from exc
+    if not same_file_object(after, current) or after.st_size != current.st_size:
+        raise ArtifactError(f"artifact member changed during snapshot: {path.name!r}")
+    return _FileSnapshot(
+        identity=ContentIdentity("sha256", digest.hexdigest()),
+        size=after.st_size,
+    )
+
+
+def _snapshot_signature(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
 
 
 def _validate_member_path(value: str) -> str:

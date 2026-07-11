@@ -32,7 +32,7 @@ def verify_file(path: Path | str, expected: ContentIdentity) -> None:
 
 
 def verify_bundle(root: Path | str, manifest: BundleManifest) -> None:
-    """Rebuild and compare a bundle manifest, including its claimed identity."""
+    """Verify the manifest identity and exact closed member set below ``root``."""
 
     projected_identity = content_identity(
         BUNDLE_PROJECTION, manifest.projected_fields()
@@ -40,9 +40,7 @@ def verify_bundle(root: Path | str, manifest: BundleManifest) -> None:
     if projected_identity != manifest.identity:
         raise VerificationError("bundle manifest identity mismatch")
     try:
-        actual = build_bundle_manifest(
-            root, [member.path for member in manifest.members]
-        )
+        actual = build_bundle_manifest(root)
     except (ArtifactError, OSError) as exc:
         raise VerificationError("bundle member verification failed") from exc
     if actual != manifest:

@@ -14,6 +14,72 @@ def _events(stream: EventStream) -> list[Path]:
     return sorted(stream.directory.glob("*.json"))
 
 
+def _symlink_or_skip(link: Path, target: Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError:
+        pytest.skip("symlinks are unavailable in this test environment")
+
+
+def test_append_rejects_symlinked_event_directory(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    events = tmp_path / "events"
+    _symlink_or_skip(events, outside, directory=True)
+
+    with pytest.raises(EventStreamCorrupt, match="symlink|reparse"):
+        EventStream(events).append(EventRequest("one", "created", {}))
+
+    assert list(outside.iterdir()) == []
+
+
+def test_append_rejects_symlinked_event_ancestor(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    _symlink_or_skip(linked_parent, outside, directory=True)
+
+    stream = EventStream(linked_parent / "events")
+    with pytest.raises(EventStreamCorrupt, match="symlink|reparse"):
+        stream.append(EventRequest("one", "created", {}))
+
+    assert list(outside.iterdir()) == []
+
+
+def test_append_rejects_symlinked_lock_file_without_modifying_target(
+    tmp_path: Path,
+) -> None:
+    events = tmp_path / "events"
+    events.mkdir()
+    target = tmp_path / "lock-target"
+    target.write_bytes(b"")
+    _symlink_or_skip(events / ".append.lock", target)
+
+    with pytest.raises(EventStreamCorrupt, match="symlink|reparse"):
+        EventStream(events).append(EventRequest("one", "created", {}))
+
+    assert target.read_bytes() == b""
+
+
+def test_append_rejects_broken_event_directory_symlink(tmp_path: Path) -> None:
+    events = tmp_path / "events"
+    _symlink_or_skip(events, tmp_path / "missing", directory=True)
+
+    with pytest.raises(EventStreamCorrupt, match="symlink|reparse"):
+        EventStream(events).append(EventRequest("one", "created", {}))
+
+
+def test_symlinked_temporary_event_entry_is_not_ignored(tmp_path: Path) -> None:
+    stream = EventStream(tmp_path / "events")
+    stream.append(EventRequest("one", "created", {}))
+    target = tmp_path / "temporary-target"
+    target.write_bytes(b"synthetic")
+    _symlink_or_skip(stream.directory / ".event.interrupted.tmp", target)
+
+    with pytest.raises(EventStreamCorrupt, match="symlink|reparse"):
+        stream.read_verified()
+
+
 def test_incomplete_temporary_files_are_ignored(tmp_path: Path) -> None:
     stream = EventStream(tmp_path / "events")
     stored = stream.append(EventRequest("one", "created", {"ok": True}))

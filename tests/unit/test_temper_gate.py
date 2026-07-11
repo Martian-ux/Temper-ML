@@ -59,7 +59,7 @@ def test_setup_requires_the_committed_lockfile(monkeypatch):
     assert [call["command"] for call in calls] == [["uv", "sync", "--dev", "--locked"]]
 
 
-def test_maintenance_runs_compile_and_unit_checks_through_uv(monkeypatch):
+def test_maintenance_runs_compile_and_complete_suite_through_uv(monkeypatch):
     gate = load_gate_module()
     calls = []
 
@@ -75,7 +75,7 @@ def test_maintenance_runs_compile_and_unit_checks_through_uv(monkeypatch):
         ["uv", "run", "ruff", "check", "src", "tests", "scripts"],
         ["uv", "run", "mypy", "src"],
         ["uv", "run", "python", "-m", "compileall", "-q", "src"],
-        ["uv", "run", "pytest", "tests/unit"],
+        ["uv", "run", "pytest", "tests"],
     ]
 
 
@@ -230,7 +230,7 @@ def test_all_runs_dependency_checks_once_through_resolved_uv(monkeypatch):
         [*uv_command, "run", "ruff", "check", "src", "tests", "scripts"],
         [*uv_command, "run", "mypy", "src"],
         [*uv_command, "run", "python", "-m", "compileall", "-q", "src"],
-        [*uv_command, "run", "pytest", "tests/unit"],
+        [*uv_command, "run", "pytest", "tests"],
         ["git", "diff", "--check"],
     ]
     assert [call["env"] for call in calls[:6]] == [uv_env] * 6
@@ -301,3 +301,16 @@ def test_fixture_help_does_not_spawn_bash(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "Usage:" in output
     assert "fixture walkthrough" in output
+
+
+def test_ci_gate_runs_on_ubuntu_and_windows() -> None:
+    workflow = (
+        Path(__file__).resolve().parents[2]
+        / ".github"
+        / "workflows"
+        / "temper-gate.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "os: [ubuntu-latest, windows-latest]" in workflow
+    assert "runs-on: ${{ matrix.os }}" in workflow
+    assert "python scripts/temper-gate.py all" in workflow

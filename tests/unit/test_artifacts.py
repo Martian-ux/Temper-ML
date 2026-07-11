@@ -1,7 +1,9 @@
+import os
 from pathlib import Path
 
 import pytest
 
+import temper_ml.domain.artifacts as artifacts
 from temper_ml.domain.artifacts import (
     ArtifactError,
     build_bundle_manifest,
@@ -32,6 +34,30 @@ def test_file_verification_fails_closed_after_tampering(tmp_path: Path) -> None:
     path.write_bytes(b"synthetic-v2")
     with pytest.raises(VerificationError, match="identity mismatch"):
         verify_file(path, expected)
+
+
+def test_file_identity_rejects_mutation_during_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "artifact.bin"
+    path.write_bytes(b"synthetic-snapshot")
+    real_fstat = os.fstat
+    calls = 0
+
+    def changing_fstat(descriptor: int):
+        nonlocal calls
+        result = real_fstat(descriptor)
+        calls += 1
+        if calls == 2:
+            values = list(result)
+            values[6] += 1
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(artifacts.os, "fstat", changing_fstat)
+
+    with pytest.raises(ArtifactError, match="changed during snapshot"):
+        file_identity(path)
 
 
 def test_bundle_identity_is_stable_across_roots_and_input_order(tmp_path: Path) -> None:

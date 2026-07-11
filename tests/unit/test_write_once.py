@@ -137,7 +137,7 @@ def test_write_projected_json_rejects_symlinked_store_directory(tmp_path):
     except OSError as exc:
         pytest.skip(f"symbolic links are unavailable: {exc}")
 
-    with pytest.raises(WriteOnceError, match="symbolic links"):
+    with pytest.raises(WriteOnceError, match="symlink|reparse"):
         store.write_projected_json(
             "datasets",
             projection,
