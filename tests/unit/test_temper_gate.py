@@ -211,7 +211,7 @@ def test_temp_bootstrap_install_failure_propagates_and_skips_uv_gates(
     ]
 
 
-def test_all_routes_dependency_python_checks_through_resolved_uv(monkeypatch):
+def test_all_runs_dependency_checks_once_through_resolved_uv(monkeypatch):
     gate = load_gate_module()
     calls = []
     uv_command = [sys.executable, "-m", "uv"]

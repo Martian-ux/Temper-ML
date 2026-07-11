@@ -86,6 +86,8 @@ dependencies, provider adapters, training, or evaluation in the Slice 1 task.
 ## Integration note
 
 This foundation branch is a review candidate, not an integration decision.
-Workflow-control changes remain on a separate candidate until explicitly
-integrated. Reconcile both histories against the then-current `main` before any
-merge; do not silently rebase, rewrite, or discard either candidate.
+The accepted workflow-control pull request is now integrated on `main`. The
+publication merge brought that history into this branch while retaining the
+expanded quality-gate commands and their deduplicated execution behavior.
+Future tasks must still fetch and verify the then-current `main`; do not
+silently rebase, rewrite, or discard either product or workflow evidence.
