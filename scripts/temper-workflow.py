@@ -368,6 +368,7 @@ def validate_state(state: Any) -> dict[str, Any]:
     workers = _as_list(state.get("workers"), "workers")
     seen_worker_refs: set[str] = set()
     active_worker_tasks: set[str] = set()
+    active_writers: list[dict[str, Any]] = []
     for worker in workers:
         worker = _as_object(worker, "worker")
         reference = worker.get("reference")
@@ -381,7 +382,9 @@ def validate_state(state: Any) -> dict[str, Any]:
         attempt = worker.get("attempt", 1)
         if not isinstance(attempt, int) or attempt < 1:
             raise WorkflowError("worker attempt must be a positive integer")
-        if worker.get("status") == "SPAWN_UNKNOWN" and not isinstance(worker.get("ambiguity_reference"), str):
+        if worker.get("status") == "SPAWN_UNKNOWN" and (
+            not isinstance(worker.get("ambiguity_reference"), str) or not worker["ambiguity_reference"]
+        ):
             raise WorkflowError("ambiguous worker state requires durable ambiguity_reference")
         if worker.get("status") in ACTIVE_WORKER_STATES:
             key = worker.get("task_key")
@@ -398,12 +401,18 @@ def validate_state(state: Any) -> dict[str, Any]:
                 raise WorkflowError("worker write capability does not match its task class")
             if derived_writer and key not in active_keys:
                 raise WorkflowError("active writer has no active ownership lease")
+            if derived_writer:
+                active_writers.append(worker)
             if key in active_worker_tasks:
                 raise WorkflowError("more than one active or spawn-requested worker exists for a task")
             active_worker_tasks.add(key)
         _validate_monitor(worker.get("monitor"), worker["status"])
     if _active_writer_count(state) > 2:
         raise WorkflowError("a third active implementation writer is prohibited")
+    if len(active_writers) == 2:
+        guards = active_writers[1].get("independence_guards")
+        if not isinstance(guards, dict) or not all(guards.get(name) is True for name in REQUIRED_SECOND_WRITER_GUARDS):
+            raise WorkflowError("second active implementation writer requires every recorded independence guard")
     for field in ("evidence", "verification", "checkpoints", "handoffs", "reviews"):
         _as_list(state.get(field), field)
     for evidence in state["evidence"]:
@@ -429,6 +438,15 @@ def validate_state(state: Any) -> dict[str, Any]:
         _identity(verification.get("subject"), repository["exact_base"])
         if verification.get("status") not in {"PASS", "FAIL", "UNKNOWN", "NON_REUSABLE"}:
             raise WorkflowError("unknown verification status")
+        if "verifier_reference" in verification and not _registered_verifier(
+            state,
+            key,
+            _identity(verification.get("subject"), repository["exact_base"]),
+            verification,
+            verification.get("verifier_reference"),
+            verification_sequence=verification.get("sequence"),
+        ):
+            raise WorkflowError("verifier-bound verification requires a prior accepted exact task/subject/request verifier registration")
     review_keys: set[str] = set()
     for review in state["reviews"]:
         review = _as_object(review, "review")
@@ -769,6 +787,10 @@ def record_verification(state: dict[str, Any], record: dict[str, Any]) -> dict[s
         raise WorkflowError("unknown verification status")
     subject = _identity(record["subject"], state["repository"]["exact_base"])
     request = _verification_request(record)
+    if "verifier_reference" in record and not _registered_verifier(
+        state, key, subject, record, record.get("verifier_reference"), verification_sequence=state["event_sequence"] + 1
+    ):
+        raise WorkflowError("verifier-bound verification requires a prior accepted exact task/subject/request verifier registration")
     for existing in state["verification"]:
         if existing.get("reference") == record["reference"] and not (
             existing.get("task_key") == key
@@ -1000,20 +1022,38 @@ def _refresh_verification_authorization(state: dict[str, Any]) -> None:
 
 
 def _registered_verifier(
-    state: dict[str, Any], task_key: str, subject: dict[str, Any], requested: dict[str, Any], verifier_reference: Any
+    state: dict[str, Any],
+    task_key: str,
+    subject: dict[str, Any],
+    requested: dict[str, Any],
+    verifier_reference: Any,
+    *,
+    verification_sequence: Any = None,
 ) -> bool:
     if not isinstance(verifier_reference, str) or not verifier_reference:
         return False
     request_identity = _verification_request(requested)
-    return any(
-        evidence.get("kind") == "verifier_registration"
-        and evidence.get("task_key") == task_key
-        and evidence.get("subject") == subject
-        and evidence.get("accepted") is True
-        and evidence.get("verifier_reference") == verifier_reference
-        and _verification_request(evidence) == request_identity
-        for evidence in state["evidence"]
-    )
+    if verification_sequence is not None and (not isinstance(verification_sequence, int) or verification_sequence < 0):
+        return False
+    for evidence in state["evidence"]:
+        if (
+            evidence.get("kind") != "verifier_registration"
+            or evidence.get("task_key") != task_key
+            or evidence.get("accepted") is not True
+            or evidence.get("verifier_reference") != verifier_reference
+        ):
+            continue
+        try:
+            if _identity(evidence.get("subject"), subject["base"]) != subject or _verification_request(evidence) != request_identity:
+                continue
+        except WorkflowError:
+            continue
+        if verification_sequence is None:
+            return True
+        registration_sequence = evidence.get("sequence")
+        if isinstance(registration_sequence, int) and registration_sequence < verification_sequence:
+            return True
+    return False
 
 
 def _integration_evidence(

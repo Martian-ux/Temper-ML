@@ -371,9 +371,8 @@ def test_final_and_public_safety_evidence_use_registered_verifier_and_latest_res
     arbitrary = state(workflow)
     workflow.register_task(arbitrary, task())
     completed_candidate(workflow, arbitrary)
-    workflow.record_verification(arbitrary, {"task_key": "task-one", "reference": "verification:arbitrary-gate", "subject": IDENTITY, **final_gate_request(), "status": "PASS", "verifier_reference": "unregistered:label"})
-    with pytest.raises(workflow.WorkflowError, match="registered-verifier"):
-        workflow.authorize(arbitrary, request)
+    with pytest.raises(workflow.WorkflowError, match="prior accepted"):
+        workflow.record_verification(arbitrary, {"task_key": "task-one", "reference": "verification:arbitrary-gate", "subject": IDENTITY, **final_gate_request(), "status": "PASS", "verifier_reference": "unregistered:label"})
 
     stale_gate = state(workflow)
     workflow.register_task(stale_gate, task())
@@ -472,6 +471,13 @@ def test_guarded_second_writer_is_reachable_and_third_or_unguarded_writer_is_rej
     guards = {name: True for name in workflow.REQUIRED_SECOND_WRITER_GUARDS}
     assert workflow.advance(value, {"task_key": "task-two", "independence_guards": guards})["advanced"] is True
     assert workflow.register_worker(value, {"reference": "writer-two", "task_key": "task-two"})["status"] == "ACTIVE"
+    del value["workers"][1]["independence_guards"]
+    with pytest.raises(workflow.WorkflowError, match="independence guard"):
+        workflow.validate_state(value)
+    value["workers"][1]["independence_guards"] = None
+    with pytest.raises(workflow.WorkflowError, match="independence guard"):
+        workflow.validate_state(value)
+    value["workers"][1]["independence_guards"] = guards
     with pytest.raises(workflow.WorkflowError, match="third"):
         workflow.advance(value, {"task_key": "task-three", "independence_guards": guards})
 
@@ -489,6 +495,24 @@ def test_duplicate_task_attempt_and_ambiguous_spawn_reconciliation_are_rejected_
     value["workers"].pop()
     assert workflow.reconcile_worker(value, {"reference": "manual:task-one", "status": "SPAWN_UNKNOWN", "ambiguity_reference": "ambiguity:synthetic"})["status"] == "SPAWN_UNKNOWN"
     assert workflow.reconcile_worker(value, {"reference": "manual:task-one"})["retry"] == "BLOCKED"
+    value["workers"][0]["ambiguity_reference"] = ""
+    with pytest.raises(workflow.WorkflowError, match="ambiguity_reference"):
+        workflow.validate_state(value)
+
+
+def test_late_verifier_registration_cannot_authorize_a_persisted_gate_result():
+    workflow = load_workflow_module()
+    value = state(workflow)
+    workflow.register_task(value, task())
+    completed_candidate(workflow, value)
+    registration = next(item for item in value["evidence"] if item["kind"] == "verifier_registration")
+    registration["sequence"] = value["verification"][-1]["sequence"] + 1
+    request = {
+        "actor": "maintainer", "authorization_state": "INTEGRATION_AUTHORIZED", "task_key": "task-one", "identity": IDENTITY,
+        "applied_decision": handoff()["applied_decisions"][0], "verification_reference": "verification:unit", "verification_request": verification_request(),
+    }
+    with pytest.raises(workflow.WorkflowError, match="prior accepted"):
+        workflow.authorize(value, request)
 
 
 def test_newer_fail_invalidates_only_its_task_verification_pass():
