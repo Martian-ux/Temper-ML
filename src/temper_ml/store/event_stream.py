@@ -247,12 +247,16 @@ def _metadata_lock(path: Path) -> Iterator[None]:
         if os.name == "nt":
             import msvcrt
 
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            msvcrt.locking(  # type: ignore[attr-defined]
+                handle.fileno(), msvcrt.LK_LOCK, 1
+            )
             try:
                 yield
             finally:
                 handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                msvcrt.locking(  # type: ignore[attr-defined]
+                    handle.fileno(), msvcrt.LK_UNLCK, 1
+                )
         else:
             import fcntl
 
