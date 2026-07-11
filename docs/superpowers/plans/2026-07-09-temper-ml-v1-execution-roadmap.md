@@ -2,6 +2,7 @@
 
 **Status:** Adopted governing execution roadmap
 **Date:** 2026-07-09
+**Last aligned:** 2026-07-11
 **Product architecture:**
 - docs/superpowers/specs/2026-06-30-temper-ml-architecture-design.md
 **Historical planning reference:**
@@ -32,6 +33,11 @@ features must not bypass it.
 - Fixture behavior proves a contract before hardware-dependent code is added.
 - The native Temper runtime remains the reference implementation. External
   engines are compatibility adapters only.
+- Core training, evaluation, local adapter use, replay, and evidence workflows
+  require no hosted Temper service.
+- The first real-hardware target is a Windows host with an explicit WSL2 Ubuntu
+  ROCm worker. Native Windows execution is secondary and capability-gated
+  behind the same runtime contract.
 - Public tests use small synthetic fixtures. Hardware tests are opt-in and must
   skip with an explicit reason when unavailable.
 - Every artifact, evaluation, cleanup, replay, loop, merge, readiness
@@ -46,15 +52,22 @@ features must not bypass it.
         -> deterministic dataset pipeline
           -> fixture adapter runtime and artifact verification
             -> evaluation, recommendations, and review
-              -> early UI and CLI vertical slice
+              -> early UI, CLI, and local-use vertical slice
                 -> library-backed local adapter runtime
                   -> retention and replay
                     -> loops, merges, and readiness
                       -> optional Noah and external compatibility
 
-The early usable milestone is the fixture vertical slice. The full v1 milestone
-is the local library-backed runtime plus the evidence, retention, iteration, and
+The early usable milestone is the fixture vertical slice. The first
+real-hardware usable milestone trains, evaluates, selects, and uses an adapter
+through the Windows/WSL2 ROCm topology. The full v1 milestone is the local
+library-backed runtime plus the evidence, retention, iteration, merging, and
 readiness capabilities around it.
+
+Slices 0 through 10 are all required v1 delivery. Their milestones provide
+usable checkpoints; they do not defer accepted scope to a later product
+version. Slice 11 is an optional compatibility boundary and is not required to
+declare v1 complete.
 
 ## 4. Implementation Slices
 
@@ -103,7 +116,8 @@ readiness capabilities around it.
 - Typed schemas and projection versions for Project, ProjectPolicy,
   TaskDefinition, BaseModelRevision, CompatibilityGroup, Recipe,
   RecipeResolution, HardwareRequirements, HardwareCapabilityProfile,
-  Experiment, Run, Artifact, and ArtifactAvailability.
+  ExecutionTarget, Experiment, Run, Artifact, ArtifactAvailability,
+  LocalUseSession, and AdapterExport.
 - Compatibility relationship validators for comparison, merge, resume, and
   deployment targets.
 - Baseline policy records for per-model, project-champion, and fixed-reference
@@ -128,6 +142,8 @@ readiness capabilities around it.
   resolution.
 - Hardware capability capture, constraint resolution, preflight estimates, and
   material-change detection.
+- Windows/WSL execution-target selection, portable path mapping, and visible
+  platform-change derivation rules.
 - Experiment freeze, clone, strict replay plan, and assisted adapted-replay
   plan services.
 - CLI views for project status, recipe resolution, preflight, and manifest
@@ -173,12 +189,15 @@ readiness capabilities around it.
   experiment manifest.
 - Artifact integrity verifier for bytes, structure, base-model compatibility,
   tokenizer compatibility, and provenance.
-- Fixture inference runtime and run-log capture.
+- Fixture inference runtime, focused local-use sessions, local batch inference,
+  verified export, and run-log capture.
 - End-to-end CLI workflow from project creation through verified artifact.
 
 **Proof:**
 - A fixture project completes through native services with no network, GPU,
   external dashboard, or external trainer.
+- A verified fixture adapter can be used interactively or in a local batch and
+  exported without becoming a hosted deployment.
 - Cancellation and recovery leave coherent append-only evidence.
 - Integrity validation still runs when the selected evaluation mode has no
   quality evaluation.
@@ -223,11 +242,15 @@ readiness capabilities around it.
 - Playground with side-by-side comparison, synchronized prompts, optional
   hidden identities, inference controls, saved outputs, notes, ratings, prompt
   replay, and conversion of discovered failures into cases.
+- Focused local-use view for one selected adapter, local batch execution,
+  explicit capture into evaluation cases, and verified adapter export.
 - Recommendation, evidence, user-decision, and registry views.
 - UI boundary tests that prove routes cannot write canonical records directly.
 
 **Proof:**
 - A user completes the fixture vertical slice entirely through Temper's UI.
+- The user can move from a selection decision to focused local use without
+  creating a deployment or general chat surface.
 - The same project state remains inspectable through the CLI.
 - The UI is not a general chat surface and exposes no external dashboard as a
   required workflow.
@@ -241,18 +264,29 @@ readiness capabilities around it.
 **Implement:**
 - Library integration for tokenizer loading, PEFT adapter creation, training,
   acceleration, quantization, checkpointing, and metrics.
+- A Windows-hosted runtime port and WSL2 Ubuntu ROCm worker for hardware probes,
+  training, evaluation inference, local-use inference, and cancellation.
+- Immutable request handoff, local staging, transfer verification, ingestion
+  receipts, heartbeat, reconnection, and recovery across the Windows/WSL
+  boundary. The WSL worker never writes canonical project records directly.
 - Preflight estimators and recipe constraint checks for supported local
   hardware.
 - Library-version, model, tokenizer, device, checkpoint, artifact, log,
   cancellation, recovery, and failure evidence.
 - Deterministic local doubles for contract tests and capability-gated real
   hardware tests.
+- A secondary native Windows PyTorch/ROCm execution path only for combinations
+  that pass explicit capability checks and the same runtime contract.
 - Artifact ingestion that preserves the same manifest and lifecycle contracts
   used by the fixture runtime.
 
 **Proof:**
 - A capability-gated real adapter run is represented by the same project,
   experiment, run, artifact, and evaluation records as a fixture run.
+- A supported adapter is trained, evaluated, selected, and used locally through
+  the Windows/WSL2 ROCm reference topology.
+- Interrupted staging or worker loss cannot produce a successful run or an
+  unverified artifact, and reconnection does not duplicate the run.
 - No external trainer-specific manifest or identifier becomes canonical.
 
 **Depends on:** Slices 5 through 7.
@@ -305,7 +339,8 @@ readiness capabilities around it.
 
 ### Slice 11: Optional Compatibility Boundaries
 
-**Goal:** Add Noah or other engines without weakening the primary product.
+**Goal:** Add Noah or other engines only when a measured v1 product need
+justifies them, without weakening the primary product.
 
 **Implement:**
 - Versioned compatibility schemas, synthetic fixtures, request translation,
@@ -323,6 +358,10 @@ readiness capabilities around it.
 
 **Depends on:** Slice 10.
 
+This slice is compatibility scope, not a prerequisite for v1 acceptance. It may
+ship in v1 only when a concrete capability gap is demonstrated and every core
+workflow remains complete without it.
+
 ## 5. Cross-Cutting Test Strategy
 
 Every slice adds all applicable test layers:
@@ -334,7 +373,7 @@ Every slice adds all applicable test layers:
 | Integration fixture | Full deterministic workflows without hardware or network |
 | Adversarial | Corruption, path safety, redaction, lifecycle, cleanup, and replay failures |
 | UI | Service boundaries, user-visible states, empty/error paths, and accessibility |
-| Hardware | Opt-in real local adapter execution with explicit capability skips |
+| Hardware | Opt-in Windows/WSL2 ROCm and native-Windows contract execution with explicit capability skips |
 
 The primary gate remains:
 
@@ -351,10 +390,13 @@ Start with the smallest change set that unlocks every later module:
 1. Finish Slice 1 storage services: layout, event stream, verifier, redaction,
    and inspect CLI commands.
 2. Add Slice 2 schemas and contract tests for project, task, compatibility,
-   recipe, hardware, experiment, run, and artifact records.
+   recipe, hardware, execution target, experiment, run, artifact, local-use
+   session, and export records.
 3. Implement Slice 3 project and recipe-resolution services only after those
    schemas are stable.
-4. Do not add UI, PyTorch dependencies, a provider adapter, or hardware code
+4. Define the Windows-host/WSL-worker port and its failure semantics before
+   adding ROCm-specific code.
+5. Do not add UI, PyTorch dependencies, a provider adapter, or hardware code
    before the fixture contracts exist.
 
 The first end-to-end milestone is Slice 5. It is the earliest point at which
@@ -366,7 +408,8 @@ Temper can honestly demonstrate its central promise with deterministic evidence.
 | --- | --- |
 | Foundation complete | Canonical storage, verification, redaction, recovery, and CLI inspection |
 | Fixture product complete | Project through verified artifact, evaluation, recommendation, review, and UI |
-| Local runtime complete | Library-backed adapter training using the same manifest and evidence contracts |
+| Local-use product complete | A selected verified adapter supports focused interactive use, local batch inference, and verified export |
+| Local runtime complete | Library-backed training, evaluation, and use through the Windows/WSL2 ROCm topology using the same manifest and evidence contracts |
 | Reproducibility complete | Retention, cleanup, strict replay, and adapted replay are explicit and tested |
 | Iteration complete | Bounded loops, merge lineage, confirmation evaluation, and readiness assessment |
 | v1 complete | All architecture acceptance criteria pass without an external trainer or dashboard |
@@ -380,6 +423,7 @@ Do not begin these until v1 proves a product need:
 - model-judge evaluation;
 - distributed orchestration;
 - a hosted control plane, teams, permissions, or billing;
+- hosted inference endpoints or remote project execution;
 - a general chat client;
 - a generalized plugin marketplace; and
 - external trainer replacement of the native Temper runtime.

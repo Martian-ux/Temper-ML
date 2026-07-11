@@ -1,9 +1,9 @@
 # Temper ML
 
-Temper ML is a local-first product for LLM adapter experimentation. It is being
-built to help one semi-technical user create, evaluate, compare, reproduce, and
-retain adapter experiments without making an external trainer, dashboard, or
-cloud account the source of truth.
+Temper ML is a local-only product for LLM adapter experimentation. It is being
+built to help one semi-technical user create, evaluate, compare, reproduce, use,
+and retain adapter experiments without making an external trainer, dashboard,
+or cloud account the source of truth.
 
 ## Product boundary
 
@@ -18,6 +18,26 @@ controller, or a general chat client. The approved product architecture is in
 `docs/superpowers/specs/2026-06-30-temper-ml-architecture-design.md`; the
 adopted execution sequence is in
 `docs/superpowers/plans/2026-07-09-temper-ml-v1-execution-roadmap.md`.
+
+Using an adapter is part of v1: a verified adapter can be loaded with its
+compatible base model for focused local interactive or batch inference, saved
+with its settings and provenance, and exported as a verified local bundle.
+Temper does not turn that workflow into hosted serving or a general chat
+product.
+
+## Local execution target
+
+Temper's core workflows are local-only. The initial real-hardware topology is a
+Windows host for the launcher, loopback UI and CLI, application services, and
+canonical project store, with an explicit WSL2 Ubuntu ROCm worker for training,
+evaluation inference, and local adapter use on a supported AMD GPU.
+
+The WSL worker receives immutable runtime requests and returns explicit
+artifacts and evidence for ingestion; it does not become a second source of
+truth. Native Windows PyTorch/ROCm execution may use the same runtime contract
+when capability detection proves the required combination is supported. No
+core workflow requires a hosted Temper service, and cached projects remain
+usable without network access.
 
 ## Setup and checks
 

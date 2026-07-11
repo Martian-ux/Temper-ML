@@ -7,6 +7,12 @@ This handoff preserves the pause-state facts. It is not the current execution
 status; the adopted governing roadmap is
 `docs/superpowers/plans/2026-07-09-temper-ml-v1-execution-roadmap.md`.
 
+The 2026-07-11 maintainer alignment is recorded in the governing architecture
+and roadmap, not retroactively treated as pause-state fact. It makes focused
+local adapter use and verified export explicit v1 scope, selects a Windows
+host with a WSL2 Ubuntu ROCm worker as the first real-hardware topology, and
+keeps native Windows execution secondary and capability-gated.
+
 ## Roadmap position
 
 The governing execution roadmap is

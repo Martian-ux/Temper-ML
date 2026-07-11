@@ -2,8 +2,9 @@
 
 **Status:** Approved product direction, superseding the former provider-first architecture
 **Date:** 2026-07-09
-**Authority:** Product-grill decisions are the governing v1 specification.
-**Scope:** Local-first LLM adapter experimentation for one semi-technical user.
+**Last aligned:** 2026-07-11
+**Authority:** Product-grill decisions and subsequent maintainer clarifications are the governing v1 specification.
+**Scope:** Local-only LLM adapter experimentation for one semi-technical user.
 
 This document governs v1 product boundary and design decisions. The adopted
 implementation order is the July 9 execution roadmap at
@@ -13,15 +14,24 @@ July 1 plan is retained only as a historical planning reference.
 ## 1. Product Boundary
 
 Temper v1 is an LLM adapter experimentation product. It helps a user train,
-evaluate, compare, reproduce, retain, and select adapters without managing
-scripts, trainer dashboards, artifact folders, and informal evaluation notes.
+evaluate, compare, reproduce, retain, select, and use adapters locally without
+managing scripts, trainer dashboards, artifact folders, and informal
+evaluation notes.
 
 The primary workflows are:
 
 1. Create and train an adapter.
-2. Evaluate and select an adapter.
+2. Evaluate, select, and use an adapter locally.
 3. Iterate reproducibly through cloning, replay, bounded experiment loops, and
    compatible adapter merging.
+
+Using an adapter locally means loading an integrity-verified adapter with its
+compatible base model and tokenizer for focused interactive or batch inference.
+Temper preserves the selected artifact, inference settings, prompt or batch
+inputs when saved, outputs when saved, and provenance. It can export a verified
+adapter bundle and manifest for another compatible local runtime. This workflow
+does not create a hosted endpoint, manage a production runtime, add assistant
+memory, or turn the playground into a general chat client.
 
 Temper v1 is not a general machine-learning platform. It does not support
 classical ML, arbitrary PyTorch programs, full-model pretraining, a general
@@ -40,6 +50,9 @@ support LoRA adapters at minimum; the merge workflow is LoRA-only.
 - Normal users never need an external dashboard to complete a supported
   workflow. Optional integrations remain subordinate to Temper's UI and
   records.
+- Core workflows are local-only. They require no Temper cloud account, hosted
+  control plane, remote telemetry service, or network service after explicitly
+  imported models, datasets, and dependencies are available locally.
 - Canonical records are immutable and hash-addressed. Derived views, caches,
   and local indexes are rebuildable conveniences.
 - Evidence and user decisions are separate. An override cannot rewrite or hide
@@ -58,6 +71,8 @@ The dependency direction is:
 
 ## 3. Runtime Ownership and Compatibility Boundaries
 
+### Temper-Owned Runtime
+
 Temper owns the primary v1 training runtime behavior:
 
 - resolution of recipes into manifests;
@@ -69,6 +84,41 @@ Temper owns the primary v1 training runtime behavior:
 The runtime may call mature libraries for training, tokenization, scheduling,
 optimization, checkpoint serialization, and quantization. It captures library
 versions and resolved runtime configuration in run evidence.
+
+### Reference Windows/WSL ROCm Topology
+
+The first supported real-hardware topology is a Windows host with a WSL2 Ubuntu
+worker using ROCm on a supported AMD GPU. Temper's local launcher, loopback UI
+and CLI, application services, and canonical project store remain authoritative
+on the Windows side. Training, evaluation inference, local-use inference, and
+hardware probes execute through an explicit WSL worker boundary.
+
+That boundary follows these rules:
+
+- Temper freezes an immutable runtime request before launch. The worker cannot
+  silently alter it or write canonical project records directly.
+- Inputs and outputs cross through explicit staging and ingestion operations.
+  Artifact identities, byte counts, and transfer receipts make interrupted or
+  partial transfers detectable.
+- Lifecycle messages cover launch, progress, heartbeat, cancellation,
+  interruption, reconnection, recovery, completion, and failure.
+- Canonical manifests use portable identities and logical locations rather
+  than Windows drive paths, WSL distribution paths, or host-specific names.
+- Hardware and platform capability belong to the run. A platform-driven
+  material configuration change creates a visibly derived experiment.
+- The UI exposes the selected execution target, detected capabilities,
+  resolved changes, estimates, and unsupported combinations before launch.
+
+A native Windows PyTorch/ROCm worker may use the same runtime port when
+capability detection proves that the required library and GPU combination is
+supported. It is a secondary execution target, not a second product model, and
+Temper must never silently switch between native Windows and WSL execution.
+
+The process and transfer protocols are internal ports, not a distributed
+orchestration feature. Both sides remain on one local machine, bind management
+interfaces to loopback, and require no hosted Temper service.
+
+### Compatibility Backends
 
 External trainer products may be studied or used as isolated compatibility
 backends when a measured capability gap justifies them. They are not the normal
@@ -181,6 +231,10 @@ not silently change an experiment. If the original manifest cannot run
 unchanged, Temper offers an assisted adaptation that creates a derived
 experiment with a visible manifest diff and an adapted-reproduction label.
 
+Resolution also binds an execution-target class such as WSL2 ROCm or native
+Windows ROCm. Moving between target classes is never treated as an invisible
+retry, even when both targets report the same GPU architecture.
+
 ### Experiment and Run Semantics
 
 An experiment is immutable scientific intention: the task and project-policy
@@ -264,6 +318,19 @@ identities, inference controls, saved outputs, notes, ratings, prompt replay,
 and conversion of discovered failures into development or regression cases. It
 does not provide assistant memory, character chat, or a daily chat experience.
 
+### Local Adapter Use
+
+After artifact integrity succeeds, a user can open a selected adapter in a
+focused local-use session or run a local batch. Temper verifies the base model,
+tokenizer, adapter structure, and runtime target again before loading. Saved
+sessions retain the exact artifact, inference settings, inputs, outputs, and
+runtime evidence; ephemeral use need not become recommendation evidence.
+
+Local-use output becomes evaluation or regression evidence only through an
+explicit capture action. Export produces the adapter bytes, an integrity
+manifest, compatibility requirements, and provenance needed by a compatible
+local runtime. Export does not imply deployment readiness.
+
 ## 9. Recommendations, Registry, and Readiness
 
 Recommendations are policy-based. A policy declares hard qualifiers, advisory
@@ -343,17 +410,25 @@ local usernames, absolute paths, hostnames, process IDs, IP or MAC addresses,
 or private artifact identifiers. Optional external references remain namespaced
 and are redacted for public export.
 
+Temper requires no hosted database or cloud account. Optional network imports
+and model downloads are explicit ingress operations; after their inputs are
+cached, training, evaluation, local use, replay, cleanup, and evidence browsing
+remain available offline. Cross-boundary staging for a WSL worker is local and
+must not make the worker's filesystem a second source of truth.
+
 ## 12. User Interface and Commands
 
 The loopback UI and CLI expose the same application services. The UI never
 writes canonical records directly. Normal navigation covers project setup,
 dataset import, recipe resolution, preflight, run control, logs, metrics,
 evaluation, playground review, recommendation, registry decisions, cleanup,
-replay, loops, merge candidates, and readiness assessment.
+replay, local adapter use, verified export, loops, merge candidates, and
+readiness assessment.
 
 The CLI provides inspectable equivalents for status, manifest inspection,
-verification, replay planning, cleanup planning, and fixture workflows. It is
-not a second product surface with different scientific semantics.
+verification, local-use launch, local batch inference, export verification,
+replay planning, cleanup planning, and fixture workflows. It is not a second
+product surface with different scientific semantics.
 
 ## 13. Explicit v1 Non-Goals
 
@@ -365,6 +440,7 @@ v1 does not:
 - use model judges or a hidden universal quality score;
 - become a general data editor, annotation system, chat client, or deployment
   control plane;
+- create hosted inference endpoints or require a hosted Temper service;
 - support unrestricted background optimization, distributed orchestration, or a
   public plugin marketplace;
 - hard-lock confirmation data as a substitute for transparent evidence state;
@@ -388,8 +464,16 @@ synthetic end-to-end project that:
 8. creates strict and adapted replay plans without conflating them;
 9. runs a bounded iteration loop and evaluates its selected candidate with a
    confirmation suite;
-10. creates and evaluates a compatible merged LoRA candidate; and
-11. records a deployment-readiness assessment without controlling deployment.
+10. creates and evaluates a compatible merged LoRA candidate;
+11. loads a verified selected adapter for focused local interactive and batch
+    inference, preserving settings and provenance when saved;
+12. exports a verified adapter bundle without implying deployment; and
+13. records a deployment-readiness assessment without controlling deployment.
+
+The real-hardware acceptance path must also train, evaluate, and use a small
+supported adapter through the Windows-host/WSL2 ROCm execution topology.
+Native Windows execution is accepted only for combinations that pass the same
+capability, lifecycle, evidence, and artifact contracts.
 
 Every result must trace to immutable task, dataset, recipe, manifest, runtime,
 base-model, tokenizer, evaluation-policy, artifact, and decision identities.
