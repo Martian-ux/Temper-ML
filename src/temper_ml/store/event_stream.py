@@ -247,24 +247,22 @@ def _metadata_lock(path: Path) -> Iterator[None]:
         if os.name == "nt":
             import msvcrt
 
-            msvcrt.locking(  # type: ignore[attr-defined]
-                handle.fileno(), msvcrt.LK_LOCK, 1
-            )
+            msvcrt_api: Any = msvcrt
+            msvcrt_api.locking(handle.fileno(), msvcrt_api.LK_LOCK, 1)
             try:
                 yield
             finally:
                 handle.seek(0)
-                msvcrt.locking(  # type: ignore[attr-defined]
-                    handle.fileno(), msvcrt.LK_UNLCK, 1
-                )
+                msvcrt_api.locking(handle.fileno(), msvcrt_api.LK_UNLCK, 1)
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
+            fcntl_api: Any = fcntl
+            fcntl_api.flock(handle.fileno(), fcntl_api.LOCK_EX)
             try:
                 yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+                fcntl_api.flock(handle.fileno(), fcntl_api.LOCK_UN)
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:
