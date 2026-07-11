@@ -33,7 +33,9 @@ def test_write_once_store_creates_immutable_identity_and_refuses_overwrite(tmp_p
         store.write_projected_json("datasets", projection, record)
 
 
-def test_write_once_store_keeps_immutable_evidence_separate_from_derived_state(tmp_path):
+def test_write_once_store_keeps_immutable_evidence_separate_from_derived_state(
+    tmp_path,
+):
     store = WriteOnceStore(tmp_path)
     projection = HashProjection(name="artifact", version="v1")
     evidence = {"artifact_id": "artifact-synthetic-demo", "schema_version": 1}
@@ -43,7 +45,9 @@ def test_write_once_store_keeps_immutable_evidence_separate_from_derived_state(t
 
     assert "immutable" in written.path.parts
     assert (tmp_path / "derived" / "registry" / "state.json").exists()
-    assert store.read_projected_json("artifacts", projection, written.identity) == evidence
+    assert (
+        store.read_projected_json("artifacts", projection, written.identity) == evidence
+    )
 
 
 def test_read_projected_json_rejects_tampered_immutable_content(tmp_path):
@@ -99,7 +103,9 @@ def test_read_projected_json_normalizes_invalid_utf8_as_corruption(tmp_path):
         store.read_projected_json("datasets", projection, written.identity)
 
 
-def test_write_projected_json_normalizes_concurrent_create_as_existing(tmp_path, monkeypatch):
+def test_write_projected_json_normalizes_concurrent_create_as_existing(
+    tmp_path, monkeypatch
+):
     store = WriteOnceStore(tmp_path)
     projection = HashProjection(name="dataset_version", version="v1")
     evidence = {
@@ -158,7 +164,9 @@ def test_read_projected_json_rejects_wrong_projection_version(tmp_path):
         store.read_projected_json("datasets", read_projection, written.identity)
 
 
-@pytest.mark.parametrize("unsafe_area", ["/datasets", "../datasets", "datasets/../other"])
+@pytest.mark.parametrize(
+    "unsafe_area", ["/datasets", "../datasets", "datasets/../other"]
+)
 def test_write_once_store_rejects_unsafe_immutable_area_paths(tmp_path, unsafe_area):
     store = WriteOnceStore(tmp_path)
     projection = HashProjection(name="dataset_version", version="v1")

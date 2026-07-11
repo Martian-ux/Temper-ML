@@ -45,7 +45,9 @@ class ContentIdentity:
 
     def __post_init__(self) -> None:
         if self.algorithm != "sha256":
-            raise ProjectionError(f"unsupported content identity algorithm: {self.algorithm!r}")
+            raise ProjectionError(
+                f"unsupported content identity algorithm: {self.algorithm!r}"
+            )
         if not _SHA256_HEX.fullmatch(self.value):
             raise ProjectionError(f"invalid sha256 identity value: {self.value!r}")
 
@@ -53,10 +55,14 @@ class ContentIdentity:
         return f"{self.algorithm}:{self.value}"
 
 
-def projection_preimage(projection: HashProjection, projected_fields: Mapping[str, Any]) -> bytes:
+def projection_preimage(
+    projection: HashProjection, projected_fields: Mapping[str, Any]
+) -> bytes:
     """Return the exact bytes hashed for a Temper-owned projection."""
 
-    return f"temper:{projection.label}\n".encode("utf-8") + dumps_canonical_json(projected_fields)
+    return f"temper:{projection.label}\n".encode("utf-8") + dumps_canonical_json(
+        projected_fields
+    )
 
 
 def content_identity(
@@ -64,5 +70,7 @@ def content_identity(
 ) -> ContentIdentity:
     """Hash projected fields with a Temper domain prefix and projection version."""
 
-    digest = hashlib.sha256(projection_preimage(projection, projected_fields)).hexdigest()
+    digest = hashlib.sha256(
+        projection_preimage(projection, projected_fields)
+    ).hexdigest()
     return ContentIdentity(algorithm="sha256", value=digest)

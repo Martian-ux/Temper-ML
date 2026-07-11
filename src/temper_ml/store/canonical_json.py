@@ -66,7 +66,9 @@ def _validate(value: Any) -> None:
         _format_decimal(value)
         return
     if isinstance(value, float):
-        raise CanonicalJsonError("float values are not allowed; use normalized decimals")
+        raise CanonicalJsonError(
+            "float values are not allowed; use normalized decimals"
+        )
     if isinstance(value, list):
         for item in value:
             _validate(item)
@@ -88,7 +90,9 @@ def _encode(value: Any) -> str:
     if value is False:
         return "false"
     if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        return json.dumps(
+            value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
     if isinstance(value, int) and not isinstance(value, bool):
         return str(value)
     if isinstance(value, Decimal):
@@ -96,16 +100,20 @@ def _encode(value: Any) -> str:
     if isinstance(value, float):
         if not math.isfinite(value):
             raise CanonicalJsonError("non-finite float values are not allowed")
-        raise CanonicalJsonError("float values are not allowed; use normalized decimals")
+        raise CanonicalJsonError(
+            "float values are not allowed; use normalized decimals"
+        )
     if isinstance(value, (list, tuple)):
         return "[" + ",".join(_encode(item) for item in value) + "]"
     if isinstance(value, dict):
         for key in value:
             if not isinstance(key, str):
                 raise CanonicalJsonError("object keys must be strings")
-        return "{" + ",".join(
-            f"{_encode(key)}:{_encode(value[key])}" for key in sorted(value)
-        ) + "}"
+        return (
+            "{"
+            + ",".join(f"{_encode(key)}:{_encode(value[key])}" for key in sorted(value))
+            + "}"
+        )
     raise CanonicalJsonError(f"unsupported JSON value type: {type(value).__name__}")
 
 
@@ -113,6 +121,8 @@ def _format_decimal(value: Decimal) -> str:
     if not value.is_finite():
         raise CanonicalJsonError("non-finite decimal values are not allowed")
     sign, digits, exponent = value.as_tuple()
+    if not isinstance(exponent, int):
+        raise CanonicalJsonError("non-finite decimal values are not allowed")
     if exponent >= 0 or not digits or digits[-1] == 0:
         raise CanonicalJsonError("decimal values must be normalized decimal fractions")
 

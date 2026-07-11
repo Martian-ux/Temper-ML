@@ -9,7 +9,9 @@ from temper_ml import __version__
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="temper")
-    parser.add_argument("--version", action="version", version=f"temper-ml {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"temper-ml {__version__}"
+    )
     return parser
 
 
