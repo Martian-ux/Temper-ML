@@ -29,6 +29,12 @@ def _non_negative_int(name: str, value: object) -> int:
     return value
 
 
+def _positive_int(name: str, value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise PreflightError(f"{name}_invalid")
+    return value
+
+
 @dataclass(frozen=True)
 class EstimateComponents:
     """Explicit byte contributions used by the transparent estimate formula."""
@@ -54,6 +60,9 @@ class PreflightEstimate:
     training_steps: int
     effective_batch_size: int
 
+    def __post_init__(self) -> None:
+        _validate_preflight_estimate(self)
+
     def to_dict(self) -> dict[str, int]:
         return {
             "accelerator_memory_bytes": self.accelerator_memory_bytes,
@@ -61,6 +70,22 @@ class PreflightEstimate:
             "training_steps": self.training_steps,
             "effective_batch_size": self.effective_batch_size,
         }
+
+
+def _validate_preflight_estimate(estimate: PreflightEstimate) -> None:
+    _non_negative_int("accelerator_memory_bytes", estimate.accelerator_memory_bytes)
+    _non_negative_int("system_memory_bytes", estimate.system_memory_bytes)
+    _positive_int("training_steps", estimate.training_steps)
+    _positive_int("effective_batch_size", estimate.effective_batch_size)
+
+
+def _validate_estimate_resolution(
+    estimate: PreflightEstimate, resolution: RecipeResolution
+) -> None:
+    if estimate.training_steps != resolution.training_steps:
+        raise PreflightError("estimate_training_steps_mismatch")
+    if estimate.effective_batch_size != resolution.effective_batch_size:
+        raise PreflightError("estimate_effective_batch_size_mismatch")
 
 
 def estimate_resources(
@@ -137,6 +162,8 @@ class PreflightResult:
             raise PreflightError("capability_profile_invalid")
         if not isinstance(self.estimate, PreflightEstimate):
             raise PreflightError("preflight_estimate_invalid")
+        _validate_preflight_estimate(self.estimate)
+        _validate_estimate_resolution(self.estimate, self.resolution)
         if not isinstance(self.checks, tuple) or any(
             not isinstance(check, ConstraintCheck) for check in self.checks
         ):
@@ -265,6 +292,8 @@ def preflight(
         raise PreflightError("capability_profile_invalid")
     if not isinstance(estimate, PreflightEstimate):
         raise PreflightError("preflight_estimate_invalid")
+    _validate_preflight_estimate(estimate)
+    _validate_estimate_resolution(estimate, resolution)
     if resolution.hardware_requirements != record_reference(requirements):
         raise PreflightError("resolution_requirements_mismatch")
     if resolution.execution_target != record_reference(target):

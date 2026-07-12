@@ -17,6 +17,8 @@ from temper_ml.runtime.paths import (
 from temper_ml.runtime.preflight import (
     EstimateComponents,
     PreflightError,
+    PreflightEstimate,
+    PreflightResult,
     capture_capability_profile,
     estimate_resources,
     material_change_reasons,
@@ -139,6 +141,75 @@ def _components() -> EstimateComponents:
         dataset_bytes=1_000,
         host_runtime_overhead_bytes=2_000,
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "code"),
+    (
+        ("accelerator_memory_bytes", -1, "accelerator_memory_bytes_invalid"),
+        ("system_memory_bytes", -1, "system_memory_bytes_invalid"),
+        ("accelerator_memory_bytes", True, "accelerator_memory_bytes_invalid"),
+        ("training_steps", 0, "training_steps_invalid"),
+        ("training_steps", -1, "training_steps_invalid"),
+        ("effective_batch_size", 0, "effective_batch_size_invalid"),
+        ("effective_batch_size", -1, "effective_batch_size_invalid"),
+        ("effective_batch_size", True, "effective_batch_size_invalid"),
+    ),
+)
+def test_preflight_estimate_rejects_invalid_resource_dimensions(
+    field: str, value: object, code: str
+) -> None:
+    values: dict[str, object] = {
+        "accelerator_memory_bytes": 4_000,
+        "system_memory_bytes": 5_000,
+        "training_steps": 20,
+        "effective_batch_size": 8,
+    }
+    values[field] = value
+
+    with pytest.raises(PreflightError) as error:
+        PreflightEstimate(**values)  # type: ignore[arg-type]
+
+    assert error.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "code"),
+    (
+        ("training_steps", 21, "estimate_training_steps_mismatch"),
+        (
+            "effective_batch_size",
+            9,
+            "estimate_effective_batch_size_mismatch",
+        ),
+    ),
+)
+def test_preflight_rejects_estimates_inconsistent_with_resolution(
+    field: str, value: int, code: str
+) -> None:
+    requirements = _requirements()
+    target = _target()
+    resolution = _resolution(requirements, target)
+    profile = _profile(target)
+    estimate = replace(
+        estimate_resources(resolution, _components()),
+        **{field: value},
+    )
+
+    with pytest.raises(PreflightError) as preflight_error:
+        preflight(resolution, requirements, target, profile, estimate)
+    with pytest.raises(PreflightError) as result_error:
+        PreflightResult(
+            resolution,
+            requirements,
+            target,
+            profile,
+            estimate,
+            (),
+        )
+
+    assert preflight_error.value.code == code
+    assert result_error.value.code == code
 
 
 def test_preflight_exposes_every_estimate_and_constraint() -> None:

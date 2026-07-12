@@ -274,6 +274,61 @@ def test_freeze_is_idempotent_and_binds_every_resolved_dependency(
     assert verification.event_count == 2
 
 
+def test_freeze_rejects_an_opened_project_from_another_store_without_mutation(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path / "source")
+    destination_root = tmp_path / "destination"
+    destination = ExperimentService(destination_root)
+    assert not destination_root.exists()
+
+    with pytest.raises(ApplicationServiceError) as error:
+        destination.freeze(
+            ExperimentFreezeRequest(
+                experiment_id="experiment-cross-store",
+                opened_project=fixture.opened,
+                dataset_version=_identity("cross-store-dataset"),
+                base_model_revision=fixture.model,
+                recipe=fixture.recipe,
+                recipe_resolution=fixture.resolution,
+                compatibility_group=fixture.group,
+                hardware_requirements=fixture.requirements,
+                execution_target=fixture.target,
+            )
+        )
+
+    assert error.value.code == "opened_project_store_mismatch"
+    assert not destination_root.exists()
+    assert destination.store.iter_records() == ()
+    assert destination.store.iter_streams() == ()
+
+
+def test_clone_rejects_a_parent_from_another_store_without_supporting_leaks(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path / "source")
+    destination_root = tmp_path / "destination"
+    destination = ExperimentService(destination_root)
+    assert not destination_root.exists()
+
+    with pytest.raises(ApplicationServiceError) as error:
+        destination.clone(
+            fixture.experiment,
+            experiment_id="experiment-cross-store-clone",
+            replacements={"dataset_version": _identity("changed-dataset")},
+            derivation_id="derivation-cross-store",
+            diff_id="diff-cross-store",
+            reason_code="dataset_update",
+            reason="Use a different synthetic dataset revision.",
+            supporting_records=(fixture.requirements,),
+        )
+
+    assert error.value.code == "parent_experiment_store_mismatch"
+    assert not destination_root.exists()
+    assert destination.store.iter_records() == ()
+    assert destination.store.iter_streams() == ()
+
+
 def test_changed_machine_uses_strict_unchanged_or_explicit_adapted_derivation(
     tmp_path: Path,
 ) -> None:
@@ -376,6 +431,39 @@ def test_changed_machine_uses_strict_unchanged_or_explicit_adapted_derivation(
         == derivation.derived_experiment.scientific_manifest()
     )
     assert fixture.service.store.verify().record_counts["experiment_derivation"] == 1
+
+
+def test_replay_plan_identity_includes_estimate_and_constraint_content(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    first_preflight = _preflight(
+        fixture.resolution,
+        fixture.requirements,
+        fixture.target,
+        memory=8_000,
+    )
+    second_preflight = preflight(
+        fixture.resolution,
+        fixture.requirements,
+        fixture.target,
+        first_preflight.profile,
+        replace(
+            first_preflight.estimate,
+            accelerator_memory_bytes=(
+                first_preflight.estimate.accelerator_memory_bytes - 1
+            ),
+        ),
+    )
+
+    first_plan = plan_replay(fixture.experiment, first_preflight)
+    second_plan = plan_replay(fixture.experiment, second_preflight)
+
+    assert first_plan.ready and second_plan.ready
+    assert first_plan.reasons == second_plan.reasons == ()
+    assert first_preflight.profile.identity == second_preflight.profile.identity
+    assert first_plan.plan_id != second_plan.plan_id
+    assert first_plan.to_view()["preflight"] != second_plan.to_view()["preflight"]
 
 
 def test_clone_rejects_a_logical_rename_without_material_manifest_change(

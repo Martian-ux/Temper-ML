@@ -38,7 +38,7 @@ from temper_ml.domain.records import (
 from temper_ml.domain.tasks import TaskDefinition
 from temper_ml.runtime.preflight import PreflightResult
 from temper_ml.store.canonical_json import dumps_canonical_json
-from temper_ml.store.evidence import TypedEvidenceStore
+from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
 from temper_ml.store.event_stream import EventRequest
 
 
@@ -125,6 +125,20 @@ class ExperimentService:
             raise ApplicationServiceError("invalid_experiment_request")
         if not isinstance(request.dataset_version, ContentIdentity):
             raise ApplicationServiceError("dataset_version_invalid")
+        if (
+            not isinstance(request.opened_project.project, Project)
+            or not isinstance(request.opened_project.task_definition, TaskDefinition)
+            or not isinstance(request.opened_project.project_policy, ProjectPolicy)
+        ):
+            raise ApplicationServiceError("opened_project_store_mismatch")
+        self._require_exact_stored_records(
+            (
+                request.opened_project.project,
+                request.opened_project.task_definition,
+                request.opened_project.project_policy,
+            ),
+            mismatch_code="opened_project_store_mismatch",
+        )
         experiment = Experiment(
             experiment_id=request.experiment_id,
             project=record_reference(request.opened_project.project),
@@ -211,6 +225,10 @@ class ExperimentService:
             not isinstance(record, TypedRecord) for record in supporting_records
         ):
             raise ApplicationServiceError("supporting_records_invalid")
+        self._require_exact_stored_records(
+            (parent,),
+            mismatch_code="parent_experiment_store_mismatch",
+        )
         replacement_values: dict[str, Any] = dict(replacements)
         try:
             derived = replace(
@@ -265,6 +283,25 @@ class ExperimentService:
         )
         self.store.verify()
         return evidence
+
+    def _require_exact_stored_records(
+        self,
+        records: tuple[TypedRecord, ...],
+        *,
+        mismatch_code: str,
+    ) -> None:
+        try:
+            stored_records = tuple(
+                self.store.read_record(record_reference(record)) for record in records
+            )
+        except (EvidenceError, RecordValidationError, TypeError, ValueError):
+            raise ApplicationServiceError(mismatch_code) from None
+        if any(
+            type(stored.record) is not type(expected)
+            or stored.envelope.to_dict() != expected.to_dict()
+            for stored, expected in zip(stored_records, records, strict=True)
+        ):
+            raise ApplicationServiceError(mismatch_code)
 
     def _validate_stored_experiment(self, experiment: Experiment) -> None:
         records = {
@@ -504,6 +541,7 @@ def _replay_plan(
         "profile": record_reference(preflight.profile).to_dict(),
         "resolution": record_reference(preflight.resolution).to_dict(),
         "target": record_reference(preflight.target).to_dict(),
+        "preflight": preflight.to_view(),
         "reasons": list(reasons),
     }
     if derivation is not None:
