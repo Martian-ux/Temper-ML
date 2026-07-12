@@ -72,7 +72,25 @@ def test_bundle_identity_is_stable_across_roots_and_input_order(tmp_path: Path) 
 
     assert first == second
     assert first.identity == second.identity
+    assert type(first).from_dict(first.to_dict()) == first
     verify_bundle(roots[0], first)
+
+
+def test_bundle_manifest_parser_rejects_claimed_identity_and_order_tampering(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "a.txt").write_bytes(b"a")
+    (tmp_path / "b.txt").write_bytes(b"b")
+    manifest = build_bundle_manifest(tmp_path)
+    wrong_identity = manifest.to_dict()
+    wrong_identity["identity"]["value"] = "0" * 64
+    with pytest.raises(ArtifactError, match="identity mismatch"):
+        type(manifest).from_dict(wrong_identity)
+
+    wrong_order = manifest.to_dict()
+    wrong_order["members"].reverse()
+    with pytest.raises(ArtifactError, match="ordered"):
+        type(manifest).from_dict(wrong_order)
 
 
 def test_bundle_verification_detects_tampered_member(tmp_path: Path) -> None:

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "execution_target.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "execution_target"},
+        "payload": {
+          "type": "object",
+          "required": ["target_id", "target_class", "platform", "accelerator_backend", "runtime_contract", "capabilities", "constraints"],
+          "properties": {
+            "target_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "target_class": {"$ref": "common.schema.json#/$defs/identifier"},
+            "platform": {"$ref": "common.schema.json#/$defs/identifier"},
+            "accelerator_backend": {"$ref": "common.schema.json#/$defs/identifier"},
+            "runtime_contract": {"$ref": "common.schema.json#/$defs/identity"},
+            "capabilities": {"type": "array", "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/nonEmptyText"}},
+            "constraints": {"type": "object"}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

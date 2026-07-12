@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "recipe.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "recipe"},
+        "payload": {
+          "type": "object",
+          "required": ["recipe_id", "family", "version", "training_profile", "adapter_size", "memory_mode", "quantization", "training_duration", "checkpoint_policy", "evaluation_intensity", "retention_policy", "expert_overrides"],
+          "properties": {
+            "recipe_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "family": {"$ref": "common.schema.json#/$defs/identifier"},
+            "version": {"$ref": "common.schema.json#/$defs/identifier"},
+            "training_profile": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "adapter_size": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "memory_mode": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "quantization": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "training_duration": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "checkpoint_policy": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "evaluation_intensity": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "retention_policy": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "expert_overrides": {"type": "object"}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

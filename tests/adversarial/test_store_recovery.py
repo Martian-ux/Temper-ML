@@ -71,10 +71,10 @@ def test_append_rejects_broken_event_directory_symlink(tmp_path: Path) -> None:
 
 def test_symlinked_temporary_event_entry_is_not_ignored(tmp_path: Path) -> None:
     stream = EventStream(tmp_path / "events")
-    stream.append(EventRequest("one", "created", {}))
+    stored = stream.append(EventRequest("one", "created", {}))
     target = tmp_path / "temporary-target"
     target.write_bytes(b"synthetic")
-    _symlink_or_skip(stream.directory / ".event.interrupted.tmp", target)
+    _symlink_or_skip(stream.directory / f".{stored.path.name}.{'a' * 32}.tmp", target)
 
     with pytest.raises(EventStreamCorrupt, match="symlink|reparse"):
         stream.read_verified()
@@ -83,7 +83,9 @@ def test_symlinked_temporary_event_entry_is_not_ignored(tmp_path: Path) -> None:
 def test_incomplete_temporary_files_are_ignored(tmp_path: Path) -> None:
     stream = EventStream(tmp_path / "events")
     stored = stream.append(EventRequest("one", "created", {"ok": True}))
-    (stream.directory / ".event.interrupted.tmp").write_bytes(b'{"partial":')
+    (stream.directory / f".{stored.path.name}.{'b' * 32}.tmp").write_bytes(
+        b'{"partial":'
+    )
 
     assert stream.read_verified() == (stored,)
 
@@ -94,6 +96,15 @@ def test_unrecognized_non_temporary_entry_fails_closed(tmp_path: Path) -> None:
     (stream.directory / "unrecognized.partial").write_bytes(
         b"not a Temper temporary file"
     )
+
+    with pytest.raises(EventStreamCorrupt, match="unexpected"):
+        stream.read_verified()
+
+
+def test_unrecognized_dot_tmp_entry_fails_closed(tmp_path: Path) -> None:
+    stream = EventStream(tmp_path / "events")
+    stream.append(EventRequest("one", "created", {}))
+    (stream.directory / ".event.interrupted.tmp").write_bytes(b"partial")
 
     with pytest.raises(EventStreamCorrupt, match="unexpected"):
         stream.read_verified()

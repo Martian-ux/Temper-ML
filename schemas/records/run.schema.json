@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "run.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "run"},
+        "payload": {
+          "type": "object",
+          "required": ["run_id", "experiment", "experiment_manifest_identity", "attempt_number", "hardware_capability_profile", "execution_target", "runtime_identity", "request_identity", "training_state_identity", "retry_of"],
+          "properties": {
+            "run_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "experiment": {"$ref": "common.schema.json#/$defs/experimentReference"},
+            "experiment_manifest_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "attempt_number": {"type": "integer", "minimum": 1},
+            "hardware_capability_profile": {"$ref": "common.schema.json#/$defs/hardwareCapabilityProfileReference"},
+            "execution_target": {"$ref": "common.schema.json#/$defs/executionTargetReference"},
+            "runtime_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "request_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "training_state_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "retry_of": {"oneOf": [{"type": "null"}, {"$ref": "common.schema.json#/$defs/runReference"}]}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

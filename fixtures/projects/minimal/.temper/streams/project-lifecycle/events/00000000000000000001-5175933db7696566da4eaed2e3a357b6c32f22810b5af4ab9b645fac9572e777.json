@@ -1,0 +1,1 @@
+{"event_type":"project_created","idempotency_key":"event-minimal-1","payload":{"synthetic":true},"predecessor_hash":null,"projection_version":"v1","schema_version":"v1","sequence":1}

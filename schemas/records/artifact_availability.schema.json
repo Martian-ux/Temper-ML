@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "artifact_availability.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "artifact_availability"},
+        "payload": {
+          "type": "object",
+          "required": ["availability_id", "artifact", "state", "available_byte_classes", "storage_references", "checkpoint_resumable", "observed_content_identity", "supersedes"],
+          "properties": {
+            "availability_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "artifact": {"$ref": "common.schema.json#/$defs/artifactReference"},
+            "state": {"enum": ["available", "unavailable", "removed", "external_only"]},
+            "available_byte_classes": {"type": "array", "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/nonEmptyText"}},
+            "storage_references": {"type": "array", "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/storageReference"}},
+            "checkpoint_resumable": {"type": "boolean"},
+            "observed_content_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "supersedes": {"oneOf": [{"type": "null"}, {"$ref": "common.schema.json#/$defs/artifactAvailabilityReference"}]}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

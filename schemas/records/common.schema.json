@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "common.schema.json",
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "nonEmptyText": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "identity": {
+      "type": "object",
+      "required": ["algorithm", "value"],
+      "properties": {
+        "algorithm": {"const": "sha256"},
+        "value": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "reference": {
+      "type": "object",
+      "required": ["record_type", "logical_id", "identity"],
+      "properties": {
+        "record_type": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)*$"
+        },
+        "logical_id": {"$ref": "#/$defs/identifier"},
+        "identity": {"$ref": "#/$defs/identity"}
+      },
+      "additionalProperties": false
+    },
+    "adapterExportReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "adapter_export"}}}]},
+    "artifactReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "artifact"}}}]},
+    "artifactAvailabilityReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "artifact_availability"}}}]},
+    "baselinePolicyReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "baseline_policy"}}}]},
+    "baseModelRevisionReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "base_model_revision"}}}]},
+    "compatibilityGroupReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "compatibility_group"}}}]},
+    "executionTargetReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "execution_target"}}}]},
+    "experimentReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "experiment"}}}]},
+    "experimentDerivationReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "experiment_derivation"}}}]},
+    "hardwareCapabilityProfileReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "hardware_capability_profile"}}}]},
+    "hardwareRequirementsReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "hardware_requirements"}}}]},
+    "localUseSessionReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "local_use_session"}}}]},
+    "manifestDiffReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "manifest_diff"}}}]},
+    "projectReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "project"}}}]},
+    "projectPolicyReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "project_policy"}}}]},
+    "recipeReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "recipe"}}}]},
+    "recipeResolutionReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "recipe_resolution"}}}]},
+    "runReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "run"}}}]},
+    "taskDefinitionReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "task_definition"}}}]},
+    "storageReference": {
+      "type": "object",
+      "required": ["provider", "logical_key"],
+      "properties": {
+        "provider": {"$ref": "#/$defs/identifier"},
+        "logical_key": {"$ref": "#/$defs/identifier"}
+      },
+      "additionalProperties": false
+    },
+    "envelope": {
+      "type": "object",
+      "required": [
+        "record_type",
+        "schema_version",
+        "projection_version",
+        "identity",
+        "payload"
+      ],
+      "properties": {
+        "record_type": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)*$"
+        },
+        "schema_version": {"const": "v1"},
+        "projection_version": {"const": "v1"},
+        "identity": {"$ref": "#/$defs/identity"},
+        "payload": {"type": "object"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

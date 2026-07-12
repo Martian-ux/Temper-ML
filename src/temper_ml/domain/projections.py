@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import hashlib
 import re
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from temper_ml.store.canonical_json import dumps_canonical_json
@@ -16,6 +18,63 @@ _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 class ProjectionError(ValueError):
     """Raised when an identity projection is malformed."""
+
+
+@dataclass(frozen=True)
+class ProjectionRegistration:
+    """Bind one record schema version to its identity projection."""
+
+    record_type: str
+    schema_version: str
+    projection: "HashProjection"
+
+    def __post_init__(self) -> None:
+        if not _PROJECTION_NAME.fullmatch(self.record_type):
+            raise ProjectionError(f"invalid record type: {self.record_type!r}")
+        if not _PROJECTION_VERSION.fullmatch(self.schema_version):
+            raise ProjectionError(
+                f"invalid record schema version: {self.schema_version!r}"
+            )
+
+
+class ProjectionRegistry:
+    """Immutable, fail-closed lookup for record identity projections."""
+
+    def __init__(self, registrations: Iterable[ProjectionRegistration]) -> None:
+        entries: dict[tuple[str, str], ProjectionRegistration] = {}
+        labels: dict[str, tuple[str, str]] = {}
+        for registration in registrations:
+            key = (registration.record_type, registration.schema_version)
+            if key in entries:
+                raise ProjectionError(
+                    "duplicate projection registration: "
+                    f"{registration.record_type}@{registration.schema_version}"
+                )
+            prior = labels.get(registration.projection.label)
+            if prior is not None and prior != key:
+                raise ProjectionError(
+                    "projection label is registered to multiple record schemas: "
+                    f"{registration.projection.label}"
+                )
+            entries[key] = registration
+            labels[registration.projection.label] = key
+        self._entries = MappingProxyType(entries)
+
+    def resolve(self, record_type: str, schema_version: str) -> ProjectionRegistration:
+        """Resolve an exact record type and schema version or fail closed."""
+
+        try:
+            return self._entries[(record_type, schema_version)]
+        except KeyError as exc:
+            raise ProjectionError(
+                f"unknown record projection: {record_type}@{schema_version}"
+            ) from exc
+
+    @property
+    def registrations(self) -> tuple[ProjectionRegistration, ...]:
+        """Return registrations in stable record-type/schema order."""
+
+        return tuple(self._entries[key] for key in sorted(self._entries))
 
 
 @dataclass(frozen=True)

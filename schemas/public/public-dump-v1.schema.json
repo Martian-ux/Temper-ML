@@ -1,0 +1,128 @@
+{
+  "$id": "https://temper.invalid/schemas/public/public-dump-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "allowed_locations": {
+      "const": [
+        "public_documentation",
+        "public_issue",
+        "public_repository"
+      ]
+    },
+    "classification": {
+      "const": "public_projection"
+    },
+    "event_streams": {
+      "items": {
+        "$ref": "#/$defs/eventStream"
+      },
+      "type": "array"
+    },
+    "record_counts": {
+      "additionalProperties": {
+        "minimum": 0,
+        "type": "integer"
+      },
+      "propertyNames": {
+        "$ref": "#/$defs/recordType"
+      },
+      "type": "object"
+    },
+    "records": {
+      "items": {
+        "$ref": "#/$defs/publicRecord"
+      },
+      "type": "array"
+    },
+    "redaction_policy_version": {
+      "const": "v1"
+    },
+    "schema_version": {
+      "const": "v1"
+    }
+  },
+  "required": [
+    "allowed_locations",
+    "classification",
+    "event_streams",
+    "record_counts",
+    "records",
+    "redaction_policy_version",
+    "schema_version"
+  ],
+  "type": "object",
+  "$defs": {
+    "eventStream": {
+      "additionalProperties": false,
+      "properties": {
+        "event_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stream_ordinal": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "event_count",
+        "stream_ordinal"
+      ],
+      "type": "object"
+    },
+    "publicRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "fields": {
+          "maxProperties": 0,
+          "type": "object"
+        },
+        "public_record_projection_version": {
+          "const": "v1"
+        },
+        "record_type": {
+          "$ref": "#/$defs/recordType"
+        },
+        "source_projection_version": {
+          "const": "v1"
+        },
+        "source_schema_version": {
+          "const": "v1"
+        }
+      },
+      "required": [
+        "fields",
+        "public_record_projection_version",
+        "record_type",
+        "source_projection_version",
+        "source_schema_version"
+      ],
+      "type": "object"
+    },
+    "recordType": {
+      "enum": [
+        "adapter_export",
+        "artifact",
+        "artifact_availability",
+        "base_model_revision",
+        "baseline_policy",
+        "compatibility_group",
+        "execution_target",
+        "experiment",
+        "experiment_derivation",
+        "hardware_capability_profile",
+        "hardware_requirements",
+        "local_use_session",
+        "manifest_diff",
+        "project",
+        "project_policy",
+        "recipe",
+        "recipe_resolution",
+        "run",
+        "task_definition"
+      ],
+      "type": "string"
+    }
+  }
+}

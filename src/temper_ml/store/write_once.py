@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-import os
 from pathlib import Path
+import re
 from typing import Any
-from uuid import uuid4
 
 from temper_ml.domain.projections import (
     ContentIdentity,
@@ -23,6 +22,16 @@ from temper_ml.store.canonical_json import (
     CanonicalJsonError,
     dumps_canonical_json,
     loads_canonical_json,
+)
+from temper_ml.store.safe_io import (
+    SafeIoError,
+    read_stable_bytes,
+    replace_bytes,
+    write_once_bytes,
+)
+
+_WINDOWS_RESERVED = re.compile(
+    r"^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$", re.IGNORECASE
 )
 
 
@@ -67,22 +76,15 @@ class WriteOnceStore:
             self._verify_immutable_record(path, projection, identity)
             raise WriteOnceExists(f"immutable content already exists: {identity}")
         self._ensure_safe_directory(path.parent)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         try:
-            handle = os.open(path, flags, 0o644)
+            write_once_bytes(path, payload)
         except FileExistsError:
             self._verify_immutable_record(path, projection, identity)
             raise WriteOnceExists(
                 f"immutable content already exists: {identity}"
             ) from None
-        try:
-            with os.fdopen(handle, "wb") as file:
-                file.write(payload)
-                file.flush()
-                os.fsync(file.fileno())
-        except BaseException:
-            path.unlink(missing_ok=True)
-            raise
+        except SafeIoError as exc:
+            raise WriteOnceError("unable to write immutable content safely") from exc
         return WrittenRecord(identity=identity, path=path)
 
     def read_projected_json(
@@ -97,10 +99,10 @@ class WriteOnceStore:
     ) -> Mapping[str, Any]:
         self._assert_no_symlinks(path)
         try:
-            record = loads_canonical_json(path.read_bytes())
+            record = loads_canonical_json(read_stable_bytes(path))
         except FileNotFoundError:
             raise
-        except (CanonicalJsonError, OSError) as exc:
+        except (CanonicalJsonError, SafeIoError, OSError) as exc:
             raise WriteOnceCorrupt(
                 f"immutable content is not canonical JSON: {identity}"
             ) from exc
@@ -121,9 +123,10 @@ class WriteOnceStore:
             safe_path_stat(path, allow_missing=True)
         except UnsafeFilesystemPath as exc:
             raise WriteOnceError(str(exc)) from exc
-        temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-        temp_path.write_bytes(dumps_canonical_json(state))
-        os.replace(temp_path, path)
+        try:
+            replace_bytes(path, dumps_canonical_json(state))
+        except SafeIoError as exc:
+            raise WriteOnceError("unable to replace derived state safely") from exc
         return path
 
     def _immutable_path(self, area: str, identity: ContentIdentity) -> Path:
@@ -167,4 +170,11 @@ def _safe_relative_path(value: str) -> Path:
     parts = tuple(part for chunk in value.split("/") for part in chunk.split("\\"))
     if not parts or any(part in ("", ".", "..") for part in parts):
         raise WriteOnceError(f"path traversal is not allowed: {value!r}")
+    if any(
+        any(ord(character) < 32 or ord(character) == 127 for character in part)
+        or part.endswith((".", " "))
+        or _WINDOWS_RESERVED.fullmatch(part)
+        for part in parts
+    ):
+        raise WriteOnceError(f"non-portable store path: {value!r}")
     return Path(*parts)
