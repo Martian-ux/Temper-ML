@@ -152,22 +152,19 @@ class PreflightResult:
     checks: tuple[ConstraintCheck, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.resolution, RecipeResolution):
-            raise PreflightError("recipe_resolution_invalid")
-        if not isinstance(self.requirements, HardwareRequirements):
-            raise PreflightError("hardware_requirements_invalid")
-        if not isinstance(self.target, ExecutionTarget):
-            raise PreflightError("execution_target_invalid")
-        if not isinstance(self.profile, HardwareCapabilityProfile):
-            raise PreflightError("capability_profile_invalid")
-        if not isinstance(self.estimate, PreflightEstimate):
-            raise PreflightError("preflight_estimate_invalid")
-        _validate_preflight_estimate(self.estimate)
-        _validate_estimate_resolution(self.estimate, self.resolution)
+        expected = _canonical_constraint_checks(
+            self.resolution,
+            self.requirements,
+            self.target,
+            self.profile,
+            self.estimate,
+        )
         if not isinstance(self.checks, tuple) or any(
             not isinstance(check, ConstraintCheck) for check in self.checks
         ):
             raise PreflightError("preflight_checks_invalid")
+        if self.checks != expected:
+            raise PreflightError("preflight_checks_mismatch")
 
     @property
     def status(self) -> PreflightStatus:
@@ -282,6 +279,32 @@ def preflight(
 ) -> PreflightResult:
     """Evaluate one already-selected target without substituting another target."""
 
+    checks = _canonical_constraint_checks(
+        resolution,
+        requirements,
+        target,
+        profile,
+        estimate,
+    )
+    return PreflightResult(
+        resolution,
+        requirements,
+        target,
+        profile,
+        estimate,
+        checks,
+    )
+
+
+def _canonical_constraint_checks(
+    resolution: RecipeResolution,
+    requirements: HardwareRequirements,
+    target: ExecutionTarget,
+    profile: HardwareCapabilityProfile,
+    estimate: PreflightEstimate,
+) -> tuple[ConstraintCheck, ...]:
+    """Build the one complete, deterministic set of preflight decisions."""
+
     if not isinstance(resolution, RecipeResolution):
         raise PreflightError("recipe_resolution_invalid")
     if not isinstance(requirements, HardwareRequirements):
@@ -320,7 +343,7 @@ def preflight(
         and observed_library_versions[name] == expected
         for name, expected in required_library_versions.items()
     )
-    checks = (
+    return (
         ConstraintCheck(
             "target_class_allowed",
             target.target_class in requirements.execution_target_classes,
@@ -409,14 +432,6 @@ def preflight(
             resolution.quantization,
             profile.supported_quantization_modes,
         ),
-    )
-    return PreflightResult(
-        resolution,
-        requirements,
-        target,
-        profile,
-        estimate,
-        checks,
     )
 
 

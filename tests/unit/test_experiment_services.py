@@ -25,10 +25,11 @@ from temper_ml.domain.policies import BaselinePolicy, PerModelBaseline
 from temper_ml.domain.projects import Project, ProjectPolicy
 from temper_ml.domain.projections import ContentIdentity
 from temper_ml.domain.recipes import Recipe, RecipeResolution
-from temper_ml.domain.records import record_reference
+from temper_ml.domain.records import RecordReference, record_reference
 from temper_ml.domain.tasks import TaskDefinition
 from temper_ml.runtime.preflight import (
     EstimateComponents,
+    PreflightError,
     PreflightResult,
     capture_capability_profile,
     estimate_resources,
@@ -43,6 +44,14 @@ from temper_ml.runtime.recipe_resolution import (
 
 def _identity(label: str) -> ContentIdentity:
     return ContentIdentity("sha256", hashlib.sha256(label.encode()).hexdigest())
+
+
+def _file_snapshot(root: Path) -> tuple[tuple[str, bytes], ...]:
+    return tuple(
+        (path.relative_to(root).as_posix(), path.read_bytes())
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    )
 
 
 def _defaults() -> dict[str, object]:
@@ -329,6 +338,162 @@ def test_clone_rejects_a_parent_from_another_store_without_supporting_leaks(
     assert destination.store.iter_streams() == ()
 
 
+def test_clone_rejects_dangling_support_without_mutating_the_store(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    dangling_resolution = replace(
+        fixture.resolution,
+        resolution_id="resolution-dangling",
+        hardware_requirements=RecordReference(
+            "hardware_requirements",
+            "requirements-missing",
+            _identity("requirements-missing"),
+        ),
+    )
+    before_verification = fixture.service.store.verify().to_dict()
+    before_files = _file_snapshot(tmp_path)
+
+    with pytest.raises(ApplicationServiceError) as error:
+        fixture.service.clone(
+            fixture.experiment,
+            experiment_id="experiment-dangling-support",
+            replacements={"dataset_version": _identity("dataset-update")},
+            derivation_id="derivation-dangling-support",
+            diff_id="diff-dangling-support",
+            reason_code="dataset_update",
+            reason="Use a different synthetic dataset revision.",
+            supporting_records=(dangling_resolution,),
+        )
+
+    assert error.value.code == "experiment_candidate_graph_invalid"
+    assert fixture.service.store.verify().to_dict() == before_verification
+    assert _file_snapshot(tmp_path) == before_files
+
+
+def test_clone_does_not_use_proposed_records_to_close_an_existing_dangling_graph(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    missing_requirements = replace(
+        fixture.requirements,
+        requirements_id="requirements-existing-dangling",
+    )
+    dangling_resolution = replace(
+        fixture.resolution,
+        resolution_id="resolution-existing-dangling",
+        hardware_requirements=record_reference(missing_requirements),
+    )
+    unrelated_support = replace(
+        fixture.requirements,
+        requirements_id="requirements-unrelated-support",
+    )
+    fixture.service.store.write_record(dangling_resolution)
+    before_files = _file_snapshot(tmp_path)
+    before_records = tuple(
+        stored.envelope.to_dict() for stored in fixture.service.store.iter_records()
+    )
+
+    with pytest.raises(ApplicationServiceError) as error:
+        fixture.service.clone(
+            fixture.experiment,
+            experiment_id="experiment-existing-dangling",
+            replacements={"dataset_version": _identity("dataset-existing-dangling")},
+            derivation_id="derivation-existing-dangling",
+            diff_id="diff-existing-dangling",
+            reason_code="dataset_update",
+            reason="Use a different synthetic dataset revision.",
+            supporting_records=(unrelated_support, missing_requirements),
+        )
+
+    assert error.value.code == "experiment_candidate_graph_invalid"
+    assert _file_snapshot(tmp_path) == before_files
+    after_records = tuple(
+        stored.envelope.to_dict() for stored in fixture.service.store.iter_records()
+    )
+    assert after_records == before_records
+    after_references = tuple(
+        stored.reference for stored in fixture.service.store.iter_records()
+    )
+    assert record_reference(missing_requirements) not in after_references
+    assert record_reference(unrelated_support) not in after_references
+
+
+def test_clone_rejects_an_omitted_derived_dependency_without_leaking_support(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    adapted_requirements = replace(
+        fixture.requirements,
+        requirements_id="requirements-omitted-resolution",
+        minimum_accelerator_memory_bytes=2_000,
+    )
+    omitted_resolution = replace(
+        fixture.resolution,
+        resolution_id="resolution-omitted",
+        hardware_requirements=record_reference(adapted_requirements),
+    )
+    before_verification = fixture.service.store.verify().to_dict()
+    before_files = _file_snapshot(tmp_path)
+
+    with pytest.raises(ApplicationServiceError) as error:
+        fixture.service.clone(
+            fixture.experiment,
+            experiment_id="experiment-omitted-resolution",
+            replacements={
+                "recipe_resolution": record_reference(omitted_resolution),
+                "hardware_requirements": record_reference(adapted_requirements),
+            },
+            derivation_id="derivation-omitted-resolution",
+            diff_id="diff-omitted-resolution",
+            reason_code="hardware_adaptation",
+            reason="Use a lower synthetic accelerator memory requirement.",
+            supporting_records=(adapted_requirements,),
+        )
+
+    assert error.value.code == "experiment_candidate_graph_invalid"
+    assert fixture.service.store.verify().to_dict() == before_verification
+    assert _file_snapshot(tmp_path) == before_files
+
+
+def test_clone_topologically_orders_reverse_ordered_supporting_records(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    adapted_requirements = replace(
+        fixture.requirements,
+        requirements_id="requirements-reverse-ordered",
+        minimum_accelerator_memory_bytes=2_000,
+    )
+    adapted_resolution = replace(
+        fixture.resolution,
+        resolution_id="resolution-reverse-ordered",
+        hardware_requirements=record_reference(adapted_requirements),
+    )
+
+    derivation = fixture.service.clone(
+        fixture.experiment,
+        experiment_id="experiment-reverse-ordered",
+        replacements={
+            "recipe_resolution": record_reference(adapted_resolution),
+            "hardware_requirements": record_reference(adapted_requirements),
+        },
+        derivation_id="derivation-reverse-ordered",
+        diff_id="diff-reverse-ordered",
+        reason_code="hardware_adaptation",
+        reason="Use a lower synthetic accelerator memory requirement.",
+        supporting_records=(adapted_resolution, adapted_requirements),
+    )
+
+    assert derivation.derived_experiment.recipe_resolution == record_reference(
+        adapted_resolution
+    )
+    verification = fixture.service.store.verify()
+    assert verification.record_counts["hardware_requirements"] == 2
+    assert verification.record_counts["recipe_resolution"] == 2
+    assert verification.record_counts["experiment_derivation"] == 1
+
+
 def test_changed_machine_uses_strict_unchanged_or_explicit_adapted_derivation(
     tmp_path: Path,
 ) -> None:
@@ -431,6 +596,31 @@ def test_changed_machine_uses_strict_unchanged_or_explicit_adapted_derivation(
         == derivation.derived_experiment.scientific_manifest()
     )
     assert fixture.service.store.verify().record_counts["experiment_derivation"] == 1
+
+
+def test_strict_replay_cannot_be_authorized_with_empty_preflight_checks(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    blocked = _preflight(
+        fixture.resolution,
+        fixture.requirements,
+        fixture.target,
+        memory=3_000,
+    )
+
+    with pytest.raises(PreflightError) as error:
+        PreflightResult(
+            blocked.resolution,
+            blocked.requirements,
+            blocked.target,
+            blocked.profile,
+            blocked.estimate,
+            (),
+        )
+
+    assert error.value.code == "preflight_checks_mismatch"
+    assert not plan_replay(fixture.experiment, blocked).ready
 
 
 def test_replay_plan_identity_includes_estimate_and_constraint_content(

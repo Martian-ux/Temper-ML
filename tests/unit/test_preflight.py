@@ -246,6 +246,109 @@ def test_preflight_exposes_every_estimate_and_constraint() -> None:
     assert version_drift.blocking_reasons == ("resolved_library_versions_match",)
 
 
+def test_preflight_result_rejects_missing_or_altered_canonical_checks() -> None:
+    requirements = _requirements()
+    target = _target()
+    resolution = _resolution(requirements, target)
+    profile = _profile(target, 3_000)
+    estimate = estimate_resources(resolution, _components())
+    blocked = preflight(resolution, requirements, target, profile, estimate)
+
+    assert not blocked.ready
+    forged_checks = (
+        (),
+        blocked.checks[:-1],
+        (*blocked.checks, blocked.checks[-1]),
+        tuple(reversed(blocked.checks)),
+        (replace(blocked.checks[0], satisfied=False), *blocked.checks[1:]),
+    )
+    for checks in forged_checks:
+        with pytest.raises(PreflightError) as error:
+            PreflightResult(
+                resolution,
+                requirements,
+                target,
+                profile,
+                estimate,
+                checks,
+            )
+        assert error.value.code == "preflight_checks_mismatch"
+
+
+def test_preflight_result_direct_construction_is_deterministic() -> None:
+    requirements = _requirements()
+    target = _target()
+    resolution = _resolution(requirements, target)
+    estimate = estimate_resources(resolution, _components())
+
+    for profile in (_profile(target), _profile(target, 3_000)):
+        canonical = preflight(
+            resolution,
+            requirements,
+            target,
+            profile,
+            estimate,
+        )
+        direct = PreflightResult(
+            resolution,
+            requirements,
+            target,
+            profile,
+            estimate,
+            canonical.checks,
+        )
+        assert direct == canonical
+        assert direct.ready is canonical.ready
+        assert direct.blocking_reasons == canonical.blocking_reasons
+
+
+@pytest.mark.parametrize(
+    ("context", "code"),
+    (
+        ("requirements", "resolution_requirements_mismatch"),
+        ("target", "resolution_target_mismatch"),
+        ("profile", "profile_target_mismatch"),
+    ),
+)
+def test_preflight_result_rejects_direct_reference_mismatches(
+    context: str, code: str
+) -> None:
+    requirements = _requirements()
+    target = _target()
+    resolution = _resolution(requirements, target)
+    profile = _profile(target)
+    estimate = estimate_resources(resolution, _components())
+    canonical = preflight(
+        resolution,
+        requirements,
+        target,
+        profile,
+        estimate,
+    )
+
+    if context == "requirements":
+        requirements = replace(
+            requirements,
+            requirements_id="requirements-other",
+        )
+    elif context == "target":
+        target = _target("target-other")
+    else:
+        profile = _profile(_target("target-other"))
+
+    with pytest.raises(PreflightError) as error:
+        PreflightResult(
+            resolution,
+            requirements,
+            target,
+            profile,
+            estimate,
+            canonical.checks,
+        )
+
+    assert error.value.code == code
+
+
 def test_target_selection_never_silently_switches_between_windows_and_wsl() -> None:
     requirements = _requirements()
     wsl = _target()

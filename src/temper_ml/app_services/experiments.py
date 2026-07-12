@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, fields, replace
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 import hashlib
 from pathlib import Path
@@ -31,6 +31,7 @@ from temper_ml.domain.projections import ContentIdentity
 from temper_ml.domain.projects import Project, ProjectPolicy
 from temper_ml.domain.recipes import Recipe, RecipeResolution
 from temper_ml.domain.records import (
+    RecordReference,
     RecordValidationError,
     TypedRecord,
     record_reference,
@@ -108,6 +109,132 @@ class ReplayPlan:
                 self.derivation.manifest_diff
             ).to_dict()
         return value
+
+
+_RecordKey = tuple[str, str, str]
+_CANDIDATE_GRAPH_INVALID = "experiment_candidate_graph_invalid"
+
+
+def _record_key(record: TypedRecord) -> _RecordKey:
+    return (
+        record.RECORD_TYPE,
+        record.identity.algorithm,
+        record.identity.value,
+    )
+
+
+def _reference_key(reference: RecordReference) -> _RecordKey:
+    return (
+        reference.record_type,
+        reference.identity.algorithm,
+        reference.identity.value,
+    )
+
+
+def _iter_typed_dependencies(
+    value: Any, *, include_record: bool = True
+) -> Iterator[RecordReference | TypedRecord]:
+    """Mirror canonical-store traversal while leaving arbitrary JSON opaque."""
+
+    if isinstance(value, RecordReference):
+        yield value
+        return
+    if isinstance(value, TypedRecord):
+        if include_record:
+            yield value
+        if is_dataclass(value):
+            for field in fields(value):
+                yield from _iter_typed_dependencies(getattr(value, field.name))
+        return
+    if is_dataclass(value):
+        for field in fields(value):
+            yield from _iter_typed_dependencies(getattr(value, field.name))
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_typed_dependencies(item)
+
+
+def _validate_record_graph(
+    index: Mapping[_RecordKey, TypedRecord],
+) -> dict[_RecordKey, set[_RecordKey]]:
+    """Require exact closure for one complete graph and return its dependencies."""
+
+    dependencies: dict[_RecordKey, set[_RecordKey]] = {}
+    try:
+        for key in sorted(index):
+            record_dependencies: set[_RecordKey] = set()
+            for dependency in _iter_typed_dependencies(
+                index[key], include_record=False
+            ):
+                if isinstance(dependency, RecordReference):
+                    dependency_key = _reference_key(dependency)
+                    target = index.get(dependency_key)
+                    if target is None or record_reference(target) != dependency:
+                        raise ApplicationServiceError(_CANDIDATE_GRAPH_INVALID)
+                else:
+                    dependency_key = _record_key(dependency)
+                    target = index.get(dependency_key)
+                    if target is None or (
+                        type(target) is not type(dependency)
+                        or target.to_dict() != dependency.to_dict()
+                    ):
+                        raise ApplicationServiceError(_CANDIDATE_GRAPH_INVALID)
+                record_dependencies.add(dependency_key)
+            dependencies[key] = record_dependencies
+    except ApplicationServiceError:
+        raise
+    except (RecordValidationError, TypeError, ValueError):
+        raise ApplicationServiceError(_CANDIDATE_GRAPH_INVALID) from None
+    return dependencies
+
+
+def _prepare_candidate_record_graph(
+    existing_records: tuple[TypedRecord, ...],
+    proposed_records: tuple[TypedRecord, ...],
+) -> tuple[dict[_RecordKey, TypedRecord], tuple[TypedRecord, ...]]:
+    """Validate exact closure and return a prefix-safe deterministic write order."""
+
+    index: dict[_RecordKey, TypedRecord] = {}
+    existing_keys: set[_RecordKey] = set()
+    proposed: dict[_RecordKey, TypedRecord] = {}
+
+    def add(record: TypedRecord, *, existing: bool) -> None:
+        try:
+            key = _record_key(record)
+            prior = index.get(key)
+            if prior is not None and (
+                type(prior) is not type(record) or prior.to_dict() != record.to_dict()
+            ):
+                raise ApplicationServiceError(_CANDIDATE_GRAPH_INVALID)
+        except (RecordValidationError, TypeError, ValueError):
+            raise ApplicationServiceError(_CANDIDATE_GRAPH_INVALID) from None
+        index[key] = record
+        if existing:
+            existing_keys.add(key)
+        else:
+            proposed[key] = record
+
+    for record in existing_records:
+        add(record, existing=True)
+    _validate_record_graph(index)
+    for record in proposed_records:
+        add(record, existing=False)
+
+    dependencies = _validate_record_graph(index)
+
+    pending = set(proposed) - existing_keys
+    satisfied = set(existing_keys)
+    write_order: list[TypedRecord] = []
+    while pending:
+        ready = sorted(key for key in pending if dependencies[key].issubset(satisfied))
+        if not ready:
+            raise ApplicationServiceError(_CANDIDATE_GRAPH_INVALID)
+        for key in ready:
+            write_order.append(proposed[key])
+            satisfied.add(key)
+            pending.remove(key)
+    return index, tuple(write_order)
 
 
 class ExperimentService:
@@ -254,18 +381,28 @@ class ExperimentService:
                 output_record,
                 conflict_code="experiment_derivation_conflict",
             )
-        for supporting_record in supporting_records:
-            write_record_idempotently(
-                self.store,
-                supporting_record,
-                conflict_code="experiment_dependency_conflict",
+        try:
+            existing_records = tuple(
+                stored.record for stored in self.store.iter_records()
             )
-        self._validate_stored_experiment(derived)
-        for record in (derived, evidence.manifest_diff, evidence):
+        except EvidenceError:
+            raise ApplicationServiceError(_CANDIDATE_GRAPH_INVALID) from None
+        output_records = (derived, evidence.manifest_diff, evidence)
+        candidate_index, write_order = _prepare_candidate_record_graph(
+            existing_records,
+            (*supporting_records, *output_records),
+        )
+        self._validate_candidate_experiment(derived, candidate_index)
+        output_keys = {_record_key(record) for record in output_records}
+        for record in write_order:
             write_record_idempotently(
                 self.store,
                 record,
-                conflict_code="experiment_derivation_conflict",
+                conflict_code=(
+                    "experiment_derivation_conflict"
+                    if _record_key(record) in output_keys
+                    else "experiment_dependency_conflict"
+                ),
             )
         self.store.append_event(
             "experiment-lifecycle",
@@ -303,19 +440,27 @@ class ExperimentService:
         ):
             raise ApplicationServiceError(mismatch_code)
 
-    def _validate_stored_experiment(self, experiment: Experiment) -> None:
+    def _validate_candidate_experiment(
+        self,
+        experiment: Experiment,
+        candidate_index: Mapping[_RecordKey, TypedRecord],
+    ) -> None:
+        def resolve(reference: RecordReference) -> TypedRecord:
+            record = candidate_index.get(_reference_key(reference))
+            if record is None or record_reference(record) != reference:
+                raise ApplicationServiceError(_CANDIDATE_GRAPH_INVALID)
+            return record
+
         records = {
-            "project": self.store.read_record(experiment.project).record,
-            "policy": self.store.read_record(experiment.project_policy).record,
-            "task": self.store.read_record(experiment.task_definition).record,
-            "base_model": self.store.read_record(experiment.base_model_revision).record,
-            "recipe": self.store.read_record(experiment.recipe).record,
-            "resolution": self.store.read_record(experiment.recipe_resolution).record,
-            "group": self.store.read_record(experiment.compatibility_group).record,
-            "requirements": self.store.read_record(
-                experiment.hardware_requirements
-            ).record,
-            "target": self.store.read_record(experiment.execution_target).record,
+            "project": resolve(experiment.project),
+            "policy": resolve(experiment.project_policy),
+            "task": resolve(experiment.task_definition),
+            "base_model": resolve(experiment.base_model_revision),
+            "recipe": resolve(experiment.recipe),
+            "resolution": resolve(experiment.recipe_resolution),
+            "group": resolve(experiment.compatibility_group),
+            "requirements": resolve(experiment.hardware_requirements),
+            "target": resolve(experiment.execution_target),
         }
         expected_types = {
             "project": Project,
