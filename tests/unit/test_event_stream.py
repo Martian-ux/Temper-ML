@@ -2,10 +2,12 @@ from pathlib import Path
 
 import pytest
 
+import temper_ml.store.event_stream as event_stream_module
 from temper_ml.store.event_stream import (
     EventConflict,
     EventRequest,
     EventStream,
+    EventStreamCorrupt,
 )
 
 
@@ -44,6 +46,22 @@ def test_first_append_returns_the_canonicalized_payload(tmp_path: Path) -> None:
     assert stream.read_verified() == (stored,)
 
 
+def test_event_payloads_are_deeply_alias_safe_and_immutable(tmp_path: Path) -> None:
+    source = {"nested": {"value": 1}, "values": ["alpha"]}
+    request = EventRequest("one", "created", source)
+    source["nested"]["value"] = 99
+    source["values"].append("changed")
+
+    stored = EventStream(tmp_path / "events").append(request)
+
+    assert stored.request_fields()["payload"] == {
+        "nested": {"value": 1},
+        "values": ["alpha"],
+    }
+    with pytest.raises(TypeError):
+        stored.payload["nested"]["value"] = 2
+
+
 def test_rebuild_reduces_only_verified_events(tmp_path: Path) -> None:
     stream = EventStream(tmp_path / "events")
     stream.append(EventRequest("one", "counter.added", {"amount": 2}))
@@ -52,3 +70,24 @@ def test_rebuild_reduces_only_verified_events(tmp_path: Path) -> None:
     result = stream.rebuild(0, lambda state, event: state + event.payload["amount"])
 
     assert result == 5
+
+
+def test_event_commit_never_replaces_a_concurrently_created_final(
+    tmp_path: Path, monkeypatch
+) -> None:
+    stream = EventStream(tmp_path / "events")
+    appeared: list[Path] = []
+
+    def concurrent_create(path, payload):
+        del payload
+        candidate = Path(path)
+        candidate.write_bytes(b"foreign final")
+        appeared.append(candidate)
+        raise FileExistsError
+
+    monkeypatch.setattr(event_stream_module, "write_once_bytes", concurrent_create)
+
+    with pytest.raises(EventStreamCorrupt, match="unsafe event stream"):
+        stream.append(EventRequest("one", "created", {}))
+    assert len(appeared) == 1
+    assert appeared[0].read_bytes() == b"foreign final"

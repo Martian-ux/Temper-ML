@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import stat
-from typing import Iterable
+from typing import Any, ClassVar, Iterable, Mapping
 
 from temper_ml.domain.projections import (
     ContentIdentity,
     HashProjection,
     content_identity,
+)
+from temper_ml.domain.records import (
+    RecordReference,
+    RecordValidationError,
+    TypedRecord,
+    identity_fields,
+    parse_identity,
+    require_identifier,
+    require_string_tuple,
 )
 from temper_ml.filesystem import (
     UnsafeFilesystemPath,
@@ -28,6 +38,279 @@ BUNDLE_SCHEMA_VERSION = "v1"
 
 class ArtifactError(ValueError):
     """Raised when artifact bytes or bundle members are unsafe or malformed."""
+
+
+class ArtifactContentKind(str, Enum):
+    BYTES = "bytes"
+    BUNDLE = "bundle"
+    IMMUTABLE_UPSTREAM_REVISION = "immutable_upstream_revision"
+
+
+class AvailabilityState(str, Enum):
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    REMOVED = "removed"
+    EXTERNAL_ONLY = "external_only"
+
+
+@dataclass(frozen=True)
+class StorageReference:
+    """Portable logical storage name, never a host path or retrieval URI."""
+
+    provider: str
+    logical_key: str
+
+    def __post_init__(self) -> None:
+        require_identifier("storage provider", self.provider)
+        require_identifier("storage logical_key", self.logical_key)
+
+    def to_dict(self) -> dict[str, str]:
+        return {"provider": self.provider, "logical_key": self.logical_key}
+
+
+@dataclass(frozen=True)
+class Artifact(TypedRecord):
+    """Immutable adapter descriptor, integrity evidence, and lineage."""
+
+    RECORD_TYPE: ClassVar[str] = "artifact"
+
+    artifact_id: str
+    project: RecordReference
+    producing_run: RecordReference
+    adapter_type: str
+    content_kind: ArtifactContentKind
+    content_identity: ContentIdentity
+    base_model_revision: RecordReference
+    tokenizer_identity: ContentIdentity
+    compatibility_groups: tuple[RecordReference, ...]
+    parent_artifacts: tuple[RecordReference, ...]
+    storage_references: tuple[StorageReference, ...]
+    integrity_evidence: ContentIdentity
+    provenance: ContentIdentity
+    lineage_evidence: ContentIdentity
+
+    def __post_init__(self) -> None:
+        require_identifier("artifact_id", self.artifact_id)
+        for field, record_type in (
+            ("project", "project"),
+            ("producing_run", "run"),
+            ("base_model_revision", "base_model_revision"),
+        ):
+            value = getattr(self, field)
+            if (
+                not isinstance(value, RecordReference)
+                or value.record_type != record_type
+            ):
+                raise RecordValidationError(f"{field} must reference {record_type}")
+        require_identifier("adapter_type", self.adapter_type)
+        if not isinstance(self.content_kind, ArtifactContentKind):
+            raise RecordValidationError("content_kind is invalid")
+        for field in (
+            "content_identity",
+            "tokenizer_identity",
+            "integrity_evidence",
+            "provenance",
+            "lineage_evidence",
+        ):
+            if not isinstance(getattr(self, field), ContentIdentity):
+                raise RecordValidationError(f"{field} must be a content identity")
+        object.__setattr__(
+            self,
+            "compatibility_groups",
+            _artifact_references(
+                "compatibility_groups",
+                self.compatibility_groups,
+                "compatibility_group",
+                non_empty=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "parent_artifacts",
+            _artifact_references(
+                "parent_artifacts",
+                self.parent_artifacts,
+                "artifact",
+                non_empty=False,
+            ),
+        )
+        if (
+            not isinstance(self.storage_references, tuple)
+            or not self.storage_references
+        ):
+            raise RecordValidationError("storage_references must be a non-empty tuple")
+        if any(
+            not isinstance(reference, StorageReference)
+            for reference in self.storage_references
+        ):
+            raise RecordValidationError("storage_references contains an invalid value")
+        storage_keys = tuple(
+            (reference.provider, reference.logical_key)
+            for reference in self.storage_references
+        )
+        if len(set(storage_keys)) != len(storage_keys):
+            raise RecordValidationError(
+                "storage_references must not contain duplicates"
+            )
+        object.__setattr__(
+            self,
+            "storage_references",
+            tuple(
+                sorted(
+                    self.storage_references,
+                    key=lambda item: (item.provider, item.logical_key),
+                )
+            ),
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "artifact_id": self.artifact_id,
+            "project": self.project.to_dict(),
+            "producing_run": self.producing_run.to_dict(),
+            "adapter_type": self.adapter_type,
+            "content_kind": self.content_kind.value,
+            "content_identity": identity_fields(self.content_identity),
+            "base_model_revision": self.base_model_revision.to_dict(),
+            "tokenizer_identity": identity_fields(self.tokenizer_identity),
+            "compatibility_groups": [
+                reference.to_dict() for reference in self.compatibility_groups
+            ],
+            "parent_artifacts": [
+                reference.to_dict() for reference in self.parent_artifacts
+            ],
+            "storage_references": [
+                reference.to_dict() for reference in self.storage_references
+            ],
+            "integrity_evidence": identity_fields(self.integrity_evidence),
+            "provenance": identity_fields(self.provenance),
+            "lineage_evidence": identity_fields(self.lineage_evidence),
+        }
+
+
+@dataclass(frozen=True)
+class ArtifactAvailability(TypedRecord):
+    """One immutable availability observation, separate from the Artifact."""
+
+    RECORD_TYPE: ClassVar[str] = "artifact_availability"
+
+    availability_id: str
+    artifact: RecordReference
+    state: AvailabilityState
+    available_byte_classes: tuple[str, ...]
+    storage_references: tuple[StorageReference, ...]
+    checkpoint_resumable: bool
+    observed_content_identity: ContentIdentity
+    supersedes: RecordReference | None = None
+
+    def __post_init__(self) -> None:
+        require_identifier("availability_id", self.availability_id)
+        if (
+            not isinstance(self.artifact, RecordReference)
+            or self.artifact.record_type != "artifact"
+        ):
+            raise RecordValidationError("artifact must reference an artifact")
+        if not isinstance(self.state, AvailabilityState):
+            raise RecordValidationError("availability state is invalid")
+        object.__setattr__(
+            self,
+            "available_byte_classes",
+            require_string_tuple(
+                "available_byte_classes",
+                self.available_byte_classes,
+                non_empty=False,
+                sorted_values=True,
+            ),
+        )
+        if not isinstance(self.storage_references, tuple) or any(
+            not isinstance(reference, StorageReference)
+            for reference in self.storage_references
+        ):
+            raise RecordValidationError("storage_references must be a tuple")
+        storage_keys = tuple(
+            (reference.provider, reference.logical_key)
+            for reference in self.storage_references
+        )
+        if len(set(storage_keys)) != len(storage_keys):
+            raise RecordValidationError(
+                "storage_references must not contain duplicates"
+            )
+        object.__setattr__(
+            self,
+            "storage_references",
+            tuple(
+                sorted(
+                    self.storage_references,
+                    key=lambda item: (item.provider, item.logical_key),
+                )
+            ),
+        )
+        if not isinstance(self.checkpoint_resumable, bool):
+            raise RecordValidationError("checkpoint_resumable must be a boolean")
+        if not isinstance(self.observed_content_identity, ContentIdentity):
+            raise RecordValidationError(
+                "observed_content_identity must be a content identity"
+            )
+        if self.supersedes is not None and (
+            not isinstance(self.supersedes, RecordReference)
+            or self.supersedes.record_type != "artifact_availability"
+        ):
+            raise RecordValidationError(
+                "supersedes must reference an artifact_availability"
+            )
+        if self.state in (AvailabilityState.UNAVAILABLE, AvailabilityState.REMOVED):
+            if self.available_byte_classes or self.storage_references:
+                raise RecordValidationError(
+                    "unavailable artifacts cannot advertise retained locations or bytes"
+                )
+            if self.checkpoint_resumable:
+                raise RecordValidationError(
+                    "unavailable artifacts cannot be checkpoint-resumable"
+                )
+        if self.state is AvailabilityState.AVAILABLE and not self.storage_references:
+            raise RecordValidationError(
+                "available artifacts require a logical storage reference"
+            )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "availability_id": self.availability_id,
+            "artifact": self.artifact.to_dict(),
+            "state": self.state.value,
+            "available_byte_classes": list(self.available_byte_classes),
+            "storage_references": [
+                reference.to_dict() for reference in self.storage_references
+            ],
+            "checkpoint_resumable": self.checkpoint_resumable,
+            "observed_content_identity": identity_fields(
+                self.observed_content_identity
+            ),
+            "supersedes": (
+                self.supersedes.to_dict() if self.supersedes is not None else None
+            ),
+        }
+
+
+def _artifact_references(
+    field: str,
+    values: tuple[RecordReference, ...],
+    record_type: str,
+    *,
+    non_empty: bool,
+) -> tuple[RecordReference, ...]:
+    if not isinstance(values, tuple) or (non_empty and not values):
+        raise RecordValidationError(f"{field} must be a tuple")
+    if any(
+        not isinstance(value, RecordReference) or value.record_type != record_type
+        for value in values
+    ):
+        raise RecordValidationError(f"{field} must reference {record_type}")
+    keys = tuple(value.identity for value in values)
+    if len(set(keys)) != len(keys):
+        raise RecordValidationError(f"{field} must not contain duplicates")
+    return tuple(
+        sorted(values, key=lambda item: (item.identity.value, item.logical_id))
+    )
 
 
 @dataclass(frozen=True)
@@ -48,6 +331,30 @@ class BundleMember:
             "size": self.size,
         }
 
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "BundleMember":
+        if not isinstance(value, Mapping) or set(value) != {
+            "path",
+            "identity",
+            "size",
+        }:
+            raise ArtifactError("bundle member fields are invalid")
+        path = value["path"]
+        size = value["size"]
+        identity = value["identity"]
+        if not isinstance(path, str):
+            raise ArtifactError("bundle member path is invalid")
+        normalized = _validate_member_path(path)
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ArtifactError("bundle member size is invalid")
+        if not isinstance(identity, Mapping):
+            raise ArtifactError("bundle member identity is invalid")
+        try:
+            parsed_identity = parse_identity(identity, field="bundle member identity")
+        except RecordValidationError as exc:
+            raise ArtifactError("bundle member identity is invalid") from exc
+        return cls(normalized, parsed_identity, size)
+
 
 @dataclass(frozen=True)
 class BundleManifest:
@@ -64,6 +371,53 @@ class BundleManifest:
             "projection_version": self.projection_version,
             "members": [member.projected_fields() for member in self.members],
         }
+
+    def to_dict(self) -> dict[str, object]:
+        value = self.projected_fields()
+        value["identity"] = identity_fields(self.identity)
+        return value
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "BundleManifest":
+        if not isinstance(value, Mapping) or set(value) != {
+            "schema_version",
+            "projection_version",
+            "members",
+            "identity",
+        }:
+            raise ArtifactError("bundle manifest fields are invalid")
+        if value["schema_version"] != BUNDLE_SCHEMA_VERSION:
+            raise ArtifactError("unsupported bundle schema version")
+        if value["projection_version"] != BUNDLE_PROJECTION.version:
+            raise ArtifactError("unsupported bundle projection version")
+        raw_members = value["members"]
+        raw_identity = value["identity"]
+        if not isinstance(raw_members, list) or not isinstance(raw_identity, Mapping):
+            raise ArtifactError("bundle manifest content is invalid")
+        members = tuple(BundleMember.from_dict(member) for member in raw_members)
+        if tuple(sorted(members, key=lambda member: member.path)) != members:
+            raise ArtifactError("bundle manifest members are not canonically ordered")
+        paths = tuple(member.path for member in members)
+        if len(set(paths)) != len(paths):
+            raise ArtifactError("bundle manifest contains duplicate members")
+        try:
+            claimed = parse_identity(raw_identity, field="bundle manifest identity")
+        except RecordValidationError as exc:
+            raise ArtifactError("bundle manifest identity is invalid") from exc
+        fields = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "projection_version": BUNDLE_PROJECTION.version,
+            "members": [member.projected_fields() for member in members],
+        }
+        actual = content_identity(BUNDLE_PROJECTION, fields)
+        if claimed != actual:
+            raise ArtifactError("bundle manifest identity mismatch")
+        return cls(
+            schema_version=BUNDLE_SCHEMA_VERSION,
+            projection_version=BUNDLE_PROJECTION.version,
+            members=members,
+            identity=claimed,
+        )
 
 
 @dataclass(frozen=True)

@@ -3,3 +3,5 @@
 
 # Canonical JSON fixtures are byte-level identity vectors.
 tests/fixtures/identity/*.json text eol=lf
+fixtures/projects/minimal/.temper/**/*.json text eol=lf
+fixtures/projects/minimal/sources/* text eol=lf

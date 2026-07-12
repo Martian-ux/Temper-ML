@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "baseline_policy.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "baseline_policy"},
+        "payload": {
+          "type": "object",
+          "required": ["policy_id", "rules"],
+          "properties": {
+            "policy_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "rules": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "items": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "required": ["kind", "comparison_policy"],
+                    "properties": {
+                      "kind": {"const": "per_model"},
+                      "comparison_policy": {"$ref": "common.schema.json#/$defs/identity"}
+                    },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "required": ["kind", "comparison_policy"],
+                    "properties": {
+                      "kind": {"const": "project_champion"},
+                      "comparison_policy": {"$ref": "common.schema.json#/$defs/identity"}
+                    },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "required": ["kind", "comparison_policy", "reference"],
+                    "properties": {
+                      "kind": {"const": "fixed_reference"},
+                      "comparison_policy": {"$ref": "common.schema.json#/$defs/identity"},
+                      "reference": {"$ref": "common.schema.json#/$defs/reference"}
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

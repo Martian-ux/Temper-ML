@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "project.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "project"},
+        "payload": {
+          "type": "object",
+          "required": ["project_id", "display_name", "purpose", "task_definition", "base_model_revisions"],
+          "properties": {
+            "project_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "display_name": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "purpose": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "task_definition": {"$ref": "common.schema.json#/$defs/taskDefinitionReference"},
+            "base_model_revisions": {
+              "type": "array",
+              "items": {"$ref": "common.schema.json#/$defs/baseModelRevisionReference"},
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

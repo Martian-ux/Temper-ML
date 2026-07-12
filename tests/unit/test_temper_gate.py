@@ -300,7 +300,9 @@ def test_fixture_help_does_not_spawn_bash(monkeypatch, capsys):
 
     output = capsys.readouterr().out
     assert "Usage:" in output
-    assert "fixture walkthrough" in output
+    assert "fixtures/projects/minimal" in output
+    assert "temper verify" in output
+    assert "temper dump" in output
 
 
 def test_ci_gate_runs_on_ubuntu_and_windows() -> None:

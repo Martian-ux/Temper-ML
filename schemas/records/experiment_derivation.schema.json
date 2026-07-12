@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "experiment_derivation.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "experiment_derivation"},
+        "payload": {
+          "type": "object",
+          "required": ["derivation_id", "parent_experiment", "derived_experiment", "reproduction_mode", "reason_code", "reason", "manifest_diff"],
+          "properties": {
+            "derivation_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "parent_experiment": {"$ref": "experiment.schema.json"},
+            "derived_experiment": {"$ref": "experiment.schema.json"},
+            "reproduction_mode": {"enum": ["scientific_derivation", "adapted_reproduction"]},
+            "reason_code": {"$ref": "common.schema.json#/$defs/identifier"},
+            "reason": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "manifest_diff": {"$ref": "manifest_diff.schema.json"}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

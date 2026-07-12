@@ -22,6 +22,30 @@ credentials/
 
 # Temper runtime and private project state
 .temper/
+# The sole committed runtime-shaped tree contains only these reviewed files.
+!fixtures/projects/minimal/.temper/
+fixtures/projects/minimal/.temper/*
+!fixtures/projects/minimal/.temper/immutable/
+fixtures/projects/minimal/.temper/immutable/*
+!fixtures/projects/minimal/.temper/immutable/records/
+fixtures/projects/minimal/.temper/immutable/records/*
+!fixtures/projects/minimal/.temper/immutable/records/project/
+fixtures/projects/minimal/.temper/immutable/records/project/*
+!fixtures/projects/minimal/.temper/immutable/records/project/sha256/
+fixtures/projects/minimal/.temper/immutable/records/project/sha256/*
+!fixtures/projects/minimal/.temper/immutable/records/project/sha256/6266c5254a54cf7dac3f79db4149bc128b5db8f862a02c687f20b461b5ae51d7.json
+!fixtures/projects/minimal/.temper/immutable/records/task_definition/
+fixtures/projects/minimal/.temper/immutable/records/task_definition/*
+!fixtures/projects/minimal/.temper/immutable/records/task_definition/sha256/
+fixtures/projects/minimal/.temper/immutable/records/task_definition/sha256/*
+!fixtures/projects/minimal/.temper/immutable/records/task_definition/sha256/8c10a335561c895d1f0661529b0d7571f6419fd91b3b522d4d7bc783f59dc172.json
+!fixtures/projects/minimal/.temper/streams/
+fixtures/projects/minimal/.temper/streams/*
+!fixtures/projects/minimal/.temper/streams/project-lifecycle/
+fixtures/projects/minimal/.temper/streams/project-lifecycle/*
+!fixtures/projects/minimal/.temper/streams/project-lifecycle/events/
+fixtures/projects/minimal/.temper/streams/project-lifecycle/events/*
+!fixtures/projects/minimal/.temper/streams/project-lifecycle/events/00000000000000000001-5175933db7696566da4eaed2e3a357b6c32f22810b5af4ab9b645fac9572e777.json
 .temper-fixture-output/
 data/
 datasets/

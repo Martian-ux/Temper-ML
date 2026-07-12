@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "artifact.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "artifact"},
+        "payload": {
+          "type": "object",
+          "required": ["artifact_id", "project", "producing_run", "adapter_type", "content_kind", "content_identity", "base_model_revision", "tokenizer_identity", "compatibility_groups", "parent_artifacts", "storage_references", "integrity_evidence", "provenance", "lineage_evidence"],
+          "properties": {
+            "artifact_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "project": {"$ref": "common.schema.json#/$defs/projectReference"},
+            "producing_run": {"$ref": "common.schema.json#/$defs/runReference"},
+            "adapter_type": {"$ref": "common.schema.json#/$defs/identifier"},
+            "content_kind": {"enum": ["bytes", "bundle", "immutable_upstream_revision"]},
+            "content_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "base_model_revision": {"$ref": "common.schema.json#/$defs/baseModelRevisionReference"},
+            "tokenizer_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "compatibility_groups": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/compatibilityGroupReference"}},
+            "parent_artifacts": {"type": "array", "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/artifactReference"}},
+            "storage_references": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/storageReference"}},
+            "integrity_evidence": {"$ref": "common.schema.json#/$defs/identity"},
+            "provenance": {"$ref": "common.schema.json#/$defs/identity"},
+            "lineage_evidence": {"$ref": "common.schema.json#/$defs/identity"}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

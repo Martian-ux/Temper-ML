@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "project_policy.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "project_policy"},
+        "payload": {
+          "type": "object",
+          "required": ["policy_id", "project", "task_definition", "rendering_contract", "evaluation_policy", "case_suites", "readiness_policy", "retention_policy", "approved_recipe_families", "baseline_policy", "recommendation_policy"],
+          "properties": {
+            "policy_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "project": {"$ref": "common.schema.json#/$defs/projectReference"},
+            "task_definition": {"$ref": "common.schema.json#/$defs/taskDefinitionReference"},
+            "rendering_contract": {"$ref": "common.schema.json#/$defs/identity"},
+            "evaluation_policy": {"$ref": "common.schema.json#/$defs/identity"},
+            "case_suites": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/identity"}},
+            "readiness_policy": {"$ref": "common.schema.json#/$defs/identity"},
+            "retention_policy": {"$ref": "common.schema.json#/$defs/identity"},
+            "approved_recipe_families": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/nonEmptyText"}},
+            "baseline_policy": {"$ref": "common.schema.json#/$defs/baselinePolicyReference"},
+            "recommendation_policy": {"$ref": "common.schema.json#/$defs/identity"}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

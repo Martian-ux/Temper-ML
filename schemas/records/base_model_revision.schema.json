@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "base_model_revision.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "base_model_revision"},
+        "payload": {
+          "type": "object",
+          "required": ["model_id", "display_name", "model_family", "architecture", "source", "revision", "weights_identity", "tokenizer_identity", "license"],
+          "properties": {
+            "model_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "display_name": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "model_family": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "architecture": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "source": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "revision": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "weights_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "tokenizer_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "license": {"$ref": "common.schema.json#/$defs/nonEmptyText"}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

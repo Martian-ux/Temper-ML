@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hardware_capability_profile.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "hardware_capability_profile"},
+        "payload": {
+          "type": "object",
+          "required": ["profile_id", "execution_target", "accelerator_backend", "accelerator_architecture", "accelerator_model", "accelerator_count", "accelerator_memory_bytes", "system_memory_bytes", "supported_precision_modes", "supported_quantization_modes", "capabilities", "library_versions"],
+          "properties": {
+            "profile_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "execution_target": {"$ref": "common.schema.json#/$defs/executionTargetReference"},
+            "accelerator_backend": {"$ref": "common.schema.json#/$defs/identifier"},
+            "accelerator_architecture": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "accelerator_model": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+            "accelerator_count": {"type": "integer", "minimum": 0},
+            "accelerator_memory_bytes": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+            "system_memory_bytes": {"type": "integer", "minimum": 1},
+            "supported_precision_modes": {"type": "array", "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/nonEmptyText"}},
+            "supported_quantization_modes": {"type": "array", "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/nonEmptyText"}},
+            "capabilities": {"type": "array", "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/nonEmptyText"}},
+            "library_versions": {"type": "object"}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

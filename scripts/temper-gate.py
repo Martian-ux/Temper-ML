@@ -20,12 +20,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_HELP = """Usage: python scripts/temper-gate.py fixture-help
 Usage: bash scripts/temper-fixture-walkthrough.sh --help
 
-TML-001 provides this command target for the future deterministic fixture
-walkthrough. The walkthrough execution path is intentionally deferred until the
-fixture skeleton stage.
+The committed project at fixtures/projects/minimal contains only reviewable,
+synthetic canonical evidence. Exercise it from the repository root with:
 
-This is fixture walkthrough help only; execution arrives in the fixture
-skeleton stage.
+  uv run temper status fixtures/projects/minimal
+  uv run temper verify fixtures/projects/minimal
+  uv run temper dump fixtures/projects/minimal
+  uv run temper manifest fixtures/projects/minimal --type project --id project-minimal
+
+The dump is a public-safe projection. Manifest output is exact local canonical
+evidence and is not a public export.
 """
 
 

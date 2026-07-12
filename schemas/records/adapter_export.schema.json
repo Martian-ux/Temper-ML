@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "adapter_export.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "adapter_export"},
+        "payload": {
+          "type": "object",
+          "required": ["export_id", "artifact", "adapter_content_identity", "integrity_manifest_identity", "integrity_evidence", "compatibility_groups", "compatibility_requirements", "provenance", "export_format", "storage_reference"],
+          "properties": {
+            "export_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "artifact": {"$ref": "common.schema.json#/$defs/artifactReference"},
+            "adapter_content_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "integrity_manifest_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "integrity_evidence": {"$ref": "common.schema.json#/$defs/identity"},
+            "compatibility_groups": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "common.schema.json#/$defs/compatibilityGroupReference"}},
+            "compatibility_requirements": {"type": "object"},
+            "provenance": {"$ref": "common.schema.json#/$defs/identity"},
+            "export_format": {"$ref": "common.schema.json#/$defs/identifier"},
+            "storage_reference": {"$ref": "common.schema.json#/$defs/storageReference"}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

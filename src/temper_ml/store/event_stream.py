@@ -9,8 +9,8 @@ import os
 from pathlib import Path
 import re
 import stat
+from types import MappingProxyType
 from typing import Any, Iterator, TypeVar
-from uuid import uuid4
 
 from temper_ml.domain.projections import (
     ContentIdentity,
@@ -31,10 +31,12 @@ from temper_ml.store.canonical_json import (
     dumps_canonical_json,
     loads_canonical_json,
 )
+from temper_ml.store.safe_io import SafeIoError, write_once_bytes
 
 EVENT_PROJECTION = HashProjection("event.envelope", "v1")
 EVENT_SCHEMA_VERSION = "v1"
 _EVENT_NAME = re.compile(r"^([0-9]{20})-([0-9a-f]{64})\.json$")
+_TEMP_NAME = re.compile(r"^\.[0-9]{20}-[0-9a-f]{64}\.json\.[0-9a-f]{32}\.tmp$")
 _ENVELOPE_FIELDS = {
     "schema_version",
     "projection_version",
@@ -45,6 +47,15 @@ _ENVELOPE_FIELDS = {
     "payload",
 }
 StateT = TypeVar("StateT")
+
+
+class _FrozenJsonList(tuple[Any, ...]):
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (list, tuple)):
+            return tuple(self) == tuple(other)
+        return False
+
+    __hash__ = tuple.__hash__
 
 
 class EventStreamError(RuntimeError):
@@ -72,13 +83,16 @@ class EventRequest:
             raise ValueError("event_type must be a non-empty string")
         if not isinstance(self.payload, Mapping):
             raise ValueError("payload must be a mapping")
-        dumps_canonical_json(dict(self.payload))
+        canonical = loads_canonical_json(dumps_canonical_json(dict(self.payload)))
+        if not isinstance(canonical, dict):
+            raise ValueError("payload must canonicalize to an object")
+        object.__setattr__(self, "payload", _freeze_json(canonical))
 
     def canonical_fields(self) -> dict[str, object]:
         return {
             "idempotency_key": self.idempotency_key,
             "event_type": self.event_type,
-            "payload": dict(self.payload),
+            "payload": _thaw_json(self.payload),
         }
 
 
@@ -96,7 +110,7 @@ class StoredEvent:
         return {
             "idempotency_key": self.idempotency_key,
             "event_type": self.event_type,
-            "payload": dict(self.payload),
+            "payload": _thaw_json(self.payload),
         }
 
 
@@ -154,7 +168,7 @@ class EventStream:
             predecessor,
             request.idempotency_key,
             request.event_type,
-            canonical_payload,
+            _freeze_json(canonical_payload),
             identity,
             path,
         )
@@ -176,7 +190,7 @@ class EventStream:
                 ) from exc
             if path.name == ".append.lock":
                 continue
-            if path.name.startswith(".") and path.name.endswith(".tmp"):
+            if _TEMP_NAME.fullmatch(path.name):
                 continue
             if path.suffix != ".json":
                 raise EventStreamCorrupt(
@@ -230,7 +244,7 @@ class EventStream:
                 predecessor_hash=envelope["predecessor_hash"],
                 idempotency_key=key,
                 event_type=envelope["event_type"],
-                payload=envelope["payload"],
+                payload=_freeze_json(envelope["payload"]),
                 identity=identity,
                 path=path,
             )
@@ -323,43 +337,10 @@ def _metadata_lock(path: Path) -> Iterator[None]:
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:
-    ensure_safe_directory(path.parent)
-    if safe_path_stat(path, allow_missing=True) is not None:
-        raise UnsafeFilesystemPath(f"event path already exists: {path}")
-    temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    if safe_path_stat(temp_path, allow_missing=True) is not None:
-        raise UnsafeFilesystemPath(f"temporary event path already exists: {temp_path}")
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_BINARY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
     try:
-        descriptor = os.open(temp_path, flags, 0o600)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-            opened = os.fstat(handle.fileno())
-            if is_link_or_reparse(opened) or not stat.S_ISREG(opened.st_mode):
-                raise UnsafeFilesystemPath(
-                    f"temporary event path is not a safe regular file: {temp_path}"
-                )
-        ensure_safe_directory(path.parent)
-        current_temp = require_safe_regular_file(temp_path)
-        if not same_file_object(opened, current_temp):
-            raise UnsafeFilesystemPath(
-                f"temporary event path changed before commit: {temp_path}"
-            )
-        if safe_path_stat(path, allow_missing=True) is not None:
-            raise UnsafeFilesystemPath(f"event path appeared before commit: {path}")
-        os.replace(temp_path, path)
-        require_safe_regular_file(path)
-        _fsync_directory(path.parent)
-    finally:
-        temp_path.unlink(missing_ok=True)
+        write_once_bytes(path, payload)
+    except (FileExistsError, SafeIoError) as exc:
+        raise UnsafeFilesystemPath("unable to commit append-only event") from exc
 
 
 def _read_regular_bytes(path: Path) -> bytes:
@@ -386,12 +367,19 @@ def _read_regular_bytes(path: Path) -> bytes:
     return data
 
 
-def _fsync_directory(directory: Path) -> None:
-    if os.name == "nt":
-        return
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(directory, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {key: _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return _FrozenJsonList(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "experiment.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "experiment"},
+        "payload": {
+          "type": "object",
+          "required": ["experiment_id", "project", "project_policy", "task_definition", "dataset_version", "base_model_revision", "tokenizer_identity", "recipe", "recipe_resolution", "evaluation_policy", "compatibility_group", "hardware_requirements", "execution_target"],
+          "properties": {
+            "experiment_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "project": {"$ref": "common.schema.json#/$defs/projectReference"},
+            "project_policy": {"$ref": "common.schema.json#/$defs/projectPolicyReference"},
+            "task_definition": {"$ref": "common.schema.json#/$defs/taskDefinitionReference"},
+            "dataset_version": {"$ref": "common.schema.json#/$defs/identity"},
+            "base_model_revision": {"$ref": "common.schema.json#/$defs/baseModelRevisionReference"},
+            "tokenizer_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "recipe": {"$ref": "common.schema.json#/$defs/recipeReference"},
+            "recipe_resolution": {"$ref": "common.schema.json#/$defs/recipeResolutionReference"},
+            "evaluation_policy": {"$ref": "common.schema.json#/$defs/identity"},
+            "compatibility_group": {"$ref": "common.schema.json#/$defs/compatibilityGroupReference"},
+            "hardware_requirements": {"$ref": "common.schema.json#/$defs/hardwareRequirementsReference"},
+            "execution_target": {"$ref": "common.schema.json#/$defs/executionTargetReference"}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

@@ -114,14 +114,35 @@ def test_write_projected_json_normalizes_concurrent_create_as_existing(
         "schema_version": 1,
     }
 
-    def concurrent_open(path, flags, mode):
+    def concurrent_write(path, payload):
         Path(path).write_bytes(dumps_canonical_json(evidence))
         raise FileExistsError
 
-    monkeypatch.setattr(write_once.os, "open", concurrent_open)
+    monkeypatch.setattr(write_once, "write_once_bytes", concurrent_write)
 
     with pytest.raises(WriteOnceExists):
         store.write_projected_json("datasets", projection, evidence)
+
+
+def test_incomplete_temporary_record_does_not_block_atomic_retry(tmp_path):
+    store = WriteOnceStore(tmp_path)
+    projection = HashProjection(name="dataset_version", version="v1")
+    evidence = {
+        "dataset_id": "dataset-synthetic-demo",
+        "record_count": 2,
+        "schema_version": 1,
+    }
+    identity = write_once.content_identity(projection, evidence)
+    final_path = store._immutable_path("datasets", identity)
+    final_path.parent.mkdir(parents=True)
+    interrupted = final_path.with_name(f".{final_path.name}.interrupted.tmp")
+    interrupted.write_bytes(b'{"partial":')
+
+    written = store.write_projected_json("datasets", projection, evidence)
+
+    assert written.path == final_path
+    assert store.read_projected_json("datasets", projection, identity) == evidence
+    assert interrupted.read_bytes() == b'{"partial":'
 
 
 def test_write_projected_json_rejects_symlinked_store_directory(tmp_path):
@@ -182,3 +203,14 @@ def test_write_once_store_rejects_unsafe_immutable_area_paths(tmp_path, unsafe_a
 
     with pytest.raises(WriteOnceError):
         store.read_projected_json(unsafe_area, projection, written.identity)
+
+
+@pytest.mark.parametrize(
+    "area", ["nul", "nested/con", "trailing.", "trailing ", "bad\x00"]
+)
+def test_write_once_store_rejects_non_portable_area_paths(tmp_path, area):
+    store = WriteOnceStore(tmp_path)
+    projection = HashProjection(name="dataset_version", version="v1")
+
+    with pytest.raises(WriteOnceError, match="non-portable"):
+        store.write_projected_json(area, projection, {"value": 1})
