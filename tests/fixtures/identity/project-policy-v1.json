@@ -1,11 +1,1 @@
-{
-  "gates": [
-    {
-      "kind": "all_of",
-      "name": "minimum_quality",
-      "threshold": 1
-    }
-  ],
-  "policy_id": "policy-synthetic-demo",
-  "schema_version": 1
-}
+{"gates":[{"kind":"all_of","name":"minimum_quality","threshold":1}],"policy_id":"policy-synthetic-demo","schema_version":1}

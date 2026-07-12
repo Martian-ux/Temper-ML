@@ -29,6 +29,7 @@ models/
 checkpoints/
 artifacts/
 outputs/
+output/
 logs/
 runs/
 results/

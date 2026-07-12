@@ -9,7 +9,16 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from temper_ml.domain.projections import ContentIdentity, HashProjection, content_identity
+from temper_ml.domain.projections import (
+    ContentIdentity,
+    HashProjection,
+    content_identity,
+)
+from temper_ml.filesystem import (
+    UnsafeFilesystemPath,
+    ensure_safe_directory,
+    safe_path_stat,
+)
 from temper_ml.store.canonical_json import (
     CanonicalJsonError,
     dumps_canonical_json,
@@ -44,17 +53,28 @@ class WriteOnceStore:
     def write_projected_json(
         self, area: str, projection: HashProjection, record: Mapping[str, Any]
     ) -> WrittenRecord:
-        identity = content_identity(projection, record)
-        path = self._immutable_path(area, identity)
         payload = dumps_canonical_json(record)
-        if path.exists():
-            existing = loads_canonical_json(path.read_bytes())
-            if content_identity(projection, existing) != identity:
-                raise WriteOnceCorrupt(f"identity path does not match existing content: {identity}")
+        canonical_record = loads_canonical_json(payload)
+        if not isinstance(canonical_record, Mapping):
+            raise WriteOnceError("immutable records must be JSON objects")
+        identity = content_identity(projection, canonical_record)
+        path = self._immutable_path(area, identity)
+        try:
+            existing = safe_path_stat(path, allow_missing=True)
+        except UnsafeFilesystemPath as exc:
+            raise WriteOnceError(str(exc)) from exc
+        if existing is not None:
+            self._verify_immutable_record(path, projection, identity)
             raise WriteOnceExists(f"immutable content already exists: {identity}")
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_safe_directory(path.parent)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        handle = os.open(path, flags, 0o644)
+        try:
+            handle = os.open(path, flags, 0o644)
+        except FileExistsError:
+            self._verify_immutable_record(path, projection, identity)
+            raise WriteOnceExists(
+                f"immutable content already exists: {identity}"
+            ) from None
         try:
             with os.fdopen(handle, "wb") as file:
                 file.write(payload)
@@ -68,28 +88,74 @@ class WriteOnceStore:
     def read_projected_json(
         self, area: str, projection: HashProjection, identity: ContentIdentity
     ) -> Mapping[str, Any]:
+        return self._verify_immutable_record(
+            self._immutable_path(area, identity), projection, identity
+        )
+
+    def _verify_immutable_record(
+        self, path: Path, projection: HashProjection, identity: ContentIdentity
+    ) -> Mapping[str, Any]:
+        self._assert_no_symlinks(path)
         try:
-            record = loads_canonical_json(self._immutable_path(area, identity).read_bytes())
-        except CanonicalJsonError as exc:
-            raise WriteOnceCorrupt(f"immutable content is not canonical JSON: {identity}") from exc
+            record = loads_canonical_json(path.read_bytes())
+        except FileNotFoundError:
+            raise
+        except (CanonicalJsonError, OSError) as exc:
+            raise WriteOnceCorrupt(
+                f"immutable content is not canonical JSON: {identity}"
+            ) from exc
         if not isinstance(record, Mapping):
-            raise WriteOnceCorrupt(f"immutable content is not a JSON object: {identity}")
+            raise WriteOnceCorrupt(
+                f"immutable content is not a JSON object: {identity}"
+            )
         if content_identity(projection, record) != identity:
-            raise WriteOnceCorrupt(f"identity path does not match stored content: {identity}")
+            raise WriteOnceCorrupt(
+                f"identity path does not match stored content: {identity}"
+            )
         return record
 
     def write_derived_state(self, name: str, state: Mapping[str, Any]) -> Path:
         path = self.root / "derived" / _safe_relative_path(name).with_suffix(".json")
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_safe_directory(path.parent)
+        try:
+            safe_path_stat(path, allow_missing=True)
+        except UnsafeFilesystemPath as exc:
+            raise WriteOnceError(str(exc)) from exc
         temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         temp_path.write_bytes(dumps_canonical_json(state))
         os.replace(temp_path, path)
         return path
 
     def _immutable_path(self, area: str, identity: ContentIdentity) -> Path:
-        return self.root / "immutable" / _safe_relative_path(area) / identity.algorithm / (
-            identity.value + ".json"
+        return (
+            self.root
+            / "immutable"
+            / _safe_relative_path(area)
+            / identity.algorithm
+            / (identity.value + ".json")
         )
+
+    def _ensure_safe_directory(self, path: Path) -> None:
+        try:
+            relative_path = path.relative_to(self.root)
+        except ValueError as exc:
+            raise WriteOnceError(f"store path escapes root: {path}") from exc
+
+        try:
+            ensure_safe_directory(self.root / relative_path)
+        except (OSError, UnsafeFilesystemPath) as exc:
+            raise WriteOnceError(str(exc)) from exc
+
+    def _assert_no_symlinks(self, path: Path) -> None:
+        try:
+            relative_path = path.relative_to(self.root)
+        except ValueError as exc:
+            raise WriteOnceError(f"store path escapes root: {path}") from exc
+
+        try:
+            safe_path_stat(self.root / relative_path)
+        except UnsafeFilesystemPath as exc:
+            raise WriteOnceError(str(exc)) from exc
 
 
 def _safe_relative_path(value: str) -> Path:
