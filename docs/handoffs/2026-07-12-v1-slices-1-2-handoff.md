@@ -1,7 +1,7 @@
 # Temper ML v1 Slices 1 and 2 Handoff
 
-**Status:** Slice 1 and Slice 2 implementation complete; draft pull-request
-candidate pending cross-platform CI.
+**Status:** Slice 1 and Slice 2 implementation complete; draft pull request
+open with Ubuntu and Windows CI passing.
 
 ## Completed Slice 1 foundation
 
