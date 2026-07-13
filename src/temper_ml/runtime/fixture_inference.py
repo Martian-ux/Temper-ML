@@ -26,6 +26,9 @@ FIXTURE_INFERENCE_PROJECTION = HashProjection("runtime.fixture_inference", "v1")
 FIXTURE_INFERENCE_INPUT_PROJECTION = HashProjection(
     "runtime.fixture_inference_input", "v1"
 )
+FIXTURE_INFERENCE_OUTPUT_PROJECTION = HashProjection(
+    "runtime.fixture_inference_output", "v1"
+)
 FIXTURE_INFERENCE_EVIDENCE_PROJECTION = HashProjection(
     "runtime.fixture_inference_evidence", "v1"
 )
@@ -153,7 +156,7 @@ class FixtureInferenceRuntime:
         outputs: list[FrozenJsonObject] = []
         input_identities: list[ContentIdentity] = []
         output_identities: list[ContentIdentity] = []
-        for ordinal, frozen_input in enumerate(request.inputs, 1):
+        for frozen_input in request.inputs:
             value = thaw_json(frozen_input)
             input_identity = content_identity(FIXTURE_INFERENCE_INPUT_PROJECTION, value)
             digest = hashlib.sha256(
@@ -166,7 +169,6 @@ class FixtureInferenceRuntime:
                         ),
                         "input_identity": identity_fields(input_identity),
                         "settings": request.settings.to_dict(),
-                        "ordinal": ordinal,
                     }
                 )
             ).hexdigest()
@@ -182,7 +184,7 @@ class FixtureInferenceRuntime:
             input_identities.append(input_identity)
             output_identities.append(
                 content_identity(
-                    FIXTURE_INFERENCE_INPUT_PROJECTION,
+                    FIXTURE_INFERENCE_OUTPUT_PROJECTION,
                     thaw_json(output),
                 )
             )

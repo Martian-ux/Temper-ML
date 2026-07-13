@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, NoReturn
 
 from temper_ml.app_services._records import (
     require_no_conflicting_logical_revision,
@@ -326,6 +326,295 @@ class RunService:
             recovery_checkpoint=checkpoint,
         )
 
+    def reopen_completed(self, request: RunLaunchRequest) -> RunExecutionResult:
+        """Reopen one exact completed first attempt without executing it again."""
+
+        if not isinstance(request, RunLaunchRequest):
+            raise ApplicationServiceError("run_launch_request_invalid")
+        if request.evaluation_mode is not EvaluationMode.NO_QUALITY_EVALUATION:
+            raise ApplicationServiceError("run_evaluation_mode_not_supported")
+        try:
+            self.store.verify()
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        self._validate_launch_graph(request)
+        try:
+            preflight_result = preflight(
+                request.recipe_resolution,
+                request.hardware_requirements,
+                request.execution_target,
+                request.hardware_capability_profile,
+                request.estimate,
+            )
+        except PreflightError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        preflight_identity = content_identity(
+            PREFLIGHT_EVIDENCE_PROJECTION, preflight_result.to_view()
+        )
+        try:
+            runtime_request, run = self._build_execution_records(
+                request,
+                preflight_identity,
+                attempt_number=1,
+                retry_of=None,
+                recovery_checkpoint=None,
+            )
+        except (FixtureAdapterError, RecordValidationError, TypeError, ValueError):
+            raise ApplicationServiceError("run_existing_conflict") from None
+        events = self._events(request.run_id)
+        matching_runs = tuple(
+            stored.record
+            for stored in self.store.iter_records()
+            if isinstance(stored.record, Run) and stored.record.run_id == request.run_id
+        )
+        if not events and not matching_runs:
+            raise ApplicationServiceError("run_not_found")
+        if not preflight_result.ready or matching_runs != (run,):
+            raise ApplicationServiceError("run_existing_conflict")
+        try:
+            require_no_conflicting_logical_revision(
+                self.store,
+                runtime_request,
+                conflict_code="run_existing_conflict",
+            )
+            exact_request = self._require_exact_record(runtime_request)
+        except ApplicationServiceError:
+            raise ApplicationServiceError("run_existing_conflict") from None
+        if not isinstance(exact_request, ResolvedRuntimeRequest):
+            raise ApplicationServiceError("run_existing_conflict")
+        if self.status(run.run_id) is not RunLifecycleStatus.COMPLETED:
+            raise ApplicationServiceError("run_existing_not_completed")
+
+        try:
+            adapter_request = FixtureAdapterRequest(
+                request.experiment,
+                request.recipe_resolution,
+                request.prepared_dataset.version,
+                request.prepared_dataset.rendered_bytes,
+                runtime_request,
+                run,
+            )
+            expected_output = FixtureAdapter().execute(adapter_request)
+        except FixtureAdapterError:
+            raise ApplicationServiceError("run_existing_lifecycle_conflict") from None
+        if not expected_output.completed or expected_output.bundle_manifest is None:
+            raise ApplicationServiceError("run_existing_lifecycle_conflict")
+        try:
+            for checkpoint in expected_output.checkpoints:
+                if (
+                    read_stable_bytes(self._checkpoint_path(run, checkpoint))
+                    != checkpoint.payload
+                ):
+                    raise ApplicationServiceError("run_existing_checkpoint_conflict")
+        except SafeIoError:
+            raise ApplicationServiceError("run_existing_checkpoint_conflict") from None
+
+        run_reference = record_reference(run)
+        artifacts = tuple(
+            stored.record
+            for stored in self.store.iter_records()
+            if isinstance(stored.record, Artifact)
+            and (
+                stored.record.artifact_id == request.artifact_id
+                or stored.record.producing_run == run_reference
+            )
+        )
+        if (
+            len(artifacts) != 1
+            or artifacts[0].artifact_id != request.artifact_id
+            or artifacts[0].producing_run != run_reference
+            or artifacts[0].content_identity != expected_output.bundle_manifest.identity
+        ):
+            raise ApplicationServiceError("run_existing_artifact_conflict")
+        artifact = artifacts[0]
+        expectation = ArtifactIntegrityExpectation(
+            bundle_identity=expected_output.bundle_manifest.identity,
+            producing_run=run,
+            runtime_request=runtime_request,
+            experiment=request.experiment,
+            recipe_resolution=request.recipe_resolution,
+            dataset_version=request.prepared_dataset.version,
+            base_model_revision=request.base_model_revision,
+            compatibility_group=request.compatibility_group,
+        )
+        try:
+            integrity = verify_artifact_bundle(
+                self._artifact_root(request.artifact_id), expectation
+            )
+        except ArtifactIntegrityError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        try:
+            stored_manifest = self.store.read_bundle_manifest(
+                integrity.bundle_manifest.identity
+            )
+        except EvidenceError:
+            raise ApplicationServiceError("run_existing_artifact_conflict") from None
+        if (
+            integrity.bundle_manifest != expected_output.bundle_manifest
+            or stored_manifest != integrity.bundle_manifest
+        ):
+            raise ApplicationServiceError("run_existing_artifact_conflict")
+        lineage = content_identity(
+            ARTIFACT_LINEAGE_PROJECTION,
+            {
+                "schema_version": "v1",
+                "experiment": record_reference(request.experiment).to_dict(),
+                "resolved_runtime_request": record_reference(runtime_request).to_dict(),
+                "producing_run": record_reference(run).to_dict(),
+            },
+        )
+        expected_artifact = Artifact(
+            artifact_id=request.artifact_id,
+            project=request.experiment.project,
+            producing_run=record_reference(run),
+            adapter_type=request.recipe_resolution.adapter_type,
+            content_kind=ArtifactContentKind.BUNDLE,
+            content_identity=integrity.bundle_manifest.identity,
+            base_model_revision=record_reference(request.base_model_revision),
+            tokenizer_identity=request.base_model_revision.tokenizer_identity,
+            compatibility_groups=(record_reference(request.compatibility_group),),
+            parent_artifacts=(),
+            storage_references=(
+                StorageReference("project_store", request.artifact_id),
+            ),
+            integrity_evidence=integrity.evidence_identity,
+            provenance=integrity.provenance_identity,
+            lineage_evidence=lineage,
+        )
+        expected_availability = ArtifactAvailability(
+            availability_id=f"available-{expected_artifact.identity.value[:24]}",
+            artifact=record_reference(expected_artifact),
+            state=AvailabilityState.AVAILABLE,
+            available_byte_classes=("final_adapter",),
+            storage_references=expected_artifact.storage_references,
+            checkpoint_resumable=False,
+            observed_content_identity=expected_artifact.content_identity,
+        )
+        availabilities = tuple(
+            stored.record
+            for stored in self.store.iter_records()
+            if isinstance(stored.record, ArtifactAvailability)
+            and stored.record.artifact == record_reference(expected_artifact)
+        )
+        if artifact != expected_artifact or availabilities != (expected_availability,):
+            raise ApplicationServiceError("run_existing_artifact_conflict")
+        expected_events = [
+            EventRequest(
+                f"{run.run_id}-preflight",
+                "run_preflight_succeeded",
+                {
+                    "ready": True,
+                    "preflight_identity": identity_fields(preflight_identity),
+                    "blocking_reasons": [],
+                },
+            ),
+            EventRequest(
+                f"{run.run_id}-request-frozen",
+                "runtime_request_frozen",
+                {
+                    "runtime_request_identity": identity_fields(
+                        runtime_request.identity
+                    ),
+                    "experiment_manifest_identity": identity_fields(
+                        request.experiment.manifest_identity
+                    ),
+                    "preflight_identity": identity_fields(preflight_identity),
+                    "evaluation_mode": request.evaluation_mode.value,
+                    "starting_step": 0,
+                },
+            ),
+            EventRequest(
+                f"{run.run_id}-launched",
+                "run_launched",
+                {
+                    "run_identity": identity_fields(run.identity),
+                    "runtime_request_identity": identity_fields(
+                        runtime_request.identity
+                    ),
+                    "attempt_number": 1,
+                    "fixture_runtime": True,
+                },
+            ),
+        ]
+        expected_events.extend(
+            EventRequest(
+                f"{run.run_id}-progress-{progress.step}",
+                "run_progress",
+                progress.to_dict(),
+            )
+            for progress in expected_output.progress
+        )
+        expected_events.extend(
+            EventRequest(
+                f"{run.run_id}-checkpoint-{checkpoint.step}",
+                "run_checkpoint",
+                checkpoint.to_receipt(),
+            )
+            for checkpoint in expected_output.checkpoints
+        )
+        expected_events.extend(
+            EventRequest(
+                f"{run.run_id}-log-{log.ordinal}",
+                "run_log",
+                log.to_dict(),
+            )
+            for log in expected_output.logs
+        )
+        expected_events.extend(
+            (
+                EventRequest(
+                    f"{run.run_id}-artifact-ingestion-started",
+                    "artifact_ingestion_started",
+                    {
+                        "expected_bundle_identity": identity_fields(
+                            expected_output.bundle_manifest.identity
+                        ),
+                        "expected_member_count": len(
+                            expected_output.bundle_manifest.members
+                        ),
+                    },
+                ),
+                EventRequest(
+                    f"{run.run_id}-artifact-ingestion-verified",
+                    "artifact_ingestion_verified",
+                    {
+                        "artifact_identity": identity_fields(artifact.identity),
+                        "bundle_identity": identity_fields(artifact.content_identity),
+                        "integrity_evidence": identity_fields(
+                            integrity.evidence_identity
+                        ),
+                        "quality_evaluation_required": False,
+                    },
+                ),
+                EventRequest(
+                    f"{run.run_id}-completed",
+                    "run_completed",
+                    {
+                        "terminal": True,
+                        "verified_artifact": True,
+                        "artifact_identity": identity_fields(artifact.identity),
+                        "integrity_evidence": identity_fields(
+                            integrity.evidence_identity
+                        ),
+                    },
+                ),
+            )
+        )
+        if tuple(event.request_fields() for event in events) != tuple(
+            expected.canonical_fields() for expected in expected_events
+        ):
+            raise ApplicationServiceError("run_existing_lifecycle_conflict")
+        return RunExecutionResult(
+            run,
+            runtime_request,
+            preflight_result,
+            RunLifecycleStatus.COMPLETED,
+            expected_output.checkpoints,
+            artifact,
+            expected_availability,
+            integrity,
+        )
+
     def status(self, run_id: str) -> RunLifecycleStatus:
         """Derive lifecycle status solely from the verified append-only stream."""
 
@@ -400,62 +689,16 @@ class RunService:
             raise ApplicationServiceError("run_preflight_blocked")
 
         try:
-            start_step = (
-                recovery_checkpoint.step if recovery_checkpoint is not None else 0
-            )
-            training_state = fixture_training_state_identity(
-                request.experiment,
-                request.recipe_resolution,
-                request.prepared_dataset.version,
-                start_step,
-            )
-            runtime_request = ResolvedRuntimeRequest(
-                request_id=request.request_id,
-                experiment=record_reference(request.experiment),
-                experiment_manifest_identity=request.experiment.manifest_identity,
-                recipe_resolution=record_reference(request.recipe_resolution),
-                dataset_version_identity=request.prepared_dataset.version.identity,
-                rendered_dataset_identity=(
-                    request.prepared_dataset.version.rendered_bytes_identity
-                ),
-                rendered_dataset_byte_count=len(
-                    request.prepared_dataset.rendered_bytes
-                ),
-                hardware_capability_profile=record_reference(
-                    request.hardware_capability_profile
-                ),
-                execution_target=record_reference(request.execution_target),
-                runtime_identity=FIXTURE_RUNTIME_IDENTITY,
-                preflight_identity=preflight_identity,
-                training_state_identity=training_state,
-                evaluation_mode=request.evaluation_mode,
-                training_steps=request.recipe_resolution.training_steps,
-                starting_step=start_step,
-                resume_from_run=(
-                    record_reference(retry_of) if retry_of is not None else None
-                ),
-                resume_checkpoint_identity=(
-                    recovery_checkpoint.checkpoint_identity
-                    if recovery_checkpoint is not None
-                    else None
-                ),
-            )
-            run = Run(
-                run_id=request.run_id,
-                experiment=record_reference(request.experiment),
-                experiment_manifest_identity=request.experiment.manifest_identity,
+            runtime_request, run = self._build_execution_records(
+                request,
+                preflight_identity,
                 attempt_number=attempt_number,
-                hardware_capability_profile=record_reference(
-                    request.hardware_capability_profile
-                ),
-                execution_target=record_reference(request.execution_target),
-                runtime_identity=FIXTURE_RUNTIME_IDENTITY,
-                request_identity=runtime_request.identity,
-                training_state_identity=training_state,
-                retry_of=(record_reference(retry_of) if retry_of is not None else None),
+                retry_of=retry_of,
+                recovery_checkpoint=recovery_checkpoint,
             )
         except (FixtureAdapterError, RecordValidationError, TypeError, ValueError):
             raise ApplicationServiceError("run_launch_record_invalid") from None
+        start_step = runtime_request.starting_step
         self._persist_launch_records(
             request.hardware_capability_profile, runtime_request, run
         )
@@ -511,99 +754,96 @@ class RunService:
                 "fixture_runtime": True,
             },
         )
-        adapter_request = FixtureAdapterRequest(
-            request.experiment,
-            request.recipe_resolution,
-            request.prepared_dataset.version,
-            request.prepared_dataset.rendered_bytes,
-            runtime_request,
-            run,
-        )
+        phase = "runtime"
         try:
+            adapter_request = FixtureAdapterRequest(
+                request.experiment,
+                request.recipe_resolution,
+                request.prepared_dataset.version,
+                request.prepared_dataset.rendered_bytes,
+                runtime_request,
+                run,
+            )
             output = self.adapter.execute(adapter_request, control=control)
-        except FixtureAdapterError as exc:
-            self._append_failure(request.run_id, "runtime", exc.code)
-            raise ApplicationServiceError(exc.code) from None
-        self._record_runtime_output(run, output, control)
-        if output.termination is FixtureTermination.CANCELLED:
-            self._append(
-                run.run_id,
-                "cancellation-requested",
-                "run_cancellation_requested",
-                {"acknowledged": True},
-            )
-            self._append(
-                run.run_id,
-                "cancelled",
-                "run_cancelled",
-                {"verified_artifact": False, "terminal": True},
-            )
-            self.store.verify()
-            return RunExecutionResult(
-                run,
-                runtime_request,
-                result,
-                RunLifecycleStatus.CANCELLED,
-                output.checkpoints,
-            )
-        if output.termination is FixtureTermination.INTERRUPTED:
-            self._append(
-                run.run_id,
-                "interrupted",
-                "run_interrupted",
-                {
-                    "verified_artifact": False,
-                    "terminal": True,
-                    "recovery_checkpoint_count": len(output.checkpoints),
-                },
-            )
-            self.store.verify()
-            return RunExecutionResult(
-                run,
-                runtime_request,
-                result,
-                RunLifecycleStatus.INTERRUPTED,
-                output.checkpoints,
-            )
-        try:
+            phase = "runtime_output"
+            self._record_runtime_output(run, output, control)
+            if output.termination is FixtureTermination.CANCELLED:
+                phase = "cancellation"
+                self._append(
+                    run.run_id,
+                    "cancellation-requested",
+                    "run_cancellation_requested",
+                    {"acknowledged": True},
+                )
+                terminal_result = RunExecutionResult(
+                    run,
+                    runtime_request,
+                    result,
+                    RunLifecycleStatus.CANCELLED,
+                    output.checkpoints,
+                )
+                self.store.verify()
+                self._append(
+                    run.run_id,
+                    "cancelled",
+                    "run_cancelled",
+                    {"verified_artifact": False, "terminal": True},
+                )
+                return terminal_result
+            if output.termination is FixtureTermination.INTERRUPTED:
+                phase = "interruption"
+                terminal_result = RunExecutionResult(
+                    run,
+                    runtime_request,
+                    result,
+                    RunLifecycleStatus.INTERRUPTED,
+                    output.checkpoints,
+                )
+                self.store.verify()
+                self._append(
+                    run.run_id,
+                    "interrupted",
+                    "run_interrupted",
+                    {
+                        "verified_artifact": False,
+                        "terminal": True,
+                        "recovery_checkpoint_count": len(output.checkpoints),
+                    },
+                )
+                return terminal_result
+            phase = "artifact_ingestion"
             artifact, availability, integrity = self._ingest_artifact(
                 request,
                 run,
                 runtime_request,
                 output,
             )
-        except (ArtifactIntegrityError, EvidenceError, SafeIoError) as exc:
-            code = getattr(exc, "code", "artifact_ingestion_failed")
+            phase = "completion"
+            terminal_result = RunExecutionResult(
+                run,
+                runtime_request,
+                result,
+                RunLifecycleStatus.COMPLETED,
+                output.checkpoints,
+                artifact,
+                availability,
+                integrity,
+            )
+            self.store.verify()
             self._append(
                 run.run_id,
-                "artifact-ingestion-failed",
-                "artifact_ingestion_failed",
-                {"failure_code": code, "verified_artifact": False},
+                "completed",
+                "run_completed",
+                {
+                    "terminal": True,
+                    "verified_artifact": True,
+                    "artifact_identity": identity_fields(artifact.identity),
+                    "integrity_evidence": identity_fields(integrity.evidence_identity),
+                },
             )
-            self._append_failure(run.run_id, "artifact_ingestion", code)
-            raise ApplicationServiceError(code) from None
-        self._append(
-            run.run_id,
-            "completed",
-            "run_completed",
-            {
-                "terminal": True,
-                "verified_artifact": True,
-                "artifact_identity": identity_fields(artifact.identity),
-                "integrity_evidence": identity_fields(integrity.evidence_identity),
-            },
-        )
-        self.store.verify()
-        return RunExecutionResult(
-            run,
-            runtime_request,
-            result,
-            RunLifecycleStatus.COMPLETED,
-            output.checkpoints,
-            artifact,
-            availability,
-            integrity,
-        )
+            return terminal_result
+        except Exception as exc:
+            self._terminalize_post_launch_failure(run.run_id, phase, exc)
 
     def _validate_launch_graph(self, request: RunLaunchRequest) -> None:
         for record in (
@@ -665,6 +905,67 @@ class RunService:
             or request.compatibility_group.target_modules != resolution.target_modules
         ):
             raise ApplicationServiceError("run_compatibility_group_mismatch")
+
+    @staticmethod
+    def _build_execution_records(
+        request: RunLaunchRequest,
+        preflight_identity: ContentIdentity,
+        *,
+        attempt_number: int,
+        retry_of: Run | None,
+        recovery_checkpoint: FixtureCheckpoint | None,
+    ) -> tuple[ResolvedRuntimeRequest, Run]:
+        start_step = recovery_checkpoint.step if recovery_checkpoint is not None else 0
+        training_state = fixture_training_state_identity(
+            request.experiment,
+            request.recipe_resolution,
+            request.prepared_dataset.version,
+            start_step,
+        )
+        runtime_request = ResolvedRuntimeRequest(
+            request_id=request.request_id,
+            experiment=record_reference(request.experiment),
+            experiment_manifest_identity=request.experiment.manifest_identity,
+            recipe_resolution=record_reference(request.recipe_resolution),
+            dataset_version_identity=request.prepared_dataset.version.identity,
+            rendered_dataset_identity=(
+                request.prepared_dataset.version.rendered_bytes_identity
+            ),
+            rendered_dataset_byte_count=len(request.prepared_dataset.rendered_bytes),
+            hardware_capability_profile=record_reference(
+                request.hardware_capability_profile
+            ),
+            execution_target=record_reference(request.execution_target),
+            runtime_identity=FIXTURE_RUNTIME_IDENTITY,
+            preflight_identity=preflight_identity,
+            training_state_identity=training_state,
+            evaluation_mode=request.evaluation_mode,
+            training_steps=request.recipe_resolution.training_steps,
+            starting_step=start_step,
+            resume_from_run=(
+                record_reference(retry_of) if retry_of is not None else None
+            ),
+            resume_checkpoint_identity=(
+                recovery_checkpoint.checkpoint_identity
+                if recovery_checkpoint is not None
+                else None
+            ),
+        )
+        run = Run(
+            run_id=request.run_id,
+            experiment=record_reference(request.experiment),
+            experiment_manifest_identity=request.experiment.manifest_identity,
+            attempt_number=attempt_number,
+            hardware_capability_profile=record_reference(
+                request.hardware_capability_profile
+            ),
+            execution_target=record_reference(request.execution_target),
+            runtime_identity=FIXTURE_RUNTIME_IDENTITY,
+            request_identity=runtime_request.identity,
+            training_state_identity=training_state,
+            retry_of=(record_reference(retry_of) if retry_of is not None else None),
+        )
+        return runtime_request, run
 
     def _persist_launch_records(
         self,
@@ -885,10 +1186,32 @@ class RunService:
         event_type: str,
         payload: Mapping[str, object],
     ) -> StoredEvent:
-        return self.store.append_event(
-            self._stream_id(run_id),
-            EventRequest(f"{run_id}-{key}", event_type, payload),
-        )
+        request = EventRequest(f"{run_id}-{key}", event_type, payload)
+        try:
+            return self.store.append_event(self._stream_id(run_id), request)
+        except Exception:
+            reconciled = self._reconcile_ambiguous_append(run_id, request)
+            if reconciled is not None:
+                return reconciled
+            raise
+
+    def _reconcile_ambiguous_append(
+        self, run_id: str, request: EventRequest
+    ) -> StoredEvent | None:
+        try:
+            matches = tuple(
+                event
+                for event in self._events(run_id)
+                if event.idempotency_key == request.idempotency_key
+            )
+        except Exception:
+            return None
+        if len(matches) != 1:
+            return None
+        durable = matches[0]
+        if durable.request_fields() != request.canonical_fields():
+            return None
+        return durable
 
     def _append_failure(self, run_id: str, phase: str, code: str) -> None:
         self._append(
@@ -902,6 +1225,41 @@ class RunService:
                 "verified_artifact": False,
             },
         )
+
+    def _terminalize_post_launch_failure(
+        self,
+        run_id: str,
+        phase: str,
+        error: Exception,
+    ) -> NoReturn:
+        stable_errors = (
+            ApplicationServiceError,
+            ArtifactIntegrityError,
+            EvidenceError,
+            FixtureAdapterError,
+        )
+        code = error.code if isinstance(error, stable_errors) else None
+        if not isinstance(code, str) or not code:
+            code = {
+                "runtime": "run_runtime_failed",
+                "runtime_output": "run_output_persistence_failed",
+                "cancellation": "run_cancellation_persistence_failed",
+                "interruption": "run_interruption_persistence_failed",
+                "artifact_ingestion": "artifact_ingestion_failed",
+                "completion": "run_completion_persistence_failed",
+            }.get(phase, "run_post_launch_failed")
+        if phase == "artifact_ingestion":
+            try:
+                self._append(
+                    run_id,
+                    "artifact-ingestion-failed",
+                    "artifact_ingestion_failed",
+                    {"failure_code": code, "verified_artifact": False},
+                )
+            except EvidenceError:
+                pass
+        self._append_failure(run_id, phase, code)
+        raise ApplicationServiceError(code) from None
 
     def _stream_id(self, run_id: str) -> str:
         return f"run-{run_id}"

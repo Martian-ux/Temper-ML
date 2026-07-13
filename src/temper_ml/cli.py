@@ -508,23 +508,28 @@ def _fixture_workflow(
             host_runtime_overhead_bytes=1024,
         ),
     )
-    run = RunService(project_root).launch(
-        RunLaunchRequest(
-            run_id="run-fixture-runtime",
-            request_id="request-fixture-runtime",
-            artifact_id="artifact-fixture-runtime",
-            experiment=experiment,
-            recipe_resolution=resolution,
-            prepared_dataset=prepared,
-            base_model_revision=model,
-            compatibility_group=group,
-            hardware_requirements=requirements,
-            execution_target=target,
-            hardware_capability_profile=profile,
-            estimate=estimate,
-            evaluation_mode=evaluation_mode,
-        )
+    launch_request = RunLaunchRequest(
+        run_id="run-fixture-runtime",
+        request_id="request-fixture-runtime",
+        artifact_id="artifact-fixture-runtime",
+        experiment=experiment,
+        recipe_resolution=resolution,
+        prepared_dataset=prepared,
+        base_model_revision=model,
+        compatibility_group=group,
+        hardware_requirements=requirements,
+        execution_target=target,
+        hardware_capability_profile=profile,
+        estimate=estimate,
+        evaluation_mode=evaluation_mode,
     )
+    run_service = RunService(project_root)
+    try:
+        run = run_service.reopen_completed(launch_request)
+    except ApplicationServiceError as exc:
+        if exc.code != "run_not_found":
+            raise
+        run = run_service.launch(launch_request)
     if run.artifact is None:
         raise ApplicationServiceError("fixture_workflow_artifact_missing")
     local = LocalUseService(project_root)

@@ -2,6 +2,9 @@ import json
 from pathlib import Path
 import socket
 
+from temper_ml.app_services.errors import ApplicationServiceError
+from temper_ml.app_services.local_use import LocalUseService
+from temper_ml.app_services.runs import RunLifecycleStatus, RunService
 from temper_ml.cli import main
 from temper_ml.domain.artifacts import Artifact
 from temper_ml.domain.local_use import AdapterExport, LocalUseSession
@@ -88,3 +91,77 @@ def test_fixture_workflow_is_location_independent_and_repeatable(
     )
     assert first_artifact.identity == second_artifact.identity
     assert first_artifact.content_identity == second_artifact.content_identity
+
+
+def test_fixture_workflow_rerun_reuses_exact_same_directory_evidence(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    root = tmp_path / "same-project"
+    first, first_output = _run_workflow(root, capsys, monkeypatch)
+    before_store = TypedEvidenceStore(root)
+    before_records = tuple(
+        (stored.envelope.record_type, stored.envelope.identity)
+        for stored in before_store.iter_records()
+    )
+    before_streams = tuple(
+        (
+            stream.stream_id,
+            tuple(event.identity for event in stream.events),
+        )
+        for stream in before_store.iter_streams()
+    )
+
+    second, second_output = _run_workflow(root, capsys, monkeypatch)
+    after_store = TypedEvidenceStore(root)
+    after_records = tuple(
+        (stored.envelope.record_type, stored.envelope.identity)
+        for stored in after_store.iter_records()
+    )
+    after_streams = tuple(
+        (
+            stream.stream_id,
+            tuple(event.identity for event in stream.events),
+        )
+        for stream in after_store.iter_streams()
+    )
+
+    assert second == first
+    assert second_output == first_output
+    assert after_records == before_records
+    assert after_streams == before_streams
+
+
+def test_fixture_workflow_continues_after_an_exact_completed_run(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    root = tmp_path / "continued-project"
+    original_focused = LocalUseService.focused
+
+    def stop_after_run(self, request):
+        del self, request
+        raise ApplicationServiceError("synthetic_stop_after_run")
+
+    monkeypatch.setattr(LocalUseService, "focused", stop_after_run)
+    assert main(["fixture-workflow", str(root)]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.err) == {
+        "status": "error",
+        "code": "synthetic_stop_after_run",
+    }
+    assert captured.out == ""
+    assert (
+        RunService(root).status("run-fixture-runtime") is RunLifecycleStatus.COMPLETED
+    )
+    records = [stored.record for stored in TypedEvidenceStore(root).iter_records()]
+    assert not any(isinstance(record, LocalUseSession) for record in records)
+    assert not any(isinstance(record, AdapterExport) for record in records)
+
+    monkeypatch.setattr(LocalUseService, "focused", original_focused)
+    value, _ = _run_workflow(root, capsys, monkeypatch)
+
+    assert value["status"] == "verified"
+    records = [stored.record for stored in TypedEvidenceStore(root).iter_records()]
+    assert sum(isinstance(record, Run) for record in records) == 1
+    assert sum(isinstance(record, Artifact) for record in records) == 1
+    assert sum(isinstance(record, LocalUseSession) for record in records) == 1
+    assert sum(isinstance(record, AdapterExport) for record in records) == 1

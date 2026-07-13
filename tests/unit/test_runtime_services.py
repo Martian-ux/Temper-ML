@@ -1,7 +1,9 @@
 from dataclasses import dataclass, replace
 from pathlib import Path
+import shutil
 
 import pytest
+import temper_ml.app_services.runs as runs_module
 
 from temper_ml.app_services.datasets import (
     DatasetImportRequest,
@@ -21,7 +23,7 @@ from temper_ml.app_services.runs import (
     RunService,
 )
 from temper_ml.cli import _FixtureTokenizer, _fixture_workflow
-from temper_ml.domain.artifacts import Artifact
+from temper_ml.domain.artifacts import Artifact, ArtifactAvailability
 from temper_ml.domain.base_models import BaseModelRevision
 from temper_ml.domain.compatibility import CompatibilityGroup
 from temper_ml.domain.datasets import (
@@ -50,7 +52,9 @@ from temper_ml.runtime.fixture_adapter import (
 from temper_ml.runtime.preflight import EstimateComponents, estimate_resources
 from temper_ml.runtime.fixture_inference import InferenceSettings
 from temper_ml.store.canonical_json import dumps_canonical_json
-from temper_ml.store.evidence import TypedEvidenceStore
+from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
+from temper_ml.store.event_stream import EventRequest
+from temper_ml.store.safe_io import SafeIoError
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,37 @@ def _one(store: TypedEvidenceStore, kind):
     ]
     assert len(values) == 1
     return values[0]
+
+
+def _project_file_snapshot(root: Path) -> tuple[tuple[str, bytes], ...]:
+    return tuple(
+        (path.relative_to(root).as_posix(), path.read_bytes())
+        for path in sorted(
+            candidate for candidate in root.rglob("*") if candidate.is_file()
+        )
+    )
+
+
+def _copy_with_run_events(
+    source: Path,
+    target: Path,
+    run_id: str,
+    events,
+) -> None:
+    shutil.copytree(source, target)
+    store = TypedEvidenceStore(target)
+    stream_id = f"run-{run_id}"
+    shutil.rmtree(store.layout.stream_events(stream_id).parent)
+    for event in events:
+        fields = event.request_fields()
+        store.append_event(
+            stream_id,
+            EventRequest(
+                event.idempotency_key,
+                event.event_type,
+                fields["payload"],
+            ),
+        )
 
 
 def _foundation(root: Path) -> _Foundation:
@@ -243,6 +278,113 @@ def test_recovery_rejects_unrecorded_checkpoint_identity(tmp_path: Path) -> None
         )
 
 
+def test_completed_run_reopens_exactly_and_conflicting_request_fails_closed(
+    tmp_path: Path,
+) -> None:
+    foundation = _foundation(tmp_path)
+    service = RunService(tmp_path)
+    launch = foundation.launch(
+        run_id="run-reopen-completed",
+        request_id="request-reopen-completed",
+        artifact_id="artifact-reopen-completed",
+    )
+    completed = service.launch(launch)
+    before = service._events(launch.run_id)
+    before_files = _project_file_snapshot(tmp_path)
+
+    reopened = RunService(tmp_path, adapter=_FailingAdapter()).reopen_completed(launch)
+
+    assert reopened == completed
+    assert service._events(launch.run_id) == before
+    assert _project_file_snapshot(tmp_path) == before_files
+    with pytest.raises(ApplicationServiceError, match="run_existing_conflict"):
+        service.reopen_completed(
+            replace(launch, request_id="request-reopen-conflicting")
+        )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "reordered"])
+def test_reopen_completed_requires_the_exact_success_lifecycle(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    source = tmp_path / "source"
+    copied = tmp_path / mutation
+    foundation = _foundation(source)
+    service = RunService(source)
+    launch = foundation.launch(
+        run_id=f"run-lifecycle-{mutation}",
+        request_id=f"request-lifecycle-{mutation}",
+        artifact_id=f"artifact-lifecycle-{mutation}",
+    )
+    completed = service.launch(launch)
+    events = list(service._events(launch.run_id))
+    progress_indices = [
+        index
+        for index, event in enumerate(events)
+        if event.event_type == "run_progress"
+    ]
+    assert len(progress_indices) >= 2
+    if mutation == "missing":
+        events.pop(progress_indices[0])
+    else:
+        first, second = progress_indices[:2]
+        events[first], events[second] = events[second], events[first]
+    _copy_with_run_events(source, copied, launch.run_id, events)
+    before = _project_file_snapshot(copied)
+
+    with pytest.raises(
+        ApplicationServiceError, match="run_existing_lifecycle_conflict"
+    ):
+        RunService(copied).reopen_completed(launch)
+
+    assert _project_file_snapshot(copied) == before
+    assert service.reopen_completed(launch) == completed
+
+
+def test_reopen_completed_requires_the_stored_bundle_manifest(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    copied = tmp_path / "missing-manifest"
+    foundation = _foundation(source)
+    service = RunService(source)
+    launch = foundation.launch(
+        run_id="run-manifest-missing",
+        request_id="request-manifest-missing",
+        artifact_id="artifact-manifest-missing",
+    )
+    completed = service.launch(launch)
+    assert completed.integrity is not None
+    shutil.copytree(source, copied)
+    copied_store = TypedEvidenceStore(copied)
+    copied_store.layout.bundle_manifest_path(
+        completed.integrity.bundle_manifest.identity
+    ).unlink()
+    before = _project_file_snapshot(copied)
+
+    with pytest.raises(ApplicationServiceError, match="run_existing_artifact_conflict"):
+        RunService(copied).reopen_completed(launch)
+
+    assert _project_file_snapshot(copied) == before
+    assert service.reopen_completed(launch) == completed
+
+
+def test_failed_run_cannot_be_reopened_as_completed(tmp_path: Path) -> None:
+    foundation = _foundation(tmp_path)
+    service = RunService(tmp_path, adapter=_FailingAdapter())
+    launch = foundation.launch(
+        run_id="run-reopen-failed",
+        request_id="request-reopen-failed",
+        artifact_id="artifact-reopen-failed",
+    )
+
+    with pytest.raises(ApplicationServiceError, match="fixture_failure_injected"):
+        service.launch(launch)
+    with pytest.raises(ApplicationServiceError, match="run_existing_not_completed"):
+        service.reopen_completed(launch)
+
+
 def test_preflight_blocks_before_request_freeze_or_launch(tmp_path: Path) -> None:
     foundation = _foundation(tmp_path)
     launch = foundation.launch(
@@ -329,6 +471,174 @@ def test_runtime_failure_appends_public_safe_terminal_evidence(tmp_path: Path) -
     assert event.event_type == "run_failed"
     assert event.payload["failure_code"] == "fixture_failure_injected"
     assert str(tmp_path) not in str(event.payload)
+
+
+def test_checkpoint_write_failure_terminalizes_the_launched_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    foundation = _foundation(tmp_path)
+    service = RunService(tmp_path)
+    launch = foundation.launch(
+        run_id="run-checkpoint-write-failed",
+        request_id="request-checkpoint-write-failed",
+        artifact_id="artifact-checkpoint-write-failed",
+    )
+
+    def fail_checkpoint_write(path, data):
+        del path, data
+        raise SafeIoError("synthetic checkpoint persistence failure")
+
+    monkeypatch.setattr(service, "_write_idempotent", fail_checkpoint_write)
+
+    with pytest.raises(ApplicationServiceError, match="run_output_persistence_failed"):
+        service.launch(launch)
+
+    assert service.status(launch.run_id) is RunLifecycleStatus.FAILED
+    event = service._events(launch.run_id)[-1]
+    assert event.event_type == "run_failed"
+    assert event.payload["phase"] == "runtime_output"
+    assert event.payload["failure_code"] == "run_output_persistence_failed"
+
+
+@pytest.mark.parametrize(
+    ("failed_event", "expected_phase"),
+    [("run_progress", "runtime_output"), ("run_completed", "completion")],
+)
+def test_post_launch_event_append_failure_terminalizes_the_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_event: str,
+    expected_phase: str,
+) -> None:
+    foundation = _foundation(tmp_path)
+    service = RunService(tmp_path)
+    launch = foundation.launch(
+        run_id=f"run-{failed_event}-append-failed",
+        request_id=f"request-{failed_event}-append-failed",
+        artifact_id=f"artifact-{failed_event}-append-failed",
+    )
+    original_append = service._append
+    injected = False
+
+    def fail_one_event(run_id, key, event_type, payload):
+        nonlocal injected
+        if event_type == failed_event and not injected:
+            injected = True
+            raise EvidenceError("event_append_failed")
+        return original_append(run_id, key, event_type, payload)
+
+    monkeypatch.setattr(service, "_append", fail_one_event)
+
+    with pytest.raises(ApplicationServiceError, match="event_append_failed"):
+        service.launch(launch)
+
+    assert injected is True
+    assert service.status(launch.run_id) is RunLifecycleStatus.FAILED
+    event = service._events(launch.run_id)[-1]
+    assert event.event_type == "run_failed"
+    assert event.payload["phase"] == expected_phase
+    assert event.payload["failure_code"] == "event_append_failed"
+
+
+@pytest.mark.parametrize(
+    ("ambiguous_event", "adapter_fails", "expected_terminal"),
+    [
+        ("run_launched", False, "run_completed"),
+        ("run_progress", False, "run_completed"),
+        ("run_completed", False, "run_completed"),
+        ("run_failed", True, "run_failed"),
+    ],
+)
+def test_commit_then_raise_event_append_is_reconciled_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ambiguous_event: str,
+    adapter_fails: bool,
+    expected_terminal: str,
+) -> None:
+    foundation = _foundation(tmp_path)
+    adapter = _FailingAdapter() if adapter_fails else FixtureAdapter()
+    service = RunService(tmp_path, adapter=adapter)
+    launch = foundation.launch(
+        run_id=f"run-{ambiguous_event}-commit-unknown",
+        request_id=f"request-{ambiguous_event}-commit-unknown",
+        artifact_id=f"artifact-{ambiguous_event}-commit-unknown",
+    )
+    original_append = service.store.append_event
+    injected = 0
+    injected_key = None
+
+    def commit_then_raise(stream_id, request):
+        nonlocal injected, injected_key
+        durable = original_append(stream_id, request)
+        if request.event_type == ambiguous_event and injected == 0:
+            injected += 1
+            injected_key = request.idempotency_key
+            raise EvidenceError("synthetic_commit_outcome_unknown")
+        return durable
+
+    monkeypatch.setattr(service.store, "append_event", commit_then_raise)
+
+    if adapter_fails:
+        with pytest.raises(ApplicationServiceError, match="fixture_failure_injected"):
+            service.launch(launch)
+        expected_status = RunLifecycleStatus.FAILED
+    else:
+        result = service.launch(launch)
+        expected_status = RunLifecycleStatus.COMPLETED
+        assert result.status is expected_status
+
+    events = service._events(launch.run_id)
+    terminal_types = {
+        "run_preflight_blocked",
+        "run_cancelled",
+        "run_interrupted",
+        "run_completed",
+        "run_failed",
+    }
+    assert injected == 1
+    assert injected_key is not None
+    assert service.status(launch.run_id) is expected_status
+    assert sum(event.idempotency_key == injected_key for event in events) == 1
+    assert [
+        event.event_type for event in events if event.event_type in terminal_types
+    ] == [expected_terminal]
+    assert events[-1].event_type == expected_terminal
+
+
+@pytest.mark.parametrize("record_kind", [Artifact, ArtifactAvailability])
+def test_artifact_record_conflicts_terminalize_the_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record_kind,
+) -> None:
+    foundation = _foundation(tmp_path)
+    service = RunService(tmp_path)
+    launch = foundation.launch(
+        run_id=f"run-{record_kind.RECORD_TYPE}-conflict",
+        request_id=f"request-{record_kind.RECORD_TYPE}-conflict",
+        artifact_id=f"artifact-{record_kind.RECORD_TYPE}-conflict",
+    )
+    original_check = runs_module.require_no_conflicting_logical_revision
+
+    def inject_conflict(store, record, *, conflict_code):
+        if isinstance(record, record_kind):
+            raise ApplicationServiceError("artifact_record_conflict")
+        return original_check(store, record, conflict_code=conflict_code)
+
+    monkeypatch.setattr(
+        runs_module, "require_no_conflicting_logical_revision", inject_conflict
+    )
+
+    with pytest.raises(ApplicationServiceError, match="artifact_record_conflict"):
+        service.launch(launch)
+
+    assert service.status(launch.run_id) is RunLifecycleStatus.FAILED
+    events = service._events(launch.run_id)
+    assert events[-2].event_type == "artifact_ingestion_failed"
+    assert events[-1].event_type == "run_failed"
+    assert events[-1].payload["phase"] == "artifact_ingestion"
+    assert events[-1].payload["failure_code"] == "artifact_record_conflict"
 
 
 def test_final_step_interruption_fails_without_resumable_checkpoint(
