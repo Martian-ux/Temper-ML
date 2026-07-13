@@ -64,6 +64,7 @@ _CORE_RECORD_TYPES = (
     "project_policy",
     "recipe",
     "recipe_resolution",
+    "resolved_runtime_request",
     "run",
     "task_definition",
 )
@@ -88,6 +89,7 @@ CORE_LOGICAL_ID_FIELDS = MappingProxyType(
         "project_policy": "policy_id",
         "recipe": "recipe_id",
         "recipe_resolution": "resolution_id",
+        "resolved_runtime_request": "request_id",
         "run": "run_id",
         "task_definition": "task_id",
     }

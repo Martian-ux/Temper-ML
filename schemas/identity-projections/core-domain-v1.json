@@ -19,6 +19,7 @@
     {"record_type":"project_policy","record_schema_version":"v1","projection_name":"record.project_policy","projection_version":"v1","record_schema":"schemas/records/project_policy.schema.json"},
     {"record_type":"recipe","record_schema_version":"v1","projection_name":"record.recipe","projection_version":"v1","record_schema":"schemas/records/recipe.schema.json"},
     {"record_type":"recipe_resolution","record_schema_version":"v1","projection_name":"record.recipe_resolution","projection_version":"v1","record_schema":"schemas/records/recipe_resolution.schema.json"},
+    {"record_type":"resolved_runtime_request","record_schema_version":"v1","projection_name":"record.resolved_runtime_request","projection_version":"v1","record_schema":"schemas/records/resolved_runtime_request.schema.json"},
     {"record_type":"run","record_schema_version":"v1","projection_name":"record.run","projection_version":"v1","record_schema":"schemas/records/run.schema.json"},
     {"record_type":"task_definition","record_schema_version":"v1","projection_name":"record.task_definition","projection_version":"v1","record_schema":"schemas/records/task_definition.schema.json"}
   ]

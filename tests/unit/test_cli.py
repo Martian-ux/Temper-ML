@@ -238,3 +238,26 @@ def test_stdout_encoding_failure_uses_stable_error_json(
         "code": "filesystem_error",
         "status": "error",
     }
+
+
+def test_fixture_workflow_cli_fails_closed_on_unimplemented_quality_mode(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "fixture-workflow",
+                str(tmp_path),
+                "--evaluation-mode",
+                "light_evaluation",
+            ]
+        )
+
+    assert error.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "code": "usage_error",
+        "status": "error",
+    }
+    assert str(tmp_path) not in captured.err

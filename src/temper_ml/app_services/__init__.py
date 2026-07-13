@@ -36,9 +36,24 @@ from temper_ml.app_services.projects import (
     ProjectCreateRequest,
     ProjectService,
 )
+from temper_ml.app_services.local_use import (
+    AdapterExportRequest,
+    LocalUseRequest,
+    LocalUseResult,
+    LocalUseService,
+    VerifiedAdapterExport,
+)
+from temper_ml.app_services.runs import (
+    RunExecutionResult,
+    RunLaunchRequest,
+    RunLifecycleStatus,
+    RunRecoveryRequest,
+    RunService,
+)
 
 __all__ = [
     "ApplicationServiceError",
+    "AdapterExportRequest",
     "CorrectionReport",
     "CsvDatasetAdapter",
     "DatasetAdapterError",
@@ -54,6 +69,9 @@ __all__ = [
     "JsonDatasetAdapter",
     "JsonlDatasetAdapter",
     "LocalDatasetAdapter",
+    "LocalUseRequest",
+    "LocalUseResult",
+    "LocalUseService",
     "OpenedProject",
     "ProjectCreateRequest",
     "ProjectService",
@@ -65,6 +83,12 @@ __all__ = [
     "ReimportValueDelta",
     "SharedTokenCountDelta",
     "SplitChange",
+    "RunExecutionResult",
+    "RunLaunchRequest",
+    "RunLifecycleStatus",
+    "RunRecoveryRequest",
+    "RunService",
+    "VerifiedAdapterExport",
     "adapted_replay_plan",
     "plan_replay",
     "strict_replay_plan",
