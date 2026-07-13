@@ -200,7 +200,11 @@ For each dataset version, Temper records:
 9. immutable content identity and provenance.
 
 Temper may diagnose data quality and issue correction reports. Users correct an
-authoritative source outside Temper, then reimport and compare versions.
+authoritative source outside Temper, then reimport and compare versions. Reimport
+comparisons disclose exact before/after deltas for governed configuration and
+summary statistics, including split counts, plus token-count deltas for rendered
+examples shared by both versions; changed contracts are never silently treated as
+equivalent.
 Unsupported transformations happen outside Temper through a strict
 import-and-provenance contract.
 
