@@ -16,6 +16,8 @@ from temper_ml.app_services.datasets import (
     LocalDatasetAdapter,
     PreparedDataset,
     ReimportComparison,
+    ReimportValueDelta,
+    SharedTokenCountDelta,
     SplitChange,
 )
 from temper_ml.app_services.errors import ApplicationServiceError
@@ -60,6 +62,8 @@ __all__ = [
     "ReplayPlan",
     "ReplayStatus",
     "ReimportComparison",
+    "ReimportValueDelta",
+    "SharedTokenCountDelta",
     "SplitChange",
     "adapted_replay_plan",
     "plan_replay",

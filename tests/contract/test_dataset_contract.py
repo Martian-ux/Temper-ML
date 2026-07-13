@@ -1,5 +1,6 @@
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -69,11 +70,33 @@ def test_dataset_version_round_trips_through_registered_typed_envelope(
     assert CORE_LOGICAL_ID_FIELDS["dataset_version"] == "version_id"
     assert RecordEnvelope.from_dict(envelope.to_dict()) == envelope
     assert RecordEnvelope.from_dict(envelope.to_dict()).to_record() == prepared.version
+    assert prepared.version.preview_selections == tuple(
+        preview.selection for preview in prepared.previews
+    )
+    assert set(envelope.payload["preview_selections"][0]) == {
+        "source_ordinal",
+        "rendered_identity",
+        "split",
+        "token_count",
+    }
+    assert "text" not in envelope.payload["preview_selections"][0]
+
+    without_preview = replace(
+        prepared.version,
+        preview_limit=0,
+        preview_selections=(),
+    )
+    assert without_preview.identity != prepared.version.identity
 
     tampered = envelope.to_dict()
     tampered["payload"]["rendered_bytes_count"] += 1
     with pytest.raises(RecordValidationError):
         RecordEnvelope.from_dict(tampered)
+
+    tampered_selection = envelope.to_dict()
+    tampered_selection["payload"]["preview_selections"][0]["token_count"] += 1
+    with pytest.raises(RecordValidationError):
+        RecordEnvelope.from_dict(tampered_selection)
 
 
 def test_published_dataset_schema_and_projection_registry_match_code() -> None:

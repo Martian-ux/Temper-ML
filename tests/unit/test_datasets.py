@@ -1,5 +1,6 @@
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,9 @@ from temper_ml.app_services.datasets import (
     ImportedSource,
     JsonDatasetAdapter,
     JsonlDatasetAdapter,
+    ReimportComparison,
+    SharedTokenCountDelta,
+    SplitChange,
 )
 from temper_ml.app_services.errors import ApplicationServiceError
 from temper_ml.domain.datasets import (
@@ -28,6 +32,7 @@ from temper_ml.domain.datasets import (
     renderer_identity,
 )
 from temper_ml.domain.projections import ContentIdentity
+from temper_ml.domain.records import RecordValidationError
 from temper_ml.store.canonical_json import dumps_canonical_json, loads_canonical_json
 
 
@@ -55,6 +60,7 @@ def _request(
     split_rule: SplitRule | None = None,
     maximum_characters: int | None = 200,
     maximum_tokens: int | None = None,
+    preview_limit: int = 2,
 ) -> DatasetImportRequest:
     return DatasetImportRequest(
         version_id=version_id,
@@ -65,7 +71,7 @@ def _request(
         split_rule=split_rule
         or SplitRule(17, (SplitPart("train", 8), SplitPart("validation", 2))),
         tokenizer=tokenizer or WordTokenizer(),  # type: ignore[arg-type]
-        preview_limit=2,
+        preview_limit=preview_limit,
     )
 
 
@@ -107,6 +113,14 @@ def test_pipeline_is_byte_identical_and_records_safe_row_dispositions(
     assert first.version.exclusions[1].phase is ExclusionPhase.VALIDATION
     assert first.version.exclusions[2].phase is ExclusionPhase.FILTERING
     assert len(first.previews) == 2
+    assert first.version.preview_selections == tuple(
+        preview.selection for preview in first.previews
+    )
+    with pytest.raises(
+        RecordValidationError,
+        match="private previews do not match persisted preview selections",
+    ):
+        replace(first, previews=tuple(reversed(first.previews)))
 
     envelope_bytes = dumps_canonical_json(first.version.to_dict())
     assert rejected.encode() not in envelope_bytes
@@ -377,8 +391,132 @@ def test_correction_report_and_reimport_comparison_do_not_rewrite_versions(
     assert len(comparison.split_changes) == 1
     assert comparison.split_changes[0].previous_split == "train"
     assert comparison.split_changes[0].current_split == "validation"
+    assert [item.field for item in comparison.governed_configuration_deltas] == [
+        "split_rule"
+    ]
+    assert "split_counts" in {
+        item.field for item in comparison.summary_statistics_deltas
+    }
+    split_count_delta = next(
+        item
+        for item in comparison.summary_statistics_deltas
+        if item.field == "split_counts"
+    )
+    assert split_count_delta.to_dict() == {
+        "field": "split_counts",
+        "before": [{"split": "train", "count": 1}],
+        "after": [{"split": "validation", "count": 2}],
+    }
     assert previous.version.to_payload() == previous_payload
     assert current.version.to_payload() == current_payload
+
+
+class CharacterTokenizer(WordTokenizer):
+    def count_tokens(self, text: str) -> int:
+        return len(text)
+
+
+def test_reimport_comparison_discloses_configuration_statistics_and_token_deltas(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        {
+            "instruction": "Stable prompt",
+            "response": "Stable answer",
+            "prompt": "Stable prompt",
+            "answer": "Stable answer",
+        }
+    ]
+    service = DatasetService(tmp_path)
+    previous = service.import_json(
+        json.dumps(rows, separators=(",", ":")).encode(),
+        _request(
+            "dataset-delta-before",
+            mapping=FieldMapping("instruction", "response"),
+            tokenizer=WordTokenizer("tokenizer-before"),
+            split_rule=SplitRule(1, (SplitPart("train", 1),)),
+            maximum_characters=200,
+            preview_limit=2,
+        ),
+    )
+    current = service.import_hugging_face_rows(
+        rows,
+        _request(
+            "dataset-delta-after",
+            mapping=FieldMapping("prompt", "answer"),
+            tokenizer=CharacterTokenizer("tokenizer-after"),
+            split_rule=SplitRule(99, (SplitPart("train", 1),)),
+            maximum_characters=500,
+            preview_limit=0,
+        ),
+    )
+
+    comparison = service.compare_reimport(previous.version, current.version)
+
+    assert comparison.added_content == ()
+    assert comparison.removed_content == ()
+    assert comparison.split_changes == ()
+    assert [item.field for item in comparison.governed_configuration_deltas] == [
+        "source.adapter",
+        "field_mapping",
+        "filter_rule",
+        "tokenizer_identity",
+        "split_rule",
+        "preview_limit",
+    ]
+    assert [item.field for item in comparison.summary_statistics_deltas] == [
+        "total_tokens",
+        "minimum_tokens",
+        "maximum_tokens",
+    ]
+    assert len(comparison.shared_token_count_deltas) == 1
+    token_delta = comparison.shared_token_count_deltas[0]
+    assert (
+        token_delta.rendered_identity
+        == previous.version.accepted_examples[0].rendered_identity
+    )
+    assert token_delta.before_token_count == previous.version.statistics.total_tokens
+    assert token_delta.after_token_count == current.version.statistics.total_tokens
+    encoded = comparison.to_dict()
+    preview_delta = encoded["governed_configuration_deltas"][-1]
+    assert preview_delta == {"field": "preview_limit", "before": 2, "after": 0}
+    assert encoded["shared_token_count_deltas"] == [token_delta.to_dict()]
+
+
+def test_reimport_comparison_rejects_non_shared_split_and_token_deltas() -> None:
+    added_identity = _identity("added-content")
+    removed_identity = _identity("removed-content")
+
+    with pytest.raises(RecordValidationError, match="split changes require shared"):
+        ReimportComparison(
+            _identity("previous-version"),
+            _identity("current-version"),
+            (added_identity,),
+            (),
+            (SplitChange(added_identity, "train", "validation"),),
+            (),
+            (),
+            (),
+            (),
+            (),
+        )
+
+    with pytest.raises(
+        RecordValidationError,
+        match="token-count deltas require shared",
+    ):
+        ReimportComparison(
+            _identity("previous-version"),
+            _identity("current-version"),
+            (),
+            (removed_identity,),
+            (),
+            (),
+            (),
+            (SharedTokenCountDelta(removed_identity, 1, 2),),
+            (),
+            (),
+        )
 
 
 class ChangingTokenizer(WordTokenizer):

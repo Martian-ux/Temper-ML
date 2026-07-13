@@ -283,6 +283,31 @@ class AcceptedExample:
 
 
 @dataclass(frozen=True)
+class PreviewSelection:
+    """Value-free evidence identifying one deterministically selected preview."""
+
+    source_ordinal: int
+    rendered_identity: ContentIdentity
+    split: str
+    token_count: int
+
+    def __post_init__(self) -> None:
+        require_positive_int("source_ordinal", self.source_ordinal)
+        if not isinstance(self.rendered_identity, ContentIdentity):
+            raise RecordValidationError("rendered_identity must be a content identity")
+        require_identifier("split", self.split)
+        require_non_negative_int("token_count", self.token_count)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "source_ordinal": self.source_ordinal,
+            "rendered_identity": identity_fields(self.rendered_identity),
+            "split": self.split,
+            "token_count": self.token_count,
+        }
+
+
+@dataclass(frozen=True)
 class SplitMembership:
     """Exact accepted-content membership in one named split."""
 
@@ -431,6 +456,7 @@ class DatasetVersion(TypedRecord):
     rendered_bytes_identity: ContentIdentity
     rendered_bytes_count: int
     preview_limit: int
+    preview_selections: tuple[PreviewSelection, ...]
     accepted_examples: tuple[AcceptedExample, ...]
     split_membership: tuple[SplitMembership, ...]
     exclusions: tuple[ExclusionReceipt, ...]
@@ -467,6 +493,7 @@ class DatasetVersion(TypedRecord):
         require_positive_int("rendered_bytes_count", self.rendered_bytes_count)
         require_non_negative_int("preview_limit", self.preview_limit)
         for field, expected in (
+            ("preview_selections", PreviewSelection),
             ("accepted_examples", AcceptedExample),
             ("split_membership", SplitMembership),
             ("exclusions", ExclusionReceipt),
@@ -511,6 +538,25 @@ class DatasetVersion(TypedRecord):
             self.split_rule, self.split_membership
         ):
             raise RecordValidationError("split identity mismatch")
+        membership_by_identity = {
+            item.rendered_identity: item.split for item in self.split_membership
+        }
+        expected_preview_selections = tuple(
+            PreviewSelection(
+                item.source_ordinal,
+                item.rendered_identity,
+                membership_by_identity[item.rendered_identity],
+                item.token_count,
+            )
+            for item in self.accepted_examples[
+                : min(self.preview_limit, len(self.accepted_examples))
+            ]
+        )
+        if self.preview_selections != expected_preview_selections:
+            raise RecordValidationError(
+                "preview selections must exactly match the deterministic "
+                "accepted prefix"
+            )
         dispositions = tuple(
             item.source_ordinal for item in self.accepted_examples
         ) + tuple(item.source_ordinal for item in self.exclusions)
@@ -569,6 +615,7 @@ class DatasetVersion(TypedRecord):
             "rendered_bytes_identity": identity_fields(self.rendered_bytes_identity),
             "rendered_bytes_count": self.rendered_bytes_count,
             "preview_limit": self.preview_limit,
+            "preview_selections": [item.to_dict() for item in self.preview_selections],
             "accepted_examples": [item.to_dict() for item in self.accepted_examples],
             "split_membership": [item.to_dict() for item in self.split_membership],
             "exclusions": [item.to_dict() for item in self.exclusions],

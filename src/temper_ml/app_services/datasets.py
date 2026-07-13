@@ -29,6 +29,7 @@ from temper_ml.domain.datasets import (
     ExclusionReceipt,
     FieldMapping,
     FilterRule,
+    PreviewSelection,
     RendererKind,
     RendererSpec,
     SourceDescriptor,
@@ -43,14 +44,37 @@ from temper_ml.domain.datasets import (
 from temper_ml.domain.projections import ContentIdentity
 from temper_ml.domain.records import (
     RecordValidationError,
+    freeze_json_value,
     identity_fields,
     require_identifier,
     require_non_negative_int,
+    require_positive_int,
+    thaw_json,
 )
 from temper_ml.store.canonical_json import dumps_canonical_json
 from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
 
 _SPLIT_BUCKET_PREFIX = b"temper:dataset.split_bucket@v1\n"
+_GOVERNED_CONFIGURATION_FIELDS = (
+    "source.adapter",
+    "field_mapping",
+    "renderer",
+    "filter_rule",
+    "deduplication_rule",
+    "tokenizer_identity",
+    "split_rule",
+    "preview_limit",
+)
+_SUMMARY_STATISTICS_FIELDS = (
+    "source_rows",
+    "accepted_rows",
+    "excluded_rows",
+    "duplicate_rows",
+    "total_tokens",
+    "minimum_tokens",
+    "maximum_tokens",
+    "split_counts",
+)
 
 
 class DatasetAdapterError(ValueError):
@@ -248,6 +272,28 @@ class DatasetPreview:
     text: str
     token_count: int
 
+    def __post_init__(self) -> None:
+        require_positive_int("source_ordinal", self.source_ordinal)
+        if not isinstance(self.rendered_identity, ContentIdentity):
+            raise RecordValidationError("rendered_identity must be a content identity")
+        require_identifier("split", self.split)
+        if not isinstance(self.text, str) or not self.text:
+            raise RecordValidationError("preview text must not be empty")
+        if rendered_example_identity(self.text) != self.rendered_identity:
+            raise RecordValidationError("preview rendered identity mismatch")
+        require_non_negative_int("token_count", self.token_count)
+
+    @property
+    def selection(self) -> PreviewSelection:
+        """Return the value-free persisted projection of this private preview."""
+
+        return PreviewSelection(
+            self.source_ordinal,
+            self.rendered_identity,
+            self.split,
+            self.token_count,
+        )
+
     def to_dict(self) -> dict[str, object]:
         return {
             "source_ordinal": self.source_ordinal,
@@ -275,10 +321,16 @@ class PreparedDataset:
             raise RecordValidationError("rendered bytes identity mismatch")
         if len(self.rendered_bytes) != self.version.rendered_bytes_count:
             raise RecordValidationError("rendered bytes count mismatch")
-        if not isinstance(self.previews, tuple) or len(self.previews) > (
-            self.version.preview_limit
+        if not isinstance(self.previews, tuple) or any(
+            not isinstance(item, DatasetPreview) for item in self.previews
         ):
-            raise RecordValidationError("previews exceed the configured limit")
+            raise RecordValidationError("previews contain an invalid value")
+        if tuple(item.selection for item in self.previews) != (
+            self.version.preview_selections
+        ):
+            raise RecordValidationError(
+                "private previews do not match persisted preview selections"
+            )
 
 
 @dataclass(frozen=True)
@@ -321,11 +373,68 @@ class SplitChange:
     previous_split: str
     current_split: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.rendered_identity, ContentIdentity):
+            raise RecordValidationError("rendered_identity must be a content identity")
+        require_identifier("previous_split", self.previous_split)
+        require_identifier("current_split", self.current_split)
+        if self.previous_split == self.current_split:
+            raise RecordValidationError("split change must contain different values")
+
     def to_dict(self) -> dict[str, object]:
         return {
             "rendered_identity": identity_fields(self.rendered_identity),
             "previous_split": self.previous_split,
             "current_split": self.current_split,
+        }
+
+
+@dataclass(frozen=True)
+class ReimportValueDelta:
+    """One deeply immutable, exact JSON before/after value change."""
+
+    field: str
+    before: object
+    after: object
+
+    def __post_init__(self) -> None:
+        require_identifier("delta field", self.field)
+        before = freeze_json_value(self.before, field=f"{self.field} before")
+        after = freeze_json_value(self.after, field=f"{self.field} after")
+        if before == after:
+            raise RecordValidationError("reimport delta values must differ")
+        object.__setattr__(self, "before", before)
+        object.__setattr__(self, "after", after)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "field": self.field,
+            "before": thaw_json(self.before),
+            "after": thaw_json(self.after),
+        }
+
+
+@dataclass(frozen=True)
+class SharedTokenCountDelta:
+    """Token-count change for content accepted by both immutable versions."""
+
+    rendered_identity: ContentIdentity
+    before_token_count: int
+    after_token_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.rendered_identity, ContentIdentity):
+            raise RecordValidationError("rendered_identity must be a content identity")
+        require_non_negative_int("before_token_count", self.before_token_count)
+        require_non_negative_int("after_token_count", self.after_token_count)
+        if self.before_token_count == self.after_token_count:
+            raise RecordValidationError("token-count delta values must differ")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "rendered_identity": identity_fields(self.rendered_identity),
+            "before_token_count": self.before_token_count,
+            "after_token_count": self.after_token_count,
         }
 
 
@@ -338,8 +447,83 @@ class ReimportComparison:
     added_content: tuple[ContentIdentity, ...]
     removed_content: tuple[ContentIdentity, ...]
     split_changes: tuple[SplitChange, ...]
+    governed_configuration_deltas: tuple[ReimportValueDelta, ...]
+    summary_statistics_deltas: tuple[ReimportValueDelta, ...]
+    shared_token_count_deltas: tuple[SharedTokenCountDelta, ...]
     previous_exclusions: tuple[ExclusionReceipt, ...]
     current_exclusions: tuple[ExclusionReceipt, ...]
+
+    def __post_init__(self) -> None:
+        for name in ("previous_version_identity", "current_version_identity"):
+            if not isinstance(getattr(self, name), ContentIdentity):
+                raise RecordValidationError(f"{name} must be a content identity")
+        for name in ("added_content", "removed_content"):
+            values = getattr(self, name)
+            if (
+                not isinstance(values, tuple)
+                or any(not isinstance(item, ContentIdentity) for item in values)
+                or values != tuple(sorted(set(values), key=lambda item: item.value))
+            ):
+                raise RecordValidationError(f"{name} order is not canonical")
+        if set(self.added_content) & set(self.removed_content):
+            raise RecordValidationError("added and removed content must be disjoint")
+        non_shared_content = set(self.added_content) | set(self.removed_content)
+        if (
+            not isinstance(self.split_changes, tuple)
+            or any(not isinstance(item, SplitChange) for item in self.split_changes)
+            or len({item.rendered_identity for item in self.split_changes})
+            != len(self.split_changes)
+            or self.split_changes
+            != tuple(
+                sorted(
+                    self.split_changes,
+                    key=lambda item: item.rendered_identity.value,
+                )
+            )
+        ):
+            raise RecordValidationError("split changes order is not canonical")
+        if any(
+            item.rendered_identity in non_shared_content for item in self.split_changes
+        ):
+            raise RecordValidationError("split changes require shared content")
+        _require_canonical_value_deltas(
+            self.governed_configuration_deltas,
+            _GOVERNED_CONFIGURATION_FIELDS,
+            field="governed_configuration_deltas",
+        )
+        _require_canonical_value_deltas(
+            self.summary_statistics_deltas,
+            _SUMMARY_STATISTICS_FIELDS,
+            field="summary_statistics_deltas",
+        )
+        if (
+            not isinstance(self.shared_token_count_deltas, tuple)
+            or any(
+                not isinstance(item, SharedTokenCountDelta)
+                for item in self.shared_token_count_deltas
+            )
+            or len({item.rendered_identity for item in self.shared_token_count_deltas})
+            != len(self.shared_token_count_deltas)
+            or self.shared_token_count_deltas
+            != tuple(
+                sorted(
+                    self.shared_token_count_deltas,
+                    key=lambda item: item.rendered_identity.value,
+                )
+            )
+        ):
+            raise RecordValidationError("token-count deltas order is not canonical")
+        if any(
+            item.rendered_identity in non_shared_content
+            for item in self.shared_token_count_deltas
+        ):
+            raise RecordValidationError("token-count deltas require shared content")
+        for name in ("previous_exclusions", "current_exclusions"):
+            values = getattr(self, name)
+            if not isinstance(values, tuple) or any(
+                not isinstance(item, ExclusionReceipt) for item in values
+            ):
+                raise RecordValidationError(f"{name} contains an invalid value")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -350,11 +534,54 @@ class ReimportComparison:
             "added_content": [identity_fields(item) for item in self.added_content],
             "removed_content": [identity_fields(item) for item in self.removed_content],
             "split_changes": [item.to_dict() for item in self.split_changes],
+            "governed_configuration_deltas": [
+                item.to_dict() for item in self.governed_configuration_deltas
+            ],
+            "summary_statistics_deltas": [
+                item.to_dict() for item in self.summary_statistics_deltas
+            ],
+            "shared_token_count_deltas": [
+                item.to_dict() for item in self.shared_token_count_deltas
+            ],
             "previous_exclusions": [
                 item.to_dict() for item in self.previous_exclusions
             ],
             "current_exclusions": [item.to_dict() for item in self.current_exclusions],
         }
+
+
+def _require_canonical_value_deltas(
+    deltas: tuple[ReimportValueDelta, ...],
+    field_order: tuple[str, ...],
+    *,
+    field: str,
+) -> None:
+    if not isinstance(deltas, tuple) or any(
+        not isinstance(item, ReimportValueDelta) for item in deltas
+    ):
+        raise RecordValidationError(f"{field} contains an invalid value")
+    positions = {name: index for index, name in enumerate(field_order)}
+    names = tuple(item.field for item in deltas)
+    if (
+        len(set(names)) != len(names)
+        or any(name not in positions for name in names)
+        or names != tuple(sorted(names, key=positions.__getitem__))
+    ):
+        raise RecordValidationError(f"{field} order is not canonical")
+
+
+def _changed_value_deltas(
+    before: Mapping[str, object],
+    after: Mapping[str, object],
+    field_order: tuple[str, ...],
+) -> tuple[ReimportValueDelta, ...]:
+    if set(before) != set(field_order) or set(after) != set(field_order):
+        raise ApplicationServiceError("dataset_comparison_invariant_failed")
+    return tuple(
+        ReimportValueDelta(field, before[field], after[field])
+        for field in field_order
+        if before[field] != after[field]
+    )
 
 
 @dataclass(frozen=True)
@@ -447,6 +674,17 @@ class DatasetService:
             membership,
         )
         try:
+            previews = tuple(
+                DatasetPreview(
+                    candidate.source_ordinal,
+                    candidate.identity,
+                    candidate.split,
+                    candidate.text,
+                    candidate.token_count,
+                )
+                for candidate in candidates[: request.preview_limit]
+            )
+            preview_selections = tuple(item.selection for item in previews)
             version = DatasetVersion(
                 version_id=request.version_id,
                 source=descriptor,
@@ -466,6 +704,7 @@ class DatasetService:
                 rendered_bytes_identity=_bytes_identity(rendered_bytes),
                 rendered_bytes_count=len(rendered_bytes),
                 preview_limit=request.preview_limit,
+                preview_selections=preview_selections,
                 accepted_examples=accepted,
                 split_membership=membership,
                 exclusions=exclusions,
@@ -486,16 +725,6 @@ class DatasetService:
             raise
         except (EvidenceError, RecordValidationError, TypeError, ValueError):
             raise ApplicationServiceError("dataset_persistence_failed") from None
-        previews = tuple(
-            DatasetPreview(
-                candidate.source_ordinal,
-                candidate.identity,
-                candidate.split,
-                candidate.text,
-                candidate.token_count,
-            )
-            for candidate in candidates[: request.preview_limit]
-        )
         return PreparedDataset(version, rendered_bytes, previews)
 
     @staticmethod
@@ -541,12 +770,65 @@ class DatasetService:
             )
             if previous_splits[identity] != current_splits[identity]
         )
+        previous_configuration: dict[str, object] = {
+            "source.adapter": previous.source.adapter.value,
+            "field_mapping": previous.field_mapping.to_dict(),
+            "renderer": previous.renderer.to_dict(),
+            "filter_rule": previous.filter_rule.to_dict(),
+            "deduplication_rule": previous.deduplication_rule.to_dict(),
+            "tokenizer_identity": identity_fields(previous.tokenizer_identity),
+            "split_rule": previous.split_rule.to_dict(),
+            "preview_limit": previous.preview_limit,
+        }
+        current_configuration: dict[str, object] = {
+            "source.adapter": current.source.adapter.value,
+            "field_mapping": current.field_mapping.to_dict(),
+            "renderer": current.renderer.to_dict(),
+            "filter_rule": current.filter_rule.to_dict(),
+            "deduplication_rule": current.deduplication_rule.to_dict(),
+            "tokenizer_identity": identity_fields(current.tokenizer_identity),
+            "split_rule": current.split_rule.to_dict(),
+            "preview_limit": current.preview_limit,
+        }
+        previous_statistics = previous.statistics.to_dict()
+        current_statistics = current.statistics.to_dict()
+        previous_tokens = {
+            item.rendered_identity: item.token_count
+            for item in previous.accepted_examples
+        }
+        current_tokens = {
+            item.rendered_identity: item.token_count
+            for item in current.accepted_examples
+        }
+        shared_token_count_deltas = tuple(
+            SharedTokenCountDelta(
+                identity,
+                previous_tokens[identity],
+                current_tokens[identity],
+            )
+            for identity in sorted(
+                previous_ids & current_ids,
+                key=lambda item: item.value,
+            )
+            if previous_tokens[identity] != current_tokens[identity]
+        )
         return ReimportComparison(
             previous.identity,
             current.identity,
             added,
             removed,
             split_changes,
+            _changed_value_deltas(
+                previous_configuration,
+                current_configuration,
+                _GOVERNED_CONFIGURATION_FIELDS,
+            ),
+            _changed_value_deltas(
+                previous_statistics,
+                current_statistics,
+                _SUMMARY_STATISTICS_FIELDS,
+            ),
+            shared_token_count_deltas,
             previous.exclusions,
             current.exclusions,
         )

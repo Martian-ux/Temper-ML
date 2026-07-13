@@ -120,6 +120,13 @@ def test_slice_four_forms_one_recoverable_deterministic_local_workflow(
     assert len(stored) == 1
     decoded = RecordEnvelope.from_dict(stored[0].envelope.to_dict()).to_record()
     assert decoded == initial.version
+    assert decoded.preview_selections == tuple(
+        preview.selection for preview in initial.previews
+    )
+    assert all(
+        "text" not in selection
+        for selection in decoded.to_payload()["preview_selections"]
+    )
     assert dumps_canonical_json(decoded.to_dict()) == dumps_canonical_json(
         initial.version.to_dict()
     )

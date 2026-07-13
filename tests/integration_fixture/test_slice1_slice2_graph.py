@@ -21,6 +21,7 @@ from temper_ml.domain.datasets import (
     DeduplicationRule,
     FieldMapping,
     FilterRule,
+    PreviewSelection,
     RendererSpec,
     SourceDescriptor,
     SplitCount,
@@ -107,6 +108,9 @@ def _complete_record_graph() -> tuple[TypedRecord, ...]:
         ),
         rendered_bytes_count=len(rendered_bytes),
         preview_limit=1,
+        preview_selections=(
+            PreviewSelection(1, rendered_identity, "train", token_count),
+        ),
         accepted_examples=(
             AcceptedExample(
                 1,
