@@ -7,6 +7,7 @@
     {"record_type":"base_model_revision","record_schema_version":"v1","projection_name":"record.base_model_revision","projection_version":"v1","record_schema":"schemas/records/base_model_revision.schema.json"},
     {"record_type":"baseline_policy","record_schema_version":"v1","projection_name":"record.baseline_policy","projection_version":"v1","record_schema":"schemas/records/baseline_policy.schema.json"},
     {"record_type":"compatibility_group","record_schema_version":"v1","projection_name":"record.compatibility_group","projection_version":"v1","record_schema":"schemas/records/compatibility_group.schema.json"},
+    {"record_type":"dataset_version","record_schema_version":"v1","projection_name":"record.dataset_version","projection_version":"v1","record_schema":"schemas/records/dataset_version.schema.json"},
     {"record_type":"execution_target","record_schema_version":"v1","projection_name":"record.execution_target","projection_version":"v1","record_schema":"schemas/records/execution_target.schema.json"},
     {"record_type":"experiment","record_schema_version":"v1","projection_name":"record.experiment","projection_version":"v1","record_schema":"schemas/records/experiment.schema.json"},
     {"record_type":"experiment_derivation","record_schema_version":"v1","projection_name":"record.experiment_derivation","projection_version":"v1","record_schema":"schemas/records/experiment_derivation.schema.json"},

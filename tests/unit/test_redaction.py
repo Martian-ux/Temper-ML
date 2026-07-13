@@ -195,3 +195,30 @@ def test_public_export_wrapper_is_versioned_and_contains_no_source_location() ->
         registration.record_type
         for registration in CORE_PROJECTION_REGISTRY.registrations
     ]
+
+
+def test_dataset_public_projection_is_registered_but_fail_closed_on_all_fields() -> (
+    None
+):
+    source = {
+        "record_type": "dataset_version",
+        "schema_version": "v1",
+        "projection_version": "v1",
+        "fields": {
+            "version_id": "dataset-private",
+            "source": {"source_identity": {"algorithm": "sha256", "value": "a" * 64}},
+            "accepted_examples": [{"rendered_identity": "b" * 64}],
+            "exclusions": [{"source_ordinal": 1, "reason_code": "invalid"}],
+        },
+    }
+
+    result = redact_for_public_export(source, context=CONTEXT)
+
+    assert result.value == {
+        "record_type": "dataset_version",
+        "source_schema_version": "v1",
+        "source_projection_version": "v1",
+        "public_record_projection_version": "v1",
+        "fields": {},
+    }
+    assert result.redaction_count == len(source["fields"])

@@ -39,6 +39,7 @@
     "baselinePolicyReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "baseline_policy"}}}]},
     "baseModelRevisionReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "base_model_revision"}}}]},
     "compatibilityGroupReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "compatibility_group"}}}]},
+    "datasetVersionReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "dataset_version"}}}]},
     "executionTargetReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "execution_target"}}}]},
     "experimentReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "experiment"}}}]},
     "experimentDerivationReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "experiment_derivation"}}}]},

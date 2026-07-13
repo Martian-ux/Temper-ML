@@ -48,6 +48,7 @@ _PUBLIC_RECORD_FIELDS: dict[str, frozenset[str]] = {
         "baseline_policy",
         "base_model_revision",
         "compatibility_group",
+        "dataset_version",
         "execution_target",
         "experiment",
         "experiment_derivation",

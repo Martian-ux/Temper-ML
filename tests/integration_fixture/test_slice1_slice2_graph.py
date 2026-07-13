@@ -12,6 +12,25 @@ from temper_ml.domain.artifacts import (
 )
 from temper_ml.domain.base_models import BaseModelRevision
 from temper_ml.domain.compatibility import CompatibilityGroup, RuntimeTargetConstraint
+from temper_ml.domain.datasets import (
+    RENDERED_BYTES_FORMAT,
+    AcceptedExample,
+    DatasetAdapter,
+    DatasetStatistics,
+    DatasetVersion,
+    DeduplicationRule,
+    FieldMapping,
+    FilterRule,
+    RendererSpec,
+    SourceDescriptor,
+    SplitCount,
+    SplitMembership,
+    SplitPart,
+    SplitRule,
+    rendered_example_identity,
+    renderer_identity,
+    split_membership_identity,
+)
 from temper_ml.domain.experiments import Experiment, derive_experiment
 from temper_ml.domain.hardware import (
     ExecutionTarget,
@@ -26,6 +45,7 @@ from temper_ml.domain.recipes import Recipe, RecipeResolution
 from temper_ml.domain.records import (
     CORE_PROJECTION_REGISTRY,
     TypedRecord,
+    identity_fields,
     record_reference,
 )
 from temper_ml.domain.runs import Run
@@ -41,6 +61,73 @@ def _identity(label: str) -> ContentIdentity:
 
 def _complete_record_graph() -> tuple[TypedRecord, ...]:
     tokenizer = _identity("graph-tokenizer")
+    source_bytes = dumps_canonical_json(
+        [
+            {
+                "instruction": "Synthetic graph input",
+                "response": "Synthetic graph output",
+            }
+        ]
+    )
+    field_mapping = FieldMapping("instruction", "response")
+    renderer = RendererSpec()
+    rendered_text = (
+        "### Instruction\nSynthetic graph input\n### Response\nSynthetic graph output"
+    )
+    rendered_identity = rendered_example_identity(rendered_text)
+    split_rule = SplitRule(1, (SplitPart("train", 1),))
+    split_membership = (SplitMembership(rendered_identity, "train"),)
+    rendered_bytes = dumps_canonical_json(
+        {
+            "rendered_identity": identity_fields(rendered_identity),
+            "source_ordinal": 1,
+            "split": "train",
+            "text": rendered_text,
+        }
+    )
+    token_count = len(rendered_text.split())
+    dataset = DatasetVersion(
+        version_id="dataset-graph",
+        source=SourceDescriptor(
+            DatasetAdapter.JSON,
+            ContentIdentity("sha256", hashlib.sha256(source_bytes).hexdigest()),
+            1,
+        ),
+        field_mapping=field_mapping,
+        renderer=renderer,
+        renderer_identity=renderer_identity(field_mapping, renderer),
+        filter_rule=FilterRule(),
+        deduplication_rule=DeduplicationRule(),
+        tokenizer_identity=tokenizer,
+        split_rule=split_rule,
+        split_identity=split_membership_identity(split_rule, split_membership),
+        rendered_bytes_format=RENDERED_BYTES_FORMAT,
+        rendered_bytes_identity=ContentIdentity(
+            "sha256", hashlib.sha256(rendered_bytes).hexdigest()
+        ),
+        rendered_bytes_count=len(rendered_bytes),
+        preview_limit=1,
+        accepted_examples=(
+            AcceptedExample(
+                1,
+                rendered_identity,
+                len(rendered_text.encode("utf-8")),
+                token_count,
+            ),
+        ),
+        split_membership=split_membership,
+        exclusions=(),
+        statistics=DatasetStatistics(
+            1,
+            1,
+            0,
+            0,
+            token_count,
+            token_count,
+            token_count,
+            (SplitCount("train", 1),),
+        ),
+    )
     task = TaskDefinition(
         "task-graph",
         "Synthetic graph task",
@@ -271,6 +358,7 @@ def _complete_record_graph() -> tuple[TypedRecord, ...]:
         StorageReference("export_store", "adapter_export"),
     )
     return (
+        dataset,
         task,
         model,
         project,

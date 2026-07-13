@@ -108,6 +108,7 @@
         "base_model_revision",
         "baseline_policy",
         "compatibility_group",
+        "dataset_version",
         "execution_target",
         "experiment",
         "experiment_derivation",
