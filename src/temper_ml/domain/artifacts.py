@@ -489,6 +489,37 @@ def build_bundle_manifest(
     )
 
 
+def build_bytes_bundle_manifest(
+    members: Mapping[str, bytes],
+) -> BundleManifest:
+    """Build the same canonical bundle projection before bytes cross a boundary."""
+
+    if not isinstance(members, Mapping) or not members:
+        raise ArtifactError("bundle members must be a non-empty mapping")
+    projected: list[BundleMember] = []
+    seen: set[str] = set()
+    for raw_path, data in members.items():
+        path = _validate_member_path(raw_path)
+        if path in seen:
+            raise ArtifactError(f"duplicate normalized bundle member path: {path!r}")
+        seen.add(path)
+        if not isinstance(data, bytes):
+            raise ArtifactError("bundle member content must be bytes")
+        projected.append(BundleMember(path, byte_identity(data), len(data)))
+    ordered = tuple(sorted(projected, key=lambda member: member.path))
+    fields = {
+        "schema_version": BUNDLE_SCHEMA_VERSION,
+        "projection_version": BUNDLE_PROJECTION.version,
+        "members": [member.projected_fields() for member in ordered],
+    }
+    return BundleManifest(
+        schema_version=BUNDLE_SCHEMA_VERSION,
+        projection_version=BUNDLE_PROJECTION.version,
+        members=ordered,
+        identity=content_identity(BUNDLE_PROJECTION, fields),
+    )
+
+
 def _enumerated_paths(root: Path) -> list[str]:
     paths: list[str] = []
     pending: list[tuple[Path, str]] = [(root, "")]

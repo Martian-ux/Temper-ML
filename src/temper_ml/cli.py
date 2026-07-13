@@ -4,12 +4,43 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from decimal import Decimal
+import hashlib
 import sys
 from typing import NoReturn
 
 from temper_ml import __version__
+from temper_ml.app_services.datasets import (
+    DatasetImportRequest,
+    DatasetService,
+)
 from temper_ml.app_services.errors import ApplicationServiceError
+from temper_ml.app_services.experiments import (
+    ExperimentFreezeRequest,
+    ExperimentService,
+)
+from temper_ml.app_services.local_use import (
+    AdapterExportRequest,
+    LocalUseRequest,
+    LocalUseService,
+)
 from temper_ml.app_services.projects import ProjectService
+from temper_ml.app_services.projects import ProjectCreateRequest
+from temper_ml.app_services.runs import RunLaunchRequest, RunService
+from temper_ml.domain.base_models import BaseModelRevision
+from temper_ml.domain.compatibility import (
+    CompatibilityGroup,
+    RuntimeTargetConstraint,
+)
+from temper_ml.domain.datasets import (
+    DeduplicationRule,
+    FieldMapping,
+    FilterRule,
+    RendererSpec,
+    SplitPart,
+    SplitRule,
+    renderer_identity,
+)
 from temper_ml.domain.experiments import ManifestDiff
 from temper_ml.domain.hardware import (
     ExecutionTarget,
@@ -17,16 +48,25 @@ from temper_ml.domain.hardware import (
     HardwareRequirements,
 )
 from temper_ml.domain.projections import ContentIdentity, ProjectionError
-from temper_ml.domain.recipes import RecipeResolution
+from temper_ml.domain.policies import BaselinePolicy, PerModelBaseline
+from temper_ml.domain.projects import Project, ProjectPolicy
+from temper_ml.domain.recipes import Recipe, RecipeResolution
+from temper_ml.domain.records import record_reference
+from temper_ml.domain.runs import EvaluationMode
+from temper_ml.domain.tasks import TaskDefinition
 from temper_ml.runtime.paths import PortablePathError
 from temper_ml.runtime.preflight import (
     EstimateComponents,
     PreflightError,
     estimate_resources,
     preflight,
+    capture_capability_profile,
 )
 from temper_ml.runtime.recipe_resolution import (
+    RecipeCatalog,
+    RecipeCatalogEntry,
     RecipeResolutionError,
+    RecipeResolver,
     resolution_view,
 )
 from temper_ml.store.canonical_json import dumps_canonical_json
@@ -86,6 +126,13 @@ def build_parser() -> argparse.ArgumentParser:
         "host-runtime-overhead-bytes",
     ):
         preflight_command.add_argument(f"--{option}", type=int, required=True)
+    fixture = commands.add_parser("fixture-workflow")
+    fixture.add_argument("project")
+    fixture.add_argument(
+        "--evaluation-mode",
+        choices=(EvaluationMode.NO_QUALITY_EVALUATION.value,),
+        default=EvaluationMode.NO_QUALITY_EVALUATION.value,
+    )
     return parser
 
 
@@ -230,7 +277,340 @@ def _run(arguments: argparse.Namespace) -> object:
         result["schema_version"] = "v1"
         result["command"] = "preflight"
         return result
+    if arguments.command == "fixture-workflow":
+        return _fixture_workflow(
+            arguments.project,
+            evaluation_mode=EvaluationMode(arguments.evaluation_mode),
+        )
     raise EvidenceError("unknown_command")
+
+
+class _FixtureTokenizer:
+    identity = ContentIdentity(
+        "sha256", hashlib.sha256(b"temper-public-fixture-tokenizer-v1").hexdigest()
+    )
+
+    @staticmethod
+    def count_tokens(text: str) -> int:
+        return len(text.encode("utf-8"))
+
+
+def _fixture_workflow(
+    project_root: str,
+    *,
+    evaluation_mode: EvaluationMode,
+) -> dict[str, object]:
+    """Exercise the complete synthetic Slice 5 workflow without external I/O."""
+
+    mapping = FieldMapping("instruction", "response", "context")
+    renderer = RendererSpec()
+    rendering_contract = renderer_identity(mapping, renderer)
+    task = TaskDefinition(
+        task_id="task-fixture-runtime",
+        display_name="Synthetic fixture rewrite",
+        description="Rewrite synthetic local text for the offline fixture runtime.",
+        input_schema={"required": ["instruction"]},
+        output_schema={"required": ["response"]},
+        rendering_contract=rendering_contract,
+        objectives=("deterministic_rewrite",),
+        capabilities=("text_generation",),
+    )
+    model = BaseModelRevision(
+        model_id="model-fixture-runtime",
+        display_name="Synthetic fixture model",
+        model_family="fixture-family",
+        architecture="fixture-causal-lm",
+        source="public-fixture",
+        revision="revision-one",
+        weights_identity=_fixture_identity("weights"),
+        tokenizer_identity=_FixtureTokenizer.identity,
+        license="Apache-2.0",
+    )
+    project = Project(
+        project_id="project-fixture-runtime",
+        display_name="Fixture runtime project",
+        purpose="Exercise the deterministic offline Temper runtime.",
+        task_definition=record_reference(task),
+        base_model_revisions=(record_reference(model),),
+    )
+    baseline = BaselinePolicy(
+        "baseline-fixture-runtime",
+        (PerModelBaseline(_fixture_identity("comparison-policy")),),
+    )
+    policy = ProjectPolicy(
+        policy_id="policy-fixture-runtime",
+        project=record_reference(project),
+        task_definition=record_reference(task),
+        rendering_contract=task.rendering_contract,
+        evaluation_policy=_fixture_identity("evaluation-policy"),
+        case_suites=(_fixture_identity("case-suite"),),
+        readiness_policy=_fixture_identity("readiness-policy"),
+        retention_policy=_fixture_identity("retention-policy"),
+        approved_recipe_families=("fixture",),
+        baseline_policy=record_reference(baseline),
+        recommendation_policy=_fixture_identity("recommendation-policy"),
+    )
+    opened = ProjectService(project_root).create(
+        ProjectCreateRequest(task, project, baseline, policy, (model,))
+    )
+    dataset_request = DatasetImportRequest(
+        version_id="dataset-fixture-runtime",
+        field_mapping=mapping,
+        renderer=renderer,
+        filter_rule=FilterRule(1, 1000, 1000),
+        deduplication_rule=DeduplicationRule(),
+        split_rule=SplitRule(
+            17,
+            (SplitPart("train", 4), SplitPart("validation", 1)),
+        ),
+        tokenizer=_FixtureTokenizer(),
+        preview_limit=2,
+    )
+    source_rows = [
+        {
+            "instruction": "Rewrite the synthetic alpha note",
+            "context": "Alpha fixture context",
+            "response": "Synthetic alpha rewrite",
+        },
+        {
+            "instruction": "Rewrite the synthetic beta note",
+            "context": "Beta fixture context",
+            "response": "Synthetic beta rewrite",
+        },
+        {
+            "instruction": "Rewrite the synthetic gamma note",
+            "context": "Gamma fixture context",
+            "response": "Synthetic gamma rewrite",
+        },
+    ]
+    prepared = DatasetService(project_root).import_json(
+        dumps_canonical_json(source_rows), dataset_request
+    )
+    recipe = Recipe(
+        recipe_id="recipe-fixture-runtime",
+        family="fixture",
+        version="v1",
+        training_profile="deterministic",
+        adapter_size="small",
+        memory_mode="offline",
+        quantization="none",
+        training_duration="fixture",
+        checkpoint_policy="periodic",
+        evaluation_intensity="selected_separately",
+        retention_policy="standard",
+        expert_overrides={},
+    )
+    requirements = HardwareRequirements(
+        requirements_id="requirements-fixture-runtime",
+        execution_target_classes=("fixture_cpu",),
+        accelerator_backends=("none",),
+        minimum_accelerator_memory_bytes=0,
+        minimum_system_memory_bytes=1,
+        required_precision_modes=("fp32",),
+        required_quantization_modes=(),
+        required_capabilities=("fixture_adapter",),
+        constraints={"local_only": True, "network_required": False},
+    )
+    target = ExecutionTarget(
+        target_id="target-fixture-runtime",
+        target_class="fixture_cpu",
+        platform="portable",
+        accelerator_backend="none",
+        runtime_contract=_fixture_identity("fixture-runtime-contract"),
+        capabilities=("fixture_adapter",),
+        constraints={"local_only": True, "network_required": False},
+    )
+    catalog = RecipeCatalog(
+        (
+            RecipeCatalogEntry(
+                recipe,
+                {
+                    "adapter_type": "lora",
+                    "target_modules": ["k_proj", "q_proj"],
+                    "rank": 4,
+                    "alpha": 8,
+                    "dropout": 0,
+                    "learning_rate": Decimal("0.0002"),
+                    "effective_batch_size": 2,
+                    "sequence_length": 128,
+                    "optimizer": "fixture_adamw",
+                    "precision": "fp32",
+                    "gradient_accumulation": 1,
+                    "seed": 17,
+                    "schedule": "linear",
+                    "training_steps": 4,
+                    "checkpoint_cadence": 2,
+                    "quantization": "none",
+                    "library_versions": {"fixture_runtime": "v1"},
+                },
+            ),
+        )
+    )
+    entry = catalog.select("fixture", "v1")
+    resolution = RecipeResolver().resolve(
+        entry,
+        base_model_revision=model,
+        hardware_requirements=requirements,
+        execution_target=target,
+    )
+    group = CompatibilityGroup(
+        group_id="group-fixture-runtime",
+        base_model_revision=record_reference(model),
+        tokenizer_identity=model.tokenizer_identity,
+        rendering_template=task.rendering_contract,
+        adapter_type=resolution.adapter_type,
+        target_modules=resolution.target_modules,
+        runtime_targets=(
+            RuntimeTargetConstraint(
+                target.target_class,
+                target.accelerator_backend,
+                target.runtime_contract,
+                ("fixture_adapter",),
+            ),
+        ),
+        merge_methods=(),
+    )
+    experiment = ExperimentService(project_root).freeze(
+        ExperimentFreezeRequest(
+            experiment_id="experiment-fixture-runtime",
+            opened_project=opened,
+            dataset_version=prepared.version.identity,
+            base_model_revision=model,
+            recipe=entry.recipe,
+            recipe_resolution=resolution,
+            compatibility_group=group,
+            hardware_requirements=requirements,
+            execution_target=target,
+        )
+    )
+    profile = capture_capability_profile(
+        profile_id="profile-fixture-runtime",
+        execution_target=target,
+        accelerator_backend="none",
+        accelerator_architecture="fixture-cpu",
+        accelerator_model="Synthetic fixture CPU",
+        accelerator_count=0,
+        accelerator_memory_bytes=(),
+        system_memory_bytes=1_000_000,
+        supported_precision_modes=("fp32",),
+        supported_quantization_modes=(),
+        capabilities=("fixture_adapter",),
+        library_versions={"fixture_runtime": "v1"},
+    )
+    estimate = estimate_resources(
+        resolution,
+        EstimateComponents(
+            base_model_bytes=0,
+            adapter_optimizer_bytes=0,
+            peak_activation_bytes=0,
+            accelerator_runtime_overhead_bytes=0,
+            dataset_bytes=len(prepared.rendered_bytes),
+            host_runtime_overhead_bytes=1024,
+        ),
+    )
+    launch_request = RunLaunchRequest(
+        run_id="run-fixture-runtime",
+        request_id="request-fixture-runtime",
+        artifact_id="artifact-fixture-runtime",
+        experiment=experiment,
+        recipe_resolution=resolution,
+        prepared_dataset=prepared,
+        base_model_revision=model,
+        compatibility_group=group,
+        hardware_requirements=requirements,
+        execution_target=target,
+        hardware_capability_profile=profile,
+        estimate=estimate,
+        evaluation_mode=evaluation_mode,
+    )
+    run_service = RunService(project_root)
+    try:
+        run = run_service.reopen_completed(launch_request)
+    except ApplicationServiceError as exc:
+        if exc.code != "run_not_found":
+            raise
+        run = run_service.launch(launch_request)
+    if run.artifact is None:
+        raise ApplicationServiceError("fixture_workflow_artifact_missing")
+    local = LocalUseService(project_root)
+    focused = local.focused(
+        LocalUseRequest(
+            artifact=run.artifact,
+            base_model_revision=model,
+            compatibility_group=group,
+            execution_target=target,
+            settings=_fixture_inference_settings(),
+            inputs=({"text": "Synthetic focused prompt"},),
+            session_id="session-fixture-focused",
+        )
+    )
+    batch = local.batch(
+        LocalUseRequest(
+            artifact=run.artifact,
+            base_model_revision=model,
+            compatibility_group=group,
+            execution_target=target,
+            settings=_fixture_inference_settings(),
+            inputs=(
+                {"text": "Synthetic batch prompt one"},
+                {"text": "Synthetic batch prompt two"},
+            ),
+        )
+    )
+    exported = local.export(
+        AdapterExportRequest(
+            export_id="export-fixture-runtime",
+            artifact=run.artifact,
+            base_model_revision=model,
+            compatibility_group=group,
+            execution_target=target,
+        )
+    )
+    local.verify_export(
+        exported.record,
+        artifact=run.artifact,
+        base_model_revision=model,
+        compatibility_group=group,
+        execution_target=target,
+    )
+    store = TypedEvidenceStore(project_root)
+    verification = store.verify()
+    public = store.public_dump().value
+    return {
+        "schema_version": "v1",
+        "command": "fixture-workflow",
+        "status": "verified",
+        "evaluation_mode": evaluation_mode.value,
+        "project": record_reference(project).to_dict(),
+        "dataset_version": record_reference(prepared.version).to_dict(),
+        "recipe_resolution": record_reference(resolution).to_dict(),
+        "experiment": record_reference(experiment).to_dict(),
+        "run": record_reference(run.run).to_dict(),
+        "artifact": record_reference(run.artifact).to_dict(),
+        "focused_session": (
+            record_reference(focused.session).to_dict()
+            if focused.session is not None
+            else None
+        ),
+        "batch_output_count": len(batch.inference.outputs),
+        "adapter_export": record_reference(exported.record).to_dict(),
+        "store": verification.to_dict(),
+        "public_projection_verified": public["classification"] == "public_projection",
+        "hosted_deployment": False,
+        "deployment_ready": False,
+    }
+
+
+def _fixture_identity(label: str) -> ContentIdentity:
+    return ContentIdentity(
+        "sha256", hashlib.sha256(f"temper-public-fixture:{label}".encode()).hexdigest()
+    )
+
+
+def _fixture_inference_settings():
+    from temper_ml.runtime.fixture_inference import InferenceSettings
+
+    return InferenceSettings(temperature=0, maximum_tokens=32, seed=17)
 
 
 def _parse_identity(value: str) -> ContentIdentity:
@@ -260,3 +640,7 @@ def _write_bytes(stream: object, value: bytes) -> None:
         return
     write = getattr(stream, "write")
     write(value.decode("utf-8"))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

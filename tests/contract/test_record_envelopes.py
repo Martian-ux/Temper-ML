@@ -147,6 +147,11 @@ def test_published_schemas_pin_reference_types_and_zero_accelerator_parity() -> 
     assert dataset_ref["allOf"][1]["properties"]["record_type"]["const"] == (
         "dataset_version"
     )
+    runtime_request_ref = common["$defs"]["resolvedRuntimeRequestReference"]
+    assert (
+        runtime_request_ref["allOf"][1]["properties"]["record_type"]["const"]
+        == "resolved_runtime_request"
+    )
 
     experiment = json.loads(
         (records / "experiment.schema.json").read_text(encoding="utf-8")

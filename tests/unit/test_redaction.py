@@ -222,3 +222,25 @@ def test_dataset_public_projection_is_registered_but_fail_closed_on_all_fields()
         "fields": {},
     }
     assert result.redaction_count == len(source["fields"])
+
+
+def test_runtime_request_public_projection_is_registered_and_value_free() -> None:
+    source = {
+        "record_type": "resolved_runtime_request",
+        "schema_version": "v1",
+        "projection_version": "v1",
+        "fields": {
+            "request_id": "request-private",
+            "experiment_manifest_identity": {
+                "algorithm": "sha256",
+                "value": "a" * 64,
+            },
+            "evaluation_mode": "no_quality_evaluation",
+        },
+    }
+
+    result = redact_for_public_export(source, context=CONTEXT)
+
+    assert result.value["record_type"] == "resolved_runtime_request"
+    assert result.value["fields"] == {}
+    assert result.redaction_count == len(source["fields"])

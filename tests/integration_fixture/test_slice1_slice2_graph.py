@@ -49,7 +49,7 @@ from temper_ml.domain.records import (
     identity_fields,
     record_reference,
 )
-from temper_ml.domain.runs import Run
+from temper_ml.domain.runs import EvaluationMode, ResolvedRuntimeRequest, Run
 from temper_ml.domain.tasks import TaskDefinition
 from temper_ml.store.canonical_json import dumps_canonical_json
 from temper_ml.store.evidence import TypedEvidenceStore
@@ -297,16 +297,35 @@ def _complete_record_graph() -> tuple[TypedRecord, ...]:
         reason_code="dataset_revision",
         reason="Use the second committed synthetic dataset revision.",
     )
+    runtime_identity = _identity("runtime")
+    training_state_identity = _identity("training-state")
+    request = ResolvedRuntimeRequest(
+        request_id="request-graph",
+        experiment=record_reference(parent),
+        experiment_manifest_identity=parent.manifest_identity,
+        recipe_resolution=record_reference(resolution),
+        dataset_version_identity=dataset.identity,
+        rendered_dataset_identity=dataset.rendered_bytes_identity,
+        rendered_dataset_byte_count=dataset.rendered_bytes_count,
+        hardware_capability_profile=record_reference(profile),
+        execution_target=record_reference(target),
+        runtime_identity=runtime_identity,
+        preflight_identity=_identity("preflight"),
+        training_state_identity=training_state_identity,
+        evaluation_mode=EvaluationMode.NO_QUALITY_EVALUATION,
+        training_steps=resolution.training_steps,
+        starting_step=0,
+    )
     run = Run(
-        "run-graph",
-        record_reference(parent),
-        parent.manifest_identity,
-        1,
-        record_reference(profile),
-        record_reference(target),
-        _identity("runtime"),
-        _identity("request"),
-        _identity("training-state"),
+        run_id="run-graph",
+        experiment=record_reference(parent),
+        experiment_manifest_identity=parent.manifest_identity,
+        attempt_number=1,
+        hardware_capability_profile=record_reference(profile),
+        execution_target=record_reference(target),
+        runtime_identity=runtime_identity,
+        request_identity=request.identity,
+        training_state_identity=training_state_identity,
     )
     storage = StorageReference("project_store", "adapter_primary")
     artifact = Artifact(
@@ -378,6 +397,7 @@ def _complete_record_graph() -> tuple[TypedRecord, ...]:
         derived,
         derivation.manifest_diff,
         derivation,
+        request,
         run,
         artifact,
         availability,

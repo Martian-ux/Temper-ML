@@ -6,6 +6,8 @@ from temper_ml.domain.projections import (
     projection_preimage,
 )
 from temper_ml.store.canonical_json import loads_canonical_json
+from temper_ml.runtime.fixture_adapter import FIXTURE_RUNTIME_IDENTITY
+from temper_ml.runtime.fixture_inference import FIXTURE_INFERENCE_IDENTITY
 
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "identity" / "project-policy-v1.json"
@@ -27,3 +29,9 @@ def test_content_identity_uses_explicit_projection_version_and_domain_prefix():
     assert str(identity) == (
         "sha256:db67380147829e194febebc4d1a67c8ee12f19fda03cacc7c9bc3d18493c472f"
     )
+
+
+def test_fixture_runtime_identities_are_versioned_and_stable():
+    assert FIXTURE_RUNTIME_IDENTITY.algorithm == "sha256"
+    assert FIXTURE_INFERENCE_IDENTITY.algorithm == "sha256"
+    assert FIXTURE_RUNTIME_IDENTITY != FIXTURE_INFERENCE_IDENTITY

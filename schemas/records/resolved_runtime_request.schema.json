@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "resolved_runtime_request.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "resolved_runtime_request"},
+        "payload": {
+          "type": "object",
+          "required": ["request_id", "experiment", "experiment_manifest_identity", "recipe_resolution", "dataset_version_identity", "rendered_dataset_identity", "rendered_dataset_byte_count", "hardware_capability_profile", "execution_target", "runtime_identity", "preflight_identity", "training_state_identity", "evaluation_mode", "training_steps", "starting_step", "resume_from_run", "resume_checkpoint_identity"],
+          "properties": {
+            "request_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "experiment": {"$ref": "common.schema.json#/$defs/experimentReference"},
+            "experiment_manifest_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "recipe_resolution": {"$ref": "common.schema.json#/$defs/recipeResolutionReference"},
+            "dataset_version_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "rendered_dataset_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "rendered_dataset_byte_count": {"type": "integer", "minimum": 0},
+            "hardware_capability_profile": {"$ref": "common.schema.json#/$defs/hardwareCapabilityProfileReference"},
+            "execution_target": {"$ref": "common.schema.json#/$defs/executionTargetReference"},
+            "runtime_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "preflight_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "training_state_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "evaluation_mode": {"enum": ["no_quality_evaluation", "light_evaluation", "full_suite", "experiment_loop"]},
+            "training_steps": {"type": "integer", "minimum": 1},
+            "starting_step": {"type": "integer", "minimum": 0},
+            "resume_from_run": {"oneOf": [{"type": "null"}, {"$ref": "common.schema.json#/$defs/runReference"}]},
+            "resume_checkpoint_identity": {"oneOf": [{"type": "null"}, {"$ref": "common.schema.json#/$defs/identity"}]}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

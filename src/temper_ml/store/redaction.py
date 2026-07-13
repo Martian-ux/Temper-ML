@@ -60,6 +60,7 @@ _PUBLIC_RECORD_FIELDS: dict[str, frozenset[str]] = {
         "project_policy",
         "recipe",
         "recipe_resolution",
+        "resolved_runtime_request",
         "run",
         "task_definition",
     )

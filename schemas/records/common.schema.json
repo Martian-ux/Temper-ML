@@ -51,6 +51,7 @@
     "projectPolicyReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "project_policy"}}}]},
     "recipeReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "recipe"}}}]},
     "recipeResolutionReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "recipe_resolution"}}}]},
+    "resolvedRuntimeRequestReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "resolved_runtime_request"}}}]},
     "runReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "run"}}}]},
     "taskDefinitionReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "task_definition"}}}]},
     "storageReference": {

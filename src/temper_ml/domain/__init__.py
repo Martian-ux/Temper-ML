@@ -6,6 +6,7 @@ from temper_ml.domain.artifacts import (
     ArtifactContentKind,
     AvailabilityState,
     StorageReference,
+    build_bytes_bundle_manifest,
 )
 from temper_ml.domain.base_models import BaseModelRevision
 from temper_ml.domain.compatibility import (
@@ -77,7 +78,7 @@ from temper_ml.domain.records import (
     RecordValidationError,
     record_reference,
 )
-from temper_ml.domain.runs import Run
+from temper_ml.domain.runs import EvaluationMode, ResolvedRuntimeRequest, Run
 from temper_ml.domain.tasks import TaskDefinition
 
 __all__ = [
@@ -86,6 +87,7 @@ __all__ = [
     "ArtifactAvailability",
     "ArtifactContentKind",
     "AvailabilityState",
+    "build_bytes_bundle_manifest",
     "BaseModelRevision",
     "BaselinePolicy",
     "CORE_LOGICAL_ID_FIELDS",
@@ -101,6 +103,7 @@ __all__ = [
     "DeduplicationMode",
     "DeduplicationRule",
     "ExecutionTarget",
+    "EvaluationMode",
     "ExclusionPhase",
     "ExclusionReceipt",
     "Experiment",
@@ -129,6 +132,7 @@ __all__ = [
     "RendererSpec",
     "ResumeCheckpoint",
     "ResumeRequest",
+    "ResolvedRuntimeRequest",
     "Run",
     "RuntimeTargetConstraint",
     "StorageReference",
