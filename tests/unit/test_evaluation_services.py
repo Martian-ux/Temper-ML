@@ -27,12 +27,23 @@ from temper_ml.domain.evaluations import (
     MetricObservation,
     OptimizationObjective,
     RecommendationPolicy,
+    Review,
+    ReviewCandidate,
+    ReviewEntry,
+    ReviewMode,
+    ReviewOutput,
+    ReviewRating,
+    ReviewStage,
     SuiteEvidenceState,
     UserDecision,
     UserDecisionStatus,
 )
 from temper_ml.domain.projections import ContentIdentity
-from temper_ml.domain.records import RecordValidationError, record_reference
+from temper_ml.domain.records import (
+    RecordReference,
+    RecordValidationError,
+    record_reference,
+)
 from temper_ml.domain.runs import EvaluationMode
 from temper_ml.store.evidence import TypedEvidenceStore
 
@@ -284,11 +295,56 @@ def test_confirmation_inspection_invalidates_old_results_for_new_recommendations
             accuracy=9,
             latency=2,
             status=EvidenceStatus.CONTAMINATED,
-            baseline_result=baseline,
         )
     )
     assert contaminated.suite_state is SuiteEvidenceState.UNSEALED
     assert contaminated.evidence_status is EvidenceStatus.CONTAMINATED
+
+
+def test_service_rejects_confirmation_suite_for_experiment_loop_results(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    first, _, _ = _foundation(tmp_path, capsys)
+    service = EvaluationService(tmp_path)
+    confirmation = service.seal_suite(service.register_suite(_suite()))
+    confirmation_result = replace(
+        _result(
+            "result-experiment-confirmation-invalid",
+            first,
+            confirmation,
+            accuracy=9,
+            latency=2,
+        ),
+        evaluation_mode=EvaluationMode.EXPERIMENT_LOOP,
+    )
+
+    with pytest.raises(ApplicationServiceError, match="confirmation_suite_invalid"):
+        service.record_result(confirmation_result)
+
+    development = service.seal_suite(
+        service.register_suite(
+            replace(
+                _suite(),
+                suite_id="suite-experiment-development",
+                kind=CaseSuiteKind.DEVELOPMENT,
+            )
+        )
+    )
+    accepted = service.record_result(
+        replace(
+            _result(
+                "result-experiment-development",
+                first,
+                development,
+                accuracy=9,
+                latency=2,
+            ),
+            evaluation_mode=EvaluationMode.EXPERIMENT_LOOP,
+        )
+    )
+    assert accepted.evaluation_mode is EvaluationMode.EXPERIMENT_LOOP
+    assert accepted.suite == record_reference(development)
 
 
 def test_service_rejects_undeclared_metrics_and_conflicting_logical_revisions(
@@ -452,4 +508,241 @@ def test_result_admission_binds_integrity_and_baselines_to_exact_evidence(
             )
         )
 
+    other_suite = service.seal_suite(
+        service.register_suite(
+            replace(_suite(), suite_id="suite-binding-other-context")
+        )
+    )
+    other_suite_baseline = service.record_result(
+        _result(
+            "result-binding-other-suite-baseline",
+            baseline_artifact,
+            other_suite,
+            accuracy=7,
+            latency=5,
+        )
+    )
+    with pytest.raises(ApplicationServiceError, match="suite_context_mismatch"):
+        service.record_result(
+            replace(
+                valid,
+                result_id="result-binding-cross-suite",
+                baseline_comparisons=(
+                    replace(
+                        comparison,
+                        baseline=record_reference(other_suite_baseline),
+                    ),
+                ),
+            )
+        )
+
+    cross_mode_baseline = replace(
+        baseline,
+        result_id="result-binding-cross-mode-baseline",
+        evaluation_mode=EvaluationMode.EXPERIMENT_LOOP,
+    )
+    service.store.write_record(cross_mode_baseline)
+    with pytest.raises(ApplicationServiceError, match="evaluation_mode_mismatch"):
+        service.record_result(
+            replace(
+                valid,
+                result_id="result-binding-cross-mode",
+                baseline_comparisons=(
+                    replace(
+                        comparison,
+                        baseline=record_reference(cross_mode_baseline),
+                    ),
+                ),
+            )
+        )
+
+    wrong_state_baseline = replace(
+        baseline,
+        result_id="result-binding-wrong-state-baseline",
+        suite_state=SuiteEvidenceState.UNSEALED,
+    )
+    service.store.write_record(wrong_state_baseline)
+    with pytest.raises(ApplicationServiceError, match="suite_context_mismatch"):
+        service.record_result(
+            replace(
+                valid,
+                result_id="result-binding-cross-state",
+                baseline_comparisons=(
+                    replace(
+                        comparison,
+                        baseline=record_reference(wrong_state_baseline),
+                    ),
+                ),
+            )
+        )
+
+    subjective_review = service.record_solo_review(
+        Review(
+            "review-binding-subjective",
+            ReviewMode.SOLO,
+            ReviewStage.RECORDED,
+            (
+                ReviewEntry(
+                    "prompt-binding-subjective",
+                    {"text": "Inspect the synthetic baseline."},
+                    {"temperature": 0},
+                    (
+                        ReviewOutput(
+                            "candidate-001",
+                            {"text": "Synthetic baseline output"},
+                        ),
+                    ),
+                    "The synthetic output was inspected.",
+                    (ReviewRating("candidate-001", "task-fit", 1),),
+                ),
+            ),
+            "I inspected the synthetic baseline output.",
+            (
+                ReviewCandidate(
+                    "candidate-001",
+                    record_reference(baseline_artifact),
+                ),
+            ),
+            False,
+        )
+    )
+    for invalid_status in (
+        EvidenceStatus.CONTAMINATED,
+        EvidenceStatus.INCONCLUSIVE,
+        EvidenceStatus.SUBJECTIVE_ONLY,
+        EvidenceStatus.UNEVALUATED,
+    ):
+        invalid_status_baseline = replace(
+            baseline,
+            result_id=f"result-binding-{invalid_status.value}-baseline",
+            evidence_status=invalid_status,
+            review=(
+                record_reference(subjective_review)
+                if invalid_status is EvidenceStatus.SUBJECTIVE_ONLY
+                else None
+            ),
+        )
+        service.store.write_record(invalid_status_baseline)
+        with pytest.raises(ApplicationServiceError, match="evidence_status_invalid"):
+            service.record_result(
+                replace(
+                    valid,
+                    result_id=f"result-binding-{invalid_status.value}",
+                    baseline_comparisons=(
+                        replace(
+                            comparison,
+                            baseline=record_reference(invalid_status_baseline),
+                        ),
+                    ),
+                )
+            )
+
+    failed_integrity_baseline = replace(
+        baseline,
+        result_id="result-binding-failed-integrity-baseline",
+        artifact_integrity_status=ArtifactIntegrityStatus.FAILED,
+    )
+    service.store.write_record(failed_integrity_baseline)
+    with pytest.raises(ApplicationServiceError, match="artifact_integrity_invalid"):
+        service.record_result(
+            replace(
+                valid,
+                result_id="result-binding-failed-integrity",
+                baseline_comparisons=(
+                    replace(
+                        comparison,
+                        baseline=record_reference(failed_integrity_baseline),
+                    ),
+                ),
+            )
+        )
+
+    mismatched_integrity_baseline = replace(
+        baseline,
+        result_id="result-binding-mismatched-integrity-baseline",
+        artifact_integrity_evidence=_identity("mismatched-baseline-integrity"),
+    )
+    service.store.write_record(mismatched_integrity_baseline)
+    with pytest.raises(
+        ApplicationServiceError,
+        match="artifact_integrity_evidence_mismatch",
+    ):
+        service.record_result(
+            replace(
+                valid,
+                result_id="result-binding-mismatched-integrity",
+                baseline_comparisons=(
+                    replace(
+                        comparison,
+                        baseline=record_reference(mismatched_integrity_baseline),
+                    ),
+                ),
+            )
+        )
+
+    with pytest.raises(ApplicationServiceError, match="record_reference_not_found"):
+        service.record_result(
+            replace(
+                valid,
+                result_id="result-binding-missing-baseline",
+                baseline_comparisons=(
+                    replace(
+                        comparison,
+                        baseline=RecordReference(
+                            "evaluation_result",
+                            "result-binding-missing",
+                            _identity("result-binding-missing"),
+                        ),
+                    ),
+                ),
+            )
+        )
+
+    failed_policy_baseline = service.record_result(
+        replace(
+            baseline,
+            result_id="result-binding-objective-policy-failure",
+            evidence_status=EvidenceStatus.FAILED,
+        )
+    )
+    comparable_to_failed = service.record_result(
+        replace(
+            valid,
+            result_id="result-binding-objective-policy-failure-comparison",
+            baseline_comparisons=(
+                replace(
+                    comparison,
+                    baseline=record_reference(failed_policy_baseline),
+                ),
+            ),
+        )
+    )
+    assert (
+        comparable_to_failed.baseline_comparisons[0].outcome is BaselineOutcome.BETTER
+    )
+
     assert service.record_result(valid) == valid
+
+    missing_artifact_baseline = replace(
+        baseline,
+        result_id="result-binding-missing-artifact-baseline",
+        candidate=RecordReference(
+            "artifact",
+            "artifact-binding-missing",
+            _identity("artifact-binding-missing"),
+        ),
+    )
+    service.store.write_record(missing_artifact_baseline)
+    with pytest.raises(ApplicationServiceError, match="record_reference_not_found"):
+        service.record_result(
+            replace(
+                valid,
+                result_id="result-binding-missing-artifact",
+                baseline_comparisons=(
+                    replace(
+                        comparison,
+                        baseline=record_reference(missing_artifact_baseline),
+                    ),
+                ),
+            )
+        )

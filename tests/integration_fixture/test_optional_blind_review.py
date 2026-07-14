@@ -21,6 +21,8 @@ from temper_ml.domain.evaluations import (
     EvidenceStatus,
     Review,
     ReviewCandidate,
+    ReviewEntry,
+    ReviewMode,
     ReviewRating,
     ReviewStage,
 )
@@ -291,6 +293,115 @@ def test_blind_review_transition_retries_recover_records_and_missing_events(
     assert len(reveal_events) == 1
 
 
+def test_blind_reveal_recomputes_sealed_payload_identity_from_committed_mapping(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    first, second = _artifacts(tmp_path, capsys)
+    service = EvaluationService(tmp_path)
+    packet = service.prepare_blind_review(
+        "review-blind-sealed-payload-tamper",
+        _inputs(first, second),
+    )
+    preparation = next(
+        stored.record
+        for stored in service.store.iter_records()
+        if isinstance(stored.record, Review)
+        and stored.record.review_id == packet.packet_id
+        and stored.record.stage is ReviewStage.BLIND_PREPARED
+    )
+    judgments = {item.prompt_id: item for item in _judgments(packet)}
+    entries = tuple(
+        ReviewEntry(
+            entry.prompt_id,
+            entry.prompt,
+            entry.settings,
+            entry.outputs,
+            judgments[entry.prompt_id].notes,
+            judgments[entry.prompt_id].ratings,
+        )
+        for entry in packet.entries
+    )
+    tampered_entries = (
+        replace(
+            entries[0],
+            prompt={"text": "Altered synthetic prompt after packet commitment."},
+        ),
+        *entries[1:],
+    )
+    tampered_sealed = Review(
+        review_id=packet.packet_id,
+        mode=ReviewMode.BLIND,
+        stage=ReviewStage.BLIND_SEALED,
+        entries=tampered_entries,
+        reviewer_declaration=(
+            "I judged every alias before candidate identities were revealed."
+        ),
+        candidate_mappings=(),
+        leak_audit_passed=True,
+        packet_identity=packet.packet_identity,
+        prior_review=record_reference(preparation),
+    )
+    service.store.write_record(tampered_sealed)
+
+    with pytest.raises(ApplicationServiceError, match="review_revision_conflict"):
+        service.reveal_blind_review(tampered_sealed, packet)
+
+
+@pytest.mark.parametrize("tamper", ("reviewer_declaration", "candidate_mappings"))
+def test_blind_reveal_rejects_mutated_sealed_lineage_fields(
+    tmp_path: Path,
+    capsys,
+    tamper: str,
+) -> None:
+    first, second = _artifacts(tmp_path, capsys)
+    service = EvaluationService(tmp_path)
+    packet = service.prepare_blind_review(
+        f"review-blind-lineage-{tamper}",
+        _inputs(first, second),
+    )
+    sealed = service.seal_blind_review(
+        packet.packet_id,
+        packet,
+        _judgments(packet),
+        reviewer_declaration=(
+            "I judged every alias before candidate identities were revealed."
+        ),
+    )
+    preparation = next(
+        stored.record
+        for stored in service.store.iter_records()
+        if isinstance(stored.record, Review)
+        and stored.record.review_id == packet.packet_id
+        and stored.record.stage is ReviewStage.BLIND_PREPARED
+    )
+    candidate_mappings = preparation.candidate_mappings
+    reviewer_declaration = sealed.reviewer_declaration
+    if tamper == "reviewer_declaration":
+        reviewer_declaration = "Altered declaration after judgment sealing."
+    else:
+        candidates = tuple(mapping.candidate for mapping in candidate_mappings)
+        candidate_mappings = tuple(
+            ReviewCandidate(mapping.alias, candidate)
+            for mapping, candidate in zip(
+                candidate_mappings,
+                reversed(candidates),
+                strict=True,
+            )
+        )
+    tampered_reveal = replace(
+        sealed,
+        stage=ReviewStage.BLIND_REVEALED,
+        reviewer_declaration=reviewer_declaration,
+        candidate_mappings=candidate_mappings,
+        prior_review=record_reference(sealed),
+    )
+    service.store.write_record(tampered_reveal)
+
+    with pytest.raises(ApplicationServiceError, match="review_revision_conflict"):
+        service.reveal_blind_review(sealed, packet)
+
+
 def test_blind_review_lineage_rejects_reveal_forks(
     tmp_path: Path,
     capsys,
@@ -362,6 +473,91 @@ def test_blind_packet_leak_audit_rejects_candidate_identifiers(
 
     with pytest.raises(ApplicationServiceError, match="leak_detected"):
         service.prepare_blind_review("packet-leaky", (leaky,))
+    assert not any(
+        isinstance(stored.record, Review) for stored in service.store.iter_records()
+    )
+
+
+@pytest.mark.parametrize(
+    ("prompt", "settings", "output", "private_marker"),
+    (
+        (
+            {"api_token": "fixture-sensitive-value"},
+            {"temperature": 0},
+            {"text": "Synthetic neutral output"},
+            "api_token",
+        ),
+        (
+            {"text": "Synthetic prompt"},
+            {"contact": "reviewer@example.invalid"},
+            {"text": "Synthetic neutral output"},
+            "reviewer@example.invalid",
+        ),
+        (
+            {"text": "Synthetic prompt"},
+            {"temperature": 0},
+            {"text": "C:\\fixture-private\\review-output.txt"},
+            "fixture-private",
+        ),
+        (
+            {"text": "Synthetic prompt"},
+            {"temperature": 0},
+            {"text": "https://private.invalid/review-output"},
+            "private.invalid",
+        ),
+        (
+            {"text": "fixture-local-user"},
+            {"temperature": 0},
+            {"text": "Synthetic neutral output"},
+            "fixture-local-user",
+        ),
+        (
+            {"text": "Synthetic prompt"},
+            {"label": "fixture-local-host"},
+            {"text": "Synthetic neutral output"},
+            "fixture-local-host",
+        ),
+    ),
+)
+def test_blind_packet_canonical_admission_rejects_private_fields_without_echo(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    prompt,
+    settings,
+    output,
+    private_marker: str,
+) -> None:
+    first, second = _artifacts(tmp_path, capsys)
+    monkeypatch.setattr(
+        evaluation_services.RedactionContext,
+        "current",
+        classmethod(
+            lambda cls: cls(
+                local_usernames=("fixture-local-user",),
+                local_hostnames=("fixture-local-host",),
+            )
+        ),
+    )
+    unsafe = BlindReviewInput(
+        "prompt-private-admission",
+        prompt,
+        settings,
+        (
+            BlindCandidateOutput(record_reference(first), output),
+            BlindCandidateOutput(
+                record_reference(second),
+                {"text": "Synthetic neutral alternative"},
+            ),
+        ),
+    )
+    service = EvaluationService(tmp_path)
+
+    with pytest.raises(ApplicationServiceError) as error:
+        service.prepare_blind_review("review-private-admission", (unsafe,))
+
+    assert str(error.value) == "blind_review_packet_public_safety_failed"
+    assert private_marker not in str(error.value)
     assert not any(
         isinstance(stored.record, Review) for stored in service.store.iter_records()
     )

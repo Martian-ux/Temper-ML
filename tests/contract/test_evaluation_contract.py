@@ -201,3 +201,75 @@ def test_evaluation_mode_schema_covers_all_adopted_modes() -> None:
         EvaluationMode.FULL_SUITE.value,
         EvaluationMode.EXPERIMENT_LOOP.value,
     ]
+
+
+def test_evaluation_modes_enforce_their_suite_evidence_contract() -> None:
+    candidate = _reference("artifact", "artifact-mode-contract")
+    suite = _reference("evaluation_suite", "suite-mode-contract")
+    metric = MetricObservation(
+        "accuracy",
+        EvaluatorKind.TASK_METRIC,
+        1,
+        MetricDirection.MAXIMIZE,
+    )
+    common = {
+        "candidate": candidate,
+        "artifact_integrity_status": ArtifactIntegrityStatus.PASSED,
+        "artifact_integrity_evidence": _identity("mode-contract-integrity"),
+    }
+
+    for mode in (EvaluationMode.FULL_SUITE, EvaluationMode.EXPERIMENT_LOOP):
+        with pytest.raises(RecordValidationError, match="require suite evidence"):
+            EvaluationResult(
+                result_id=f"result-{mode.value}-missing-suite",
+                evaluation_mode=mode,
+                evidence_status=EvidenceStatus.PASSED,
+                metrics=(metric,),
+                **common,
+            )
+        assert (
+            EvaluationResult(
+                result_id=f"result-{mode.value}-suite-backed",
+                evaluation_mode=mode,
+                evidence_status=EvidenceStatus.PASSED,
+                metrics=(metric,),
+                suite=suite,
+                suite_state=SuiteEvidenceState.SEALED,
+                **common,
+            ).suite
+            == suite
+        )
+
+    assert (
+        EvaluationResult(
+            result_id="result-light-without-suite",
+            evaluation_mode=EvaluationMode.LIGHT_EVALUATION,
+            evidence_status=EvidenceStatus.PASSED,
+            metrics=(metric,),
+            **common,
+        ).suite
+        is None
+    )
+    with pytest.raises(
+        RecordValidationError, match="must not reference suite evidence"
+    ):
+        EvaluationResult(
+            result_id="result-light-claiming-suite",
+            evaluation_mode=EvaluationMode.LIGHT_EVALUATION,
+            evidence_status=EvidenceStatus.PASSED,
+            metrics=(metric,),
+            suite=suite,
+            suite_state=SuiteEvidenceState.SEALED,
+            **common,
+        )
+    with pytest.raises(
+        RecordValidationError, match="must not reference suite evidence"
+    ):
+        EvaluationResult(
+            result_id="result-no-quality-claiming-suite",
+            evaluation_mode=EvaluationMode.NO_QUALITY_EVALUATION,
+            evidence_status=EvidenceStatus.UNEVALUATED,
+            suite=suite,
+            suite_state=SuiteEvidenceState.SEALED,
+            **common,
+        )

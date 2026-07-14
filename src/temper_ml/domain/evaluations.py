@@ -435,6 +435,22 @@ class EvaluationResult(TypedRecord):
             self.suite_state, SuiteEvidenceState
         ):
             raise RecordValidationError("suite_state is invalid")
+        suite_backed_modes = (
+            EvaluationMode.FULL_SUITE,
+            EvaluationMode.EXPERIMENT_LOOP,
+        )
+        if self.evaluation_mode in suite_backed_modes and self.suite is None:
+            raise RecordValidationError(
+                "suite-backed evaluation modes require suite evidence"
+            )
+        if self.evaluation_mode not in suite_backed_modes and self.suite is not None:
+            raise RecordValidationError(
+                "non-suite evaluation modes must not reference suite evidence"
+            )
+        if self.baseline_comparisons and self.suite is None:
+            raise RecordValidationError(
+                "baseline comparisons require shared suite evidence"
+            )
         if self.review is not None:
             _require_reference("review", self.review, "review")
         object.__setattr__(

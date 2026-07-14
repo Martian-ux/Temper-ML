@@ -52,9 +52,15 @@ from temper_ml.domain.records import (
     require_text,
     thaw_json,
 )
+from temper_ml.domain.runs import EvaluationMode
 from temper_ml.store.canonical_json import dumps_canonical_json
 from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
 from temper_ml.store.event_stream import EventRequest
+from temper_ml.store.redaction import (
+    PublicSafetyError,
+    RedactionContext,
+    validate_canonical_admission,
+)
 
 BLIND_PACKET_PROJECTION = HashProjection("review.blind_packet", "v1")
 BLIND_MAPPING_PROJECTION = HashProjection("review.blind_mapping", "v1")
@@ -410,6 +416,15 @@ class EvaluationService:
             leak_audit_passed=True,
         )
         _audit_blind_packet(packet, mappings)
+        try:
+            validate_canonical_admission(
+                packet.public_fields(),
+                context=RedactionContext.current(),
+            )
+        except PublicSafetyError:
+            raise ApplicationServiceError(
+                "blind_review_packet_public_safety_failed"
+            ) from None
         if existing:
             if preparation.packet_identity != packet.packet_identity:
                 raise ApplicationServiceError("blind_review_packet_conflict")
@@ -529,7 +544,9 @@ class EvaluationService:
         preparation = self._require_blind_preparation(packet.packet_id, packet)
         mappings = preparation.candidate_mappings
         _audit_blind_packet(packet, mappings)
-        self._require_review_revision(sealed_review)
+        sealed_review = self._require_review_revision(sealed_review)
+        if not _sealed_review_matches_preparation(sealed_review, preparation):
+            raise ApplicationServiceError("blind_review_packet_mismatch")
         if sealed_review.packet_identity != packet.packet_identity:
             raise ApplicationServiceError("blind_review_packet_mismatch")
         if sealed_review.review_id != packet.packet_id:
@@ -560,6 +577,17 @@ class EvaluationService:
     def record_result(self, result: EvaluationResult) -> EvaluationResult:
         if not isinstance(result, EvaluationResult):
             raise ApplicationServiceError("evaluation_result_invalid")
+        suite_backed_modes = (
+            EvaluationMode.FULL_SUITE,
+            EvaluationMode.EXPERIMENT_LOOP,
+        )
+        if result.evaluation_mode in suite_backed_modes and result.suite is None:
+            raise ApplicationServiceError("evaluation_suite_required_for_mode")
+        if (
+            result.evaluation_mode not in suite_backed_modes
+            and result.suite is not None
+        ):
+            raise ApplicationServiceError("evaluation_suite_mode_mismatch")
         candidate_record = self._require_reference(result.candidate, "artifact")
         if not isinstance(candidate_record, Artifact):
             raise ApplicationServiceError("evaluation_candidate_reference_invalid")
@@ -580,6 +608,13 @@ class EvaluationService:
                 raise ApplicationServiceError("evaluation_suite_state_mismatch")
             if suite.state is SuiteEvidenceState.RETIRED:
                 raise ApplicationServiceError("evaluation_suite_retired")
+            if (
+                result.evaluation_mode is EvaluationMode.EXPERIMENT_LOOP
+                and suite.kind is CaseSuiteKind.CONFIRMATION
+            ):
+                raise ApplicationServiceError(
+                    "experiment_loop_confirmation_suite_invalid"
+                )
             if (
                 suite.kind is CaseSuiteKind.CONFIRMATION
                 and suite.state
@@ -626,6 +661,38 @@ class EvaluationService:
                 raise ApplicationServiceError("baseline_evidence_invalid")
             if baseline_record.candidate == result.candidate:
                 raise ApplicationServiceError("baseline_candidate_self_reference")
+            if baseline_record.evaluation_mode is not result.evaluation_mode:
+                raise ApplicationServiceError("baseline_evaluation_mode_mismatch")
+            if (
+                result.suite is None
+                or result.suite_state is None
+                or baseline_record.suite != result.suite
+                or baseline_record.suite_state is not result.suite_state
+            ):
+                raise ApplicationServiceError("baseline_suite_context_mismatch")
+            baseline_candidate = self._require_reference(
+                baseline_record.candidate,
+                "artifact",
+            )
+            if not isinstance(baseline_candidate, Artifact):
+                raise ApplicationServiceError("baseline_candidate_reference_invalid")
+            if (
+                baseline_record.artifact_integrity_status
+                is not ArtifactIntegrityStatus.PASSED
+            ):
+                raise ApplicationServiceError("baseline_artifact_integrity_invalid")
+            if (
+                baseline_record.artifact_integrity_evidence
+                != baseline_candidate.integrity_evidence
+            ):
+                raise ApplicationServiceError(
+                    "baseline_artifact_integrity_evidence_mismatch"
+                )
+            if baseline_record.evidence_status not in (
+                EvidenceStatus.PASSED,
+                EvidenceStatus.FAILED,
+            ):
+                raise ApplicationServiceError("baseline_evidence_status_invalid")
             candidate_metric = candidate_metrics.get(comparison.metric_name)
             baseline_metric = next(
                 (
@@ -998,6 +1065,11 @@ class EvaluationService:
         if len(by_reference) != len(revisions) or len(roots) != 1:
             raise ApplicationServiceError("review_revision_conflict")
         root = roots[0]
+        if (
+            root.mode is ReviewMode.BLIND
+            and root.stage is not ReviewStage.BLIND_PREPARED
+        ):
+            raise ApplicationServiceError("review_revision_conflict")
         successors: dict[RecordReference, Review] = {}
         allowed_transitions = {
             (ReviewStage.BLIND_PREPARED, ReviewStage.BLIND_SEALED),
@@ -1013,6 +1085,11 @@ class EvaluationService:
                 or revision.mode is not root.mode
                 or (predecessor.stage, revision.stage) not in allowed_transitions
                 or prior in successors
+                or not _blind_review_transition_is_valid(
+                    root,
+                    predecessor,
+                    revision,
+                )
             ):
                 raise ApplicationServiceError("review_revision_conflict")
             successors[prior] = revision
@@ -1178,6 +1255,82 @@ def _blind_mapping_commitment(
             "mappings": [mapping.to_dict() for mapping in mappings],
         },
     )
+
+
+def _review_packet_entries(review: Review) -> tuple[BlindPacketEntry, ...]:
+    return tuple(
+        BlindPacketEntry(
+            prompt_id=entry.prompt_id,
+            prompt=entry.prompt,
+            settings=entry.settings,
+            outputs=entry.outputs,
+        )
+        for entry in review.entries
+    )
+
+
+def _sealed_review_matches_preparation(
+    sealed: Review,
+    preparation: Review,
+) -> bool:
+    hiding_nonce = preparation.hiding_nonce
+    if (
+        sealed.mode is not ReviewMode.BLIND
+        or sealed.stage is not ReviewStage.BLIND_SEALED
+        or preparation.mode is not ReviewMode.BLIND
+        or preparation.stage is not ReviewStage.BLIND_PREPARED
+        or hiding_nonce is None
+        or sealed.review_id != preparation.review_id
+        or sealed.packet_identity != preparation.packet_identity
+    ):
+        return False
+    commitment = _blind_mapping_commitment(
+        hiding_nonce,
+        preparation.candidate_mappings,
+    )
+    return sealed.packet_identity == _blind_packet_identity(
+        sealed.review_id,
+        _review_packet_entries(sealed),
+        commitment,
+    )
+
+
+def _blind_review_transition_is_valid(
+    root: Review,
+    predecessor: Review,
+    revision: Review,
+) -> bool:
+    if (
+        root.mode is not ReviewMode.BLIND
+        or root.stage is not ReviewStage.BLIND_PREPARED
+        or root.hiding_nonce is None
+        or revision.review_id != root.review_id
+        or revision.mode is not root.mode
+        or revision.leak_audit_passed is not root.leak_audit_passed
+        or revision.packet_identity != root.packet_identity
+    ):
+        return False
+    committed_aliases = tuple(mapping.alias for mapping in root.candidate_mappings)
+    if predecessor.stage is ReviewStage.BLIND_PREPARED:
+        return (
+            predecessor == root
+            and revision.stage is ReviewStage.BLIND_SEALED
+            and revision.candidate_mappings == ()
+            and bool(revision.entries)
+            and revision.entries[0].aliases == committed_aliases
+            and _sealed_review_matches_preparation(revision, root)
+        )
+    if predecessor.stage is ReviewStage.BLIND_SEALED:
+        return (
+            revision.stage is ReviewStage.BLIND_REVEALED
+            and revision.entries == predecessor.entries
+            and revision.reviewer_declaration == predecessor.reviewer_declaration
+            and revision.candidate_mappings == root.candidate_mappings
+            and bool(revision.entries)
+            and revision.entries[0].aliases == committed_aliases
+            and _sealed_review_matches_preparation(predecessor, root)
+        )
+    return False
 
 
 def _audit_blind_packet(
