@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "recommendation_policy.schema.json",
+  "$defs": {
+    "hardQualifier": {
+      "type": "object",
+      "required": ["metric_name", "operator", "threshold", "tolerance"],
+      "properties": {
+        "metric_name": {"$ref": "common.schema.json#/$defs/identifier"},
+        "operator": {"enum": ["greater_than_or_equal", "less_than_or_equal", "greater_than", "less_than", "equal"]},
+        "threshold": {"type": ["integer", "number"]},
+        "tolerance": {"type": ["integer", "number"], "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "objective": {
+      "type": "object",
+      "required": ["metric_name", "direction", "tie_tolerance"],
+      "properties": {
+        "metric_name": {"$ref": "common.schema.json#/$defs/identifier"},
+        "direction": {"enum": ["maximize", "minimize"]},
+        "tie_tolerance": {"type": ["integer", "number"], "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "confidenceRule": {
+      "type": "object",
+      "required": ["label", "evidence_statuses", "suite_states", "minimum_metric_count"],
+      "properties": {
+        "label": {"enum": ["high", "medium", "low", "none"]},
+        "evidence_statuses": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"enum": ["passed", "failed", "inconclusive", "subjective_only", "unevaluated", "contaminated"]}
+        },
+        "suite_states": {
+          "type": "array",
+          "items": {"enum": ["sealed", "unsealed", "modified", "contaminated", "retired"]}
+        },
+        "minimum_metric_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "recommendation_policy"},
+        "payload": {
+          "type": "object",
+          "required": ["policy_id", "hard_qualifiers", "advisory_metrics", "objectives", "baseline_comparisons", "confidence_rules"],
+          "properties": {
+            "policy_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "hard_qualifiers": {"type": "array", "items": {"$ref": "#/$defs/hardQualifier"}},
+            "advisory_metrics": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/identifier"}},
+            "objectives": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/objective"}},
+            "baseline_comparisons": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/identifier"}},
+            "confidence_rules": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/confidenceRule"}}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

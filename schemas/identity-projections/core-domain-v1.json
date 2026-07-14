@@ -8,6 +8,8 @@
     {"record_type":"baseline_policy","record_schema_version":"v1","projection_name":"record.baseline_policy","projection_version":"v1","record_schema":"schemas/records/baseline_policy.schema.json"},
     {"record_type":"compatibility_group","record_schema_version":"v1","projection_name":"record.compatibility_group","projection_version":"v1","record_schema":"schemas/records/compatibility_group.schema.json"},
     {"record_type":"dataset_version","record_schema_version":"v1","projection_name":"record.dataset_version","projection_version":"v1","record_schema":"schemas/records/dataset_version.schema.json"},
+    {"record_type":"evaluation_result","record_schema_version":"v1","projection_name":"record.evaluation_result","projection_version":"v1","record_schema":"schemas/records/evaluation_result.schema.json"},
+    {"record_type":"evaluation_suite","record_schema_version":"v1","projection_name":"record.evaluation_suite","projection_version":"v1","record_schema":"schemas/records/evaluation_suite.schema.json"},
     {"record_type":"execution_target","record_schema_version":"v1","projection_name":"record.execution_target","projection_version":"v1","record_schema":"schemas/records/execution_target.schema.json"},
     {"record_type":"experiment","record_schema_version":"v1","projection_name":"record.experiment","projection_version":"v1","record_schema":"schemas/records/experiment.schema.json"},
     {"record_type":"experiment_derivation","record_schema_version":"v1","projection_name":"record.experiment_derivation","projection_version":"v1","record_schema":"schemas/records/experiment_derivation.schema.json"},
@@ -19,8 +21,12 @@
     {"record_type":"project_policy","record_schema_version":"v1","projection_name":"record.project_policy","projection_version":"v1","record_schema":"schemas/records/project_policy.schema.json"},
     {"record_type":"recipe","record_schema_version":"v1","projection_name":"record.recipe","projection_version":"v1","record_schema":"schemas/records/recipe.schema.json"},
     {"record_type":"recipe_resolution","record_schema_version":"v1","projection_name":"record.recipe_resolution","projection_version":"v1","record_schema":"schemas/records/recipe_resolution.schema.json"},
+    {"record_type":"recommendation","record_schema_version":"v1","projection_name":"record.recommendation","projection_version":"v1","record_schema":"schemas/records/recommendation.schema.json"},
+    {"record_type":"recommendation_policy","record_schema_version":"v1","projection_name":"record.recommendation_policy","projection_version":"v1","record_schema":"schemas/records/recommendation_policy.schema.json"},
     {"record_type":"resolved_runtime_request","record_schema_version":"v1","projection_name":"record.resolved_runtime_request","projection_version":"v1","record_schema":"schemas/records/resolved_runtime_request.schema.json"},
+    {"record_type":"review","record_schema_version":"v1","projection_name":"record.review","projection_version":"v1","record_schema":"schemas/records/review.schema.json"},
     {"record_type":"run","record_schema_version":"v1","projection_name":"record.run","projection_version":"v1","record_schema":"schemas/records/run.schema.json"},
-    {"record_type":"task_definition","record_schema_version":"v1","projection_name":"record.task_definition","projection_version":"v1","record_schema":"schemas/records/task_definition.schema.json"}
+    {"record_type":"task_definition","record_schema_version":"v1","projection_name":"record.task_definition","projection_version":"v1","record_schema":"schemas/records/task_definition.schema.json"},
+    {"record_type":"user_decision","record_schema_version":"v1","projection_name":"record.user_decision","projection_version":"v1","record_schema":"schemas/records/user_decision.schema.json"}
   ]
 }

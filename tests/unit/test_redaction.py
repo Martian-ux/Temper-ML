@@ -244,3 +244,41 @@ def test_runtime_request_public_projection_is_registered_and_value_free() -> Non
     assert result.value["record_type"] == "resolved_runtime_request"
     assert result.value["fields"] == {}
     assert result.redaction_count == len(source["fields"])
+
+
+@pytest.mark.parametrize(
+    "record_type",
+    (
+        "evaluation_result",
+        "evaluation_suite",
+        "recommendation",
+        "recommendation_policy",
+        "review",
+        "user_decision",
+    ),
+)
+def test_slice_six_public_record_projections_are_registered_and_value_free(
+    record_type: str,
+) -> None:
+    source = {
+        "record_type": record_type,
+        "schema_version": "v1",
+        "projection_version": "v1",
+        "fields": {
+            "logical_id": "synthetic-private-record",
+            "notes": "Synthetic private review material",
+            "identity": {"algorithm": "sha256", "value": "a" * 64},
+            "evidence_status": "passed",
+        },
+    }
+
+    result = redact_for_public_export(source, context=CONTEXT)
+
+    assert result.value == {
+        "record_type": record_type,
+        "source_schema_version": "v1",
+        "source_projection_version": "v1",
+        "public_record_projection_version": "v1",
+        "fields": {},
+    }
+    assert result.redaction_count == len(source["fields"])

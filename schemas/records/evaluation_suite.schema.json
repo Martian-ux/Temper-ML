@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "evaluation_suite.schema.json",
+  "$defs": {
+    "case": {
+      "type": "object",
+      "required": ["case_id", "content_identity"],
+      "properties": {
+        "case_id": {"$ref": "common.schema.json#/$defs/identifier"},
+        "content_identity": {"$ref": "common.schema.json#/$defs/identity"}
+      },
+      "additionalProperties": false
+    },
+    "evaluator": {
+      "type": "object",
+      "required": ["evaluator_id", "kind", "metric_name", "direction"],
+      "properties": {
+        "evaluator_id": {"$ref": "common.schema.json#/$defs/identifier"},
+        "kind": {"enum": ["deterministic_check", "held_out_loss", "task_metric", "format_check"]},
+        "metric_name": {"$ref": "common.schema.json#/$defs/identifier"},
+        "direction": {"enum": ["maximize", "minimize"]}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "evaluation_suite"},
+        "payload": {
+          "type": "object",
+          "required": ["suite_id", "kind", "state", "case_membership_identity", "cases", "evaluators", "prior_suite"],
+          "properties": {
+            "suite_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "kind": {"enum": ["development", "regression", "confirmation"]},
+            "state": {"enum": ["sealed", "unsealed", "modified", "contaminated", "retired"]},
+            "case_membership_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "cases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/case"}},
+            "evaluators": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/evaluator"}},
+            "prior_suite": {
+              "oneOf": [
+                {"$ref": "common.schema.json#/$defs/evaluationSuiteReference"},
+                {"type": "null"}
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

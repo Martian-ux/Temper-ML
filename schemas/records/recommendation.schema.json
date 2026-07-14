@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "recommendation.schema.json",
+  "$defs": {
+    "objectiveValue": {
+      "type": "object",
+      "required": ["metric_name", "value"],
+      "properties": {
+        "metric_name": {"$ref": "common.schema.json#/$defs/identifier"},
+        "value": {"type": ["integer", "number"]}
+      },
+      "additionalProperties": false
+    },
+    "assessment": {
+      "type": "object",
+      "required": ["candidate", "evaluation_result", "evidence_status", "suite_state", "qualified", "rank", "qualifier_failures", "objective_values"],
+      "properties": {
+        "candidate": {"$ref": "common.schema.json#/$defs/artifactReference"},
+        "evaluation_result": {"$ref": "common.schema.json#/$defs/evaluationResultReference"},
+        "evidence_status": {"enum": ["passed", "failed", "inconclusive", "subjective_only", "unevaluated", "contaminated"]},
+        "suite_state": {"type": ["string", "null"], "enum": ["sealed", "unsealed", "modified", "contaminated", "retired", null]},
+        "qualified": {"type": "boolean"},
+        "rank": {"type": ["integer", "null"], "minimum": 1},
+        "qualifier_failures": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/nonEmptyText"}},
+        "objective_values": {"type": "array", "items": {"$ref": "#/$defs/objectiveValue"}}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "recommendation"},
+        "payload": {
+          "type": "object",
+          "required": ["recommendation_id", "policy", "assessments", "selected_candidate", "pareto_alternatives", "conflicts", "confidence"],
+          "properties": {
+            "recommendation_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "policy": {"$ref": "common.schema.json#/$defs/recommendationPolicyReference"},
+            "assessments": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/assessment"}},
+            "selected_candidate": {
+              "oneOf": [
+                {"$ref": "common.schema.json#/$defs/artifactReference"},
+                {"type": "null"}
+              ]
+            },
+            "pareto_alternatives": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/artifactReference"}},
+            "conflicts": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/nonEmptyText"}},
+            "confidence": {"enum": ["high", "medium", "low", "none"]}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

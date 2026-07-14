@@ -152,6 +152,18 @@ def test_published_schemas_pin_reference_types_and_zero_accelerator_parity() -> 
         runtime_request_ref["allOf"][1]["properties"]["record_type"]["const"]
         == "resolved_runtime_request"
     )
+    for name, record_type in (
+        ("evaluationResultReference", "evaluation_result"),
+        ("evaluationSuiteReference", "evaluation_suite"),
+        ("recommendationReference", "recommendation"),
+        ("recommendationPolicyReference", "recommendation_policy"),
+        ("reviewReference", "review"),
+        ("userDecisionReference", "user_decision"),
+    ):
+        assert (
+            common["$defs"][name]["allOf"][1]["properties"]["record_type"]["const"]
+            == record_type
+        )
 
     experiment = json.loads(
         (records / "experiment.schema.json").read_text(encoding="utf-8")
