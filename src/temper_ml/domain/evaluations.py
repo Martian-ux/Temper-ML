@@ -1245,6 +1245,19 @@ def build_recommendation(
             qualified_results.append(result)
 
     qualified = tuple(qualified_results)
+    if qualified:
+        cohort = (
+            qualified[0].evaluation_mode,
+            qualified[0].suite,
+            qualified[0].suite_state,
+        )
+        if any(
+            (result.evaluation_mode, result.suite, result.suite_state) != cohort
+            for result in qualified[1:]
+        ):
+            raise RecordValidationError(
+                "recommendation results must share one evaluation cohort"
+            )
     cohort_keys = _global_tolerance_cohort_keys(qualified, policy)
     ranked = list(_rank_results(qualified, policy, cohort_keys=cohort_keys))
     rank_by_key = {

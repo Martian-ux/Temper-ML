@@ -308,6 +308,103 @@ def test_policy_engine_rejects_direction_and_cross_candidate_semantic_conflicts(
         )
 
 
+def test_policy_engine_rejects_different_suite_content_identities() -> None:
+    first = _result("artifact-suite-a", accuracy=9, latency=2)
+    second = replace(
+        _result("artifact-suite-b", accuracy=9, latency=2),
+        suite=RecordReference(
+            "evaluation_suite",
+            "suite-confirmation",
+            _identity("different-suite-content"),
+        ),
+    )
+
+    with pytest.raises(RecordValidationError, match="share one evaluation cohort"):
+        build_recommendation(
+            "recommendation-suite-identity-conflict",
+            _policy(),
+            (first, second),
+        )
+
+
+def test_policy_engine_rejects_different_suite_states() -> None:
+    sealed = _result("artifact-suite-sealed", accuracy=9, latency=2)
+    modified = replace(
+        _result("artifact-suite-modified", accuracy=9, latency=2),
+        suite_state=SuiteEvidenceState.MODIFIED,
+    )
+
+    with pytest.raises(RecordValidationError, match="share one evaluation cohort"):
+        build_recommendation(
+            "recommendation-suite-state-conflict",
+            _policy(),
+            (sealed, modified),
+        )
+
+
+def test_policy_engine_rejects_light_and_full_suite_results() -> None:
+    full = _result("artifact-full-suite", accuracy=9, latency=2)
+    light = replace(
+        _result("artifact-light", accuracy=9, latency=2),
+        evaluation_mode=EvaluationMode.LIGHT_EVALUATION,
+        suite=None,
+        suite_state=None,
+    )
+
+    with pytest.raises(RecordValidationError, match="share one evaluation cohort"):
+        build_recommendation(
+            "recommendation-mode-suite-conflict",
+            _policy(),
+            (full, light),
+        )
+
+
+def test_policy_engine_rejects_different_modes_on_one_development_suite() -> None:
+    development_suite = _reference("evaluation_suite", "suite-development")
+    full = replace(
+        _result("artifact-development-full", accuracy=9, latency=2),
+        suite=development_suite,
+    )
+    experiment = replace(
+        _result("artifact-development-loop", accuracy=9, latency=2),
+        evaluation_mode=EvaluationMode.EXPERIMENT_LOOP,
+        suite=development_suite,
+    )
+
+    with pytest.raises(RecordValidationError, match="share one evaluation cohort"):
+        build_recommendation(
+            "recommendation-suite-mode-conflict",
+            _policy(),
+            (full, experiment),
+        )
+
+
+def test_policy_engine_discloses_mixed_context_non_rankable_evidence() -> None:
+    selected = _result("artifact-selected", accuracy=9, latency=2)
+    non_rankable = replace(
+        _result("artifact-non-rankable", accuracy=9, latency=2),
+        evaluation_mode=EvaluationMode.LIGHT_EVALUATION,
+        evidence_status=EvidenceStatus.INCONCLUSIVE,
+        suite=None,
+        suite_state=None,
+    )
+
+    recommendation = build_recommendation(
+        "recommendation-mixed-context-disclosure",
+        _policy(),
+        (non_rankable, selected),
+    )
+
+    assert recommendation.selected_candidate == selected.candidate
+    assert tuple(item.candidate for item in recommendation.assessments) == (
+        non_rankable.candidate,
+        selected.candidate,
+    )
+    assert recommendation.assessments[0].qualifier_failures == (
+        "evidence_status:inconclusive",
+    )
+
+
 def test_no_quality_result_keeps_integrity_separate_and_quality_unevaluated() -> None:
     result = EvaluationResult(
         result_id="result-no-quality",
