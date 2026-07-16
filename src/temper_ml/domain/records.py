@@ -54,6 +54,8 @@ _CORE_RECORD_TYPES = (
     "compatibility_group",
     "dataset_version",
     "execution_target",
+    "evaluation_result",
+    "evaluation_suite",
     "experiment",
     "experiment_derivation",
     "hardware_capability_profile",
@@ -64,9 +66,13 @@ _CORE_RECORD_TYPES = (
     "project_policy",
     "recipe",
     "recipe_resolution",
+    "recommendation",
+    "recommendation_policy",
     "resolved_runtime_request",
+    "review",
     "run",
     "task_definition",
+    "user_decision",
 )
 
 CORE_LOGICAL_ID_FIELDS = MappingProxyType(
@@ -79,6 +85,8 @@ CORE_LOGICAL_ID_FIELDS = MappingProxyType(
         "compatibility_group": "group_id",
         "dataset_version": "version_id",
         "execution_target": "target_id",
+        "evaluation_result": "result_id",
+        "evaluation_suite": "suite_id",
         "experiment": "experiment_id",
         "experiment_derivation": "derivation_id",
         "hardware_capability_profile": "profile_id",
@@ -89,9 +97,13 @@ CORE_LOGICAL_ID_FIELDS = MappingProxyType(
         "project_policy": "policy_id",
         "recipe": "recipe_id",
         "recipe_resolution": "resolution_id",
+        "recommendation": "recommendation_id",
+        "recommendation_policy": "policy_id",
         "resolved_runtime_request": "request_id",
+        "review": "review_id",
         "run": "run_id",
         "task_definition": "task_id",
+        "user_decision": "decision_id",
     }
 )
 

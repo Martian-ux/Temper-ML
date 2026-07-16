@@ -109,6 +109,8 @@
         "baseline_policy",
         "compatibility_group",
         "dataset_version",
+        "evaluation_result",
+        "evaluation_suite",
         "execution_target",
         "experiment",
         "experiment_derivation",
@@ -120,9 +122,13 @@
         "project_policy",
         "recipe",
         "recipe_resolution",
+        "recommendation",
+        "recommendation_policy",
         "resolved_runtime_request",
+        "review",
         "run",
-        "task_definition"
+        "task_definition",
+        "user_decision"
       ],
       "type": "string"
     }

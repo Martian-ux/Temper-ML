@@ -50,6 +50,8 @@ _PUBLIC_RECORD_FIELDS: dict[str, frozenset[str]] = {
         "compatibility_group",
         "dataset_version",
         "execution_target",
+        "evaluation_result",
+        "evaluation_suite",
         "experiment",
         "experiment_derivation",
         "hardware_capability_profile",
@@ -60,9 +62,13 @@ _PUBLIC_RECORD_FIELDS: dict[str, frozenset[str]] = {
         "project_policy",
         "recipe",
         "recipe_resolution",
+        "recommendation",
+        "recommendation_policy",
         "resolved_runtime_request",
+        "review",
         "run",
         "task_definition",
+        "user_decision",
     )
 }
 _PUBLIC_AGGREGATE_KEYS = {"event_count"}

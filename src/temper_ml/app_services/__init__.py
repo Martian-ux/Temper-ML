@@ -21,6 +21,14 @@ from temper_ml.app_services.datasets import (
     SplitChange,
 )
 from temper_ml.app_services.errors import ApplicationServiceError
+from temper_ml.app_services.evaluations import (
+    BlindCandidateOutput,
+    BlindPacketEntry,
+    BlindReviewInput,
+    BlindReviewJudgment,
+    BlindReviewPacket,
+    EvaluationService,
+)
 from temper_ml.app_services.experiments import (
     ExperimentFreezeRequest,
     ExperimentService,
@@ -54,6 +62,11 @@ from temper_ml.app_services.runs import (
 __all__ = [
     "ApplicationServiceError",
     "AdapterExportRequest",
+    "BlindCandidateOutput",
+    "BlindPacketEntry",
+    "BlindReviewInput",
+    "BlindReviewJudgment",
+    "BlindReviewPacket",
     "CorrectionReport",
     "CsvDatasetAdapter",
     "DatasetAdapterError",
@@ -64,6 +77,7 @@ __all__ = [
     "ExclusionReasonCount",
     "ExperimentFreezeRequest",
     "ExperimentService",
+    "EvaluationService",
     "HuggingFaceRowsDatasetAdapter",
     "ImportedSource",
     "JsonDatasetAdapter",

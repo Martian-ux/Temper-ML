@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "user_decision.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "user_decision"},
+        "payload": {
+          "type": "object",
+          "required": ["decision_id", "recommendation", "candidate", "status", "evidence_status_at_decision", "override_reason"],
+          "properties": {
+            "decision_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "recommendation": {"$ref": "common.schema.json#/$defs/recommendationReference"},
+            "candidate": {"$ref": "common.schema.json#/$defs/artifactReference"},
+            "status": {"enum": ["selected", "rejected", "pinned", "deprecated", "archived", "deployment_override"]},
+            "evidence_status_at_decision": {"enum": ["passed", "failed", "inconclusive", "subjective_only", "unevaluated", "contaminated"]},
+            "override_reason": {
+              "oneOf": [
+                {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+                {"type": "null"}
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

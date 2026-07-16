@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "evaluation_result.schema.json",
+  "$defs": {
+    "metric": {
+      "type": "object",
+      "required": ["metric_name", "evaluator_kind", "value", "direction"],
+      "properties": {
+        "metric_name": {"$ref": "common.schema.json#/$defs/identifier"},
+        "evaluator_kind": {"enum": ["deterministic_check", "held_out_loss", "task_metric", "format_check"]},
+        "value": {"type": ["integer", "number"]},
+        "direction": {"enum": ["maximize", "minimize"]}
+      },
+      "additionalProperties": false
+    },
+    "baselineComparison": {
+      "type": "object",
+      "required": ["comparison_id", "metric_name", "baseline", "candidate_value", "baseline_value", "outcome"],
+      "properties": {
+        "comparison_id": {"$ref": "common.schema.json#/$defs/identifier"},
+        "metric_name": {"$ref": "common.schema.json#/$defs/identifier"},
+        "baseline": {"$ref": "common.schema.json#/$defs/evaluationResultReference"},
+        "candidate_value": {"type": ["integer", "number"]},
+        "baseline_value": {"type": ["integer", "number"]},
+        "outcome": {"enum": ["better", "equivalent", "worse", "inconclusive"]}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "evaluation_result"},
+        "payload": {
+          "type": "object",
+          "required": ["result_id", "candidate", "evaluation_mode", "artifact_integrity_status", "artifact_integrity_evidence", "evidence_status", "metrics", "baseline_comparisons", "suite", "suite_state", "review", "conflicts"],
+          "properties": {
+            "result_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "candidate": {"$ref": "common.schema.json#/$defs/artifactReference"},
+            "evaluation_mode": {"enum": ["no_quality_evaluation", "light_evaluation", "full_suite", "experiment_loop"]},
+            "artifact_integrity_status": {"enum": ["passed", "failed"]},
+            "artifact_integrity_evidence": {"$ref": "common.schema.json#/$defs/identity"},
+            "evidence_status": {"enum": ["passed", "failed", "inconclusive", "subjective_only", "unevaluated", "contaminated"]},
+            "metrics": {"type": "array", "items": {"$ref": "#/$defs/metric"}},
+            "baseline_comparisons": {"type": "array", "items": {"$ref": "#/$defs/baselineComparison"}},
+            "suite": {
+              "oneOf": [
+                {"$ref": "common.schema.json#/$defs/evaluationSuiteReference"},
+                {"type": "null"}
+              ]
+            },
+            "suite_state": {"type": ["string", "null"], "enum": ["sealed", "unsealed", "modified", "contaminated", "retired", null]},
+            "review": {
+              "oneOf": [
+                {"$ref": "common.schema.json#/$defs/reviewReference"},
+                {"type": "null"}
+              ]
+            },
+            "conflicts": {"type": "array", "items": {"$ref": "common.schema.json#/$defs/nonEmptyText"}}
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

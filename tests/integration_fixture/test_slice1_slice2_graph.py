@@ -33,6 +33,35 @@ from temper_ml.domain.datasets import (
     split_membership_identity,
 )
 from temper_ml.domain.experiments import Experiment, derive_experiment
+from temper_ml.domain.evaluations import (
+    ArtifactIntegrityStatus,
+    CaseSuiteKind,
+    ComparisonOperator,
+    ConfidenceLabel,
+    ConfidenceRule,
+    EvaluationCase,
+    EvaluationResult,
+    EvaluationSuite,
+    EvaluatorKind,
+    EvaluatorSpec,
+    EvidenceStatus,
+    HardQualifier,
+    MetricDirection,
+    MetricObservation,
+    OptimizationObjective,
+    RecommendationPolicy,
+    Review,
+    ReviewCandidate,
+    ReviewEntry,
+    ReviewMode,
+    ReviewOutput,
+    ReviewRating,
+    ReviewStage,
+    SuiteEvidenceState,
+    UserDecision,
+    UserDecisionStatus,
+    build_recommendation,
+)
 from temper_ml.domain.hardware import (
     ExecutionTarget,
     HardwareCapabilityProfile,
@@ -380,6 +409,95 @@ def _complete_record_graph() -> tuple[TypedRecord, ...]:
         "temper_adapter_bundle",
         StorageReference("export_store", "adapter_export"),
     )
+    evaluation_suite = EvaluationSuite(
+        "suite-graph",
+        CaseSuiteKind.CONFIRMATION,
+        SuiteEvidenceState.UNSEALED,
+        (EvaluationCase("case-graph", _identity("evaluation-case-graph")),),
+        (
+            EvaluatorSpec(
+                "accuracy-check",
+                EvaluatorKind.TASK_METRIC,
+                "accuracy",
+                MetricDirection.MAXIMIZE,
+            ),
+        ),
+    )
+    review = Review(
+        "review-graph",
+        ReviewMode.SOLO,
+        ReviewStage.RECORDED,
+        (
+            ReviewEntry(
+                "review-prompt-graph",
+                {"text": "Synthetic evaluation prompt"},
+                {"temperature": 0, "maximum_tokens": 32},
+                (
+                    ReviewOutput(
+                        "candidate-graph",
+                        {"text": "Synthetic evaluation output"},
+                    ),
+                ),
+                "The synthetic output satisfies the fixture criterion.",
+                (ReviewRating("candidate-graph", "task_fit", 1),),
+            ),
+        ),
+        "I reviewed the synthetic fixture evidence.",
+        (ReviewCandidate("candidate-graph", record_reference(artifact)),),
+        False,
+    )
+    evaluation_result = EvaluationResult(
+        "result-graph",
+        record_reference(artifact),
+        EvaluationMode.FULL_SUITE,
+        ArtifactIntegrityStatus.PASSED,
+        artifact.integrity_evidence,
+        EvidenceStatus.PASSED,
+        metrics=(
+            MetricObservation(
+                "accuracy",
+                EvaluatorKind.TASK_METRIC,
+                1,
+                MetricDirection.MAXIMIZE,
+            ),
+        ),
+        suite=record_reference(evaluation_suite),
+        suite_state=evaluation_suite.state,
+        review=record_reference(review),
+    )
+    recommendation_policy = RecommendationPolicy(
+        "recommendation-policy-graph",
+        (
+            HardQualifier(
+                "accuracy",
+                ComparisonOperator.GREATER_THAN_OR_EQUAL,
+                1,
+            ),
+        ),
+        (),
+        (OptimizationObjective("accuracy", MetricDirection.MAXIMIZE),),
+        (),
+        (
+            ConfidenceRule(
+                ConfidenceLabel.HIGH,
+                (EvidenceStatus.PASSED,),
+                (SuiteEvidenceState.UNSEALED,),
+                1,
+            ),
+        ),
+    )
+    recommendation = build_recommendation(
+        "recommendation-graph",
+        recommendation_policy,
+        (evaluation_result,),
+    )
+    user_decision = UserDecision(
+        "decision-graph",
+        record_reference(recommendation),
+        record_reference(artifact),
+        UserDecisionStatus.SELECTED,
+        evaluation_result.evidence_status,
+    )
     return (
         dataset,
         task,
@@ -403,6 +521,12 @@ def _complete_record_graph() -> tuple[TypedRecord, ...]:
         availability,
         session,
         exported,
+        evaluation_suite,
+        evaluation_result,
+        recommendation_policy,
+        recommendation,
+        user_decision,
+        review,
     )
 
 

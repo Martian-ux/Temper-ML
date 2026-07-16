@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "review.schema.json",
+  "$defs": {
+    "output": {
+      "type": "object",
+      "required": ["alias", "output"],
+      "properties": {
+        "alias": {"$ref": "common.schema.json#/$defs/identifier"},
+        "output": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "rating": {
+      "type": "object",
+      "required": ["alias", "criterion", "rating"],
+      "properties": {
+        "alias": {"$ref": "common.schema.json#/$defs/identifier"},
+        "criterion": {"$ref": "common.schema.json#/$defs/identifier"},
+        "rating": {"type": ["integer", "number"]}
+      },
+      "additionalProperties": false
+    },
+    "entry": {
+      "type": "object",
+      "required": ["prompt_id", "prompt", "settings", "outputs", "notes", "ratings"],
+      "properties": {
+        "prompt_id": {"$ref": "common.schema.json#/$defs/identifier"},
+        "prompt": {"type": "object"},
+        "settings": {"type": "object"},
+        "outputs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/output"}},
+        "notes": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+        "ratings": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/rating"}}
+      },
+      "additionalProperties": false
+    },
+    "candidateMapping": {
+      "type": "object",
+      "required": ["alias", "candidate"],
+      "properties": {
+        "alias": {"$ref": "common.schema.json#/$defs/identifier"},
+        "candidate": {"$ref": "common.schema.json#/$defs/artifactReference"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "review"},
+        "payload": {
+          "type": "object",
+          "required": ["review_id", "mode", "stage", "entries", "reviewer_declaration", "candidate_mappings", "leak_audit_passed", "packet_identity", "prior_review", "hiding_nonce"],
+          "properties": {
+            "review_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "mode": {"enum": ["solo", "blind"]},
+            "stage": {"enum": ["recorded", "blind_prepared", "blind_sealed", "blind_revealed"]},
+            "entries": {"type": "array", "items": {"$ref": "#/$defs/entry"}},
+            "reviewer_declaration": {
+              "oneOf": [
+                {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+                {"type": "null"}
+              ]
+            },
+            "candidate_mappings": {"type": "array", "items": {"$ref": "#/$defs/candidateMapping"}},
+            "leak_audit_passed": {"type": "boolean"},
+            "packet_identity": {
+              "oneOf": [
+                {"$ref": "common.schema.json#/$defs/identity"},
+                {"type": "null"}
+              ]
+            },
+            "prior_review": {
+              "oneOf": [
+                {"$ref": "common.schema.json#/$defs/reviewReference"},
+                {"type": "null"}
+              ]
+            },
+            "hiding_nonce": {
+              "type": ["string", "null"],
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "mode": {"const": "solo"},
+                "stage": {"const": "recorded"},
+                "entries": {"minItems": 1},
+                "reviewer_declaration": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+                "candidate_mappings": {"minItems": 1},
+                "leak_audit_passed": {"const": false},
+                "packet_identity": {"type": "null"},
+                "prior_review": {"type": "null"},
+                "hiding_nonce": {"type": "null"}
+              }
+            },
+            {
+              "properties": {
+                "mode": {"const": "blind"},
+                "stage": {"const": "blind_prepared"},
+                "entries": {"maxItems": 0},
+                "reviewer_declaration": {"type": "null"},
+                "candidate_mappings": {"minItems": 1},
+                "leak_audit_passed": {"const": true},
+                "packet_identity": {"$ref": "common.schema.json#/$defs/identity"},
+                "prior_review": {"type": "null"},
+                "hiding_nonce": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              }
+            },
+            {
+              "properties": {
+                "mode": {"const": "blind"},
+                "stage": {"const": "blind_sealed"},
+                "entries": {"minItems": 1},
+                "reviewer_declaration": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+                "candidate_mappings": {"maxItems": 0},
+                "leak_audit_passed": {"const": true},
+                "packet_identity": {"$ref": "common.schema.json#/$defs/identity"},
+                "prior_review": {"$ref": "common.schema.json#/$defs/reviewReference"},
+                "hiding_nonce": {"type": "null"}
+              }
+            },
+            {
+              "properties": {
+                "mode": {"const": "blind"},
+                "stage": {"const": "blind_revealed"},
+                "entries": {"minItems": 1},
+                "reviewer_declaration": {"$ref": "common.schema.json#/$defs/nonEmptyText"},
+                "candidate_mappings": {"minItems": 1},
+                "leak_audit_passed": {"const": true},
+                "packet_identity": {"$ref": "common.schema.json#/$defs/identity"},
+                "prior_review": {"$ref": "common.schema.json#/$defs/reviewReference"},
+                "hiding_nonce": {"type": "null"}
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
