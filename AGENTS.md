@@ -39,13 +39,13 @@ Classify every task with `docs/workflow/policies/model-routing-policy.yaml` befo
 
 ## Model routing
 
-Prompt text never selects or proves a model. Record intended and user/API-selected model and reasoning effort. Record runtime-observed values when exposed; otherwise use `UNVERIFIED` and never claim verified compliance. Unknown user/API selection blocks dispatch. The Phase 1 public surface covers only routine administration, bounded mechanical work, normal implementation, cold technical review, and maintainer decision gates. Routine work uses the least expensive sufficient route, elevation requires explicit justification, and automatic review stacking is prohibited. Unexercised premium or diversity routes remain private.
+Prompt text never selects or proves a model. Record the declared route, exact user/API-selected model and reasoning effort, a structured executable selection mechanism, runtime-observation availability and source, actual runtime values when supported telemetry exposes them, declared-route compliance, and the independently predeclared experiment label. `UNAVAILABLE` observation and `UNVERIFIED` compliance are truthful states; they are not route failures and must never be reported as observed compliance. Unknown user/API selection or an unknown selection mechanism blocks implementation or reviewer launch. The Phase 1 public surface covers only routine administration, bounded mechanical work, normal implementation, cold technical review, and maintainer decision gates. Routine work uses the least expensive sufficient route, elevation requires explicit justification, and automatic review stacking is prohibited. Unexercised premium or diversity routes remain private. Follow `docs/workflow/procedures/model-route-and-experiment.md` for executable selection, telemetry, matched trials, scoring, and the result registry.
 
 ## Delegation and worker limits
 
-The effective worker limit is the minimum of the global ceiling, current-phase limit, task-class limit, packet limit, model-route limit, available non-conflicting ownership capacity, and explicit maintainer restriction. Fast mode is prohibited.
+The root task is the default and only routine implementation writer. Do not launch a routine writer subagent or a final-verifier agent. At most one independent read-only cold reviewer may be launched when the review matrix triggers it. The effective exceptional worker limit is the minimum of the global ceiling, current-phase limit, task-class limit, packet limit, model-route limit, available non-conflicting ownership capacity, and explicit maintainer restriction. Fast mode is prohibited for every subagent.
 
-Default active implementation writers: one. Phase 1 hard ceiling: two. A third implementation writer is prohibited. A second requires disjoint paths, independent acceptance criteria, no uncommitted-output dependency, no shared blocking decision, known integration order, and explicit recorded approval. Unknown or ambiguous ownership reduces capacity. No recursive delegation. Worker launching remains manual. Never retry an ambiguous spawn first.
+Default active implementation writers: one root writer. Phase 1 hard ceiling: two only for a non-routine, explicitly approved exception. A third implementation writer is prohibited. A second requires disjoint paths, independent acceptance criteria, no uncommitted-output dependency, no shared blocking decision, known integration order, and explicit recorded approval. Any exceptional writer also requires a durable task/subject/base/path-bound maintainer decision referenced at dispatch; a caller-supplied boolean is never authorization. Unknown or ambiguous ownership reduces capacity. No recursive delegation. Exceptional worker launching remains manual. Never retry an ambiguous spawn first.
 
 ## Task and path ownership
 
@@ -57,13 +57,15 @@ Use the latest valid private checkpoint and selective retrieval before summariza
 
 Use semantic boundaries such as phase completion, material scope or state change, superseded assumptions, repository/thread mismatch, obsolete logs, mission drift, current/history confusion, durable-record conflict, or a complete restart packet becoming available. Preserve typed current state: objective/phase, verified repository state, accepted decisions, blockers, task/ownership, evidence, reusable verification, risks, stop conditions, and exact next action. Semantic compaction is procedural in Phase 1, not a claim of automatic validator enforcement.
 
+Coordinate workers through completion, finding, blocked, error, or maintainer-input events. A bounded fallback heartbeat may reconcile lost events, but do not poll a worker merely to generate a user update. User-facing progress is a separate host obligation: send compact milestone or heartbeat updates at the host-required cadence during long work without replaying state or waking a worker.
+
 ## Verification-result reuse
 
-Query reusable verification before running checks. Workers run targeted checks; reviewers reuse them and run finding-specific checks only; one registered final-candidate verifier runs the full repository gate once after cold review and final assembly, before the maintainer integration decision. Bind results to exact subject identity, command semantics, scope, environment/lock identity, side effects, and invalidation conditions. When an untracked or generated input is relevant, bind its stable content identity, role, and scope; otherwise the result is `NON_REUSABLE`.
+Query reusable verification before running checks. The root writer runs targeted checks; reviewers reuse them and run finding-specific checks only. After cold review (when required) and final assembly, the root runs the full repository gate once for that immutable candidate revision. Never rerun it on unchanged bytes; evidence loss must be recorded before the exceptional replacement run. Bind results to exact subject identity, command semantics, scope, environment/lock identity, side effects, and invalidation conditions. When an untracked or generated input is relevant, bind its stable content identity, role, and scope; otherwise the result is `NON_REUSABLE`.
 
 ## Review requirements and multiplicity
 
-Multiple files alone do not require review. Protected boundaries require one cold Terra-high review. Other triggers require one independent review only when recorded by the matrix. Multiple triggers on one exact subject strengthen the rubric but do not create multiple reviewers. A second reviewer requires one concrete unresolved finding and a recorded reason that another perspective may resolve it. Do not automatically stack reviewers or model perspectives.
+Multiple files alone do not require review. Protected boundaries require one cold Terra-high review. Other triggers require one independent review only when recorded by the matrix. Multiple triggers on one exact subject strengthen the rubric but do not create multiple reviewers. Phase 1 permits at most one independent read-only reviewer for a candidate; do not stack reviewers or model perspectives.
 
 ## Git and worktree safety
 
@@ -75,11 +77,11 @@ Exactly one registered integrator owns an integration plan and worktree only aft
 
 ## Handoff requirements
 
-Every worker handoff names task/worker records, exact base/head or patch identity, changed paths, route, acceptance evidence, verification references, applied decisions, scope/safety statement, open findings, and integration guidance. No handoff means no completed worker and no integration.
+Every implementation handoff names the task and root executor (or explicitly approved exceptional worker), exact base/head or patch identity, changed paths, route, acceptance evidence, verification references, applied decisions, scope/safety statement, open findings, and integration guidance. No handoff means no completed implementation and no integration.
 
 ## Stop and escalation conditions
 
-Stop on unknown base, missing or conflicting decisions, blocking questions, unsafe context, route mismatch, ambiguous spawn, ownership/scope breach, stale evidence, public-safety concern, unapproved dependency, or destructive action without recovery and approval. Escalate one precise question with evidence and options; do not broaden the task.
+Repair accepted in-scope review and CI defects autonomously, across as many cycles as required. Stop only on a genuine architecture, product-contract, scope, safety, destructive-action, risk-acceptance, backward-compatibility, merge, release, or deployment decision; unknown base or selection; missing or conflicting authority; ambiguous spawn; ownership drift; stale evidence; or an unapproved dependency. Escalate one precise question with evidence and options; do not broaden the task or stop merely because a repair already occurred.
 
 ## Maintainer decision gates
 
@@ -87,4 +89,4 @@ Maintainer approval is required for Phase 1 authorization, product decisions, pu
 
 ## Canonical repository commands
 
-Use `python scripts/temper-gate.py setup`, `maintenance`, `unit`, `fixture-help`, or `all` only within an authorized task. Query reusable verification first; one registered final-candidate verifier runs `all` on the final assembled candidate under the bounded run policy. Only the exact authorized pilot may change gate behavior, and the program stops before integration to main.
+Use `python scripts/temper-gate.py setup`, `maintenance`, `unit`, `fixture-help`, or `all` only within an authorized task. Query reusable verification first; the root runs `all` once on the final immutable candidate under `docs/workflow/procedures/verification-review-and-handoff.md`. Only the exact authorized pilot may change gate behavior, and the program stops before integration to main.

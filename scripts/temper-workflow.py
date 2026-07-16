@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import re
+import statistics
 import tempfile
 from pathlib import PurePosixPath
 from typing import Any
@@ -46,6 +47,8 @@ ACTIVE_WORKER_STATES = {
 }
 HEARTBEAT_DEFAULT_SECONDS = 120
 HEARTBEAT_MAX_SECONDS = 900
+FINAL_GATE_COMMAND = ["python", "scripts/temper-gate.py", "all"]
+ROOT_EXECUTOR = "root"
 REQUIRED_SECOND_WRITER_GUARDS = {
     "disjoint_paths",
     "independent_acceptance_criteria",
@@ -55,11 +58,25 @@ REQUIRED_SECOND_WRITER_GUARDS = {
     "explicit_recorded_approval",
 }
 PUBLIC_ROUTE = {
-    "routine_administration": ("luna_or_cheapest", {"low", "medium"}),
+    "routine_administration": ("luna-or-cheapest", {"low", "medium"}),
     "mechanical_change": ("terra-medium", {"medium"}),
     "normal_implementation": ("terra-high", {"high"}),
     "protected_boundary_implementation": ("terra-high", {"high"}),
     "cold_technical_review": ("terra-high", {"high"}),
+}
+ROUTE_MODEL_MARKER = {
+    "luna-or-cheapest": "luna",
+    "terra-medium": "terra",
+    "terra-high": "terra",
+    "sol-high": "sol",
+    "sol-ultra": "sol",
+}
+TRIAL_PROTOCOL_REF = "docs/workflow/procedures/model-route-and-experiment.md"
+TRIAL_TASK_MIX = {
+    "fixed_snapshot_cold_review": 2,
+    "bounded_implementation_or_repair": 2,
+    "architecture_or_invariant_design": 1,
+    "mechanical_negative_control": 1,
 }
 TASK_WRITE_CAPABILITY = {
     "routine_administration": False,
@@ -114,6 +131,7 @@ def default_state() -> dict[str, Any]:
         "checkpoints": [],
         "handoffs": [],
         "reviews": [],
+        "route_trials": [],
         "event_sequence": 0,
     }
 
@@ -221,14 +239,68 @@ def _reset_monitor(monitor: dict[str, Any], status: str) -> None:
 
 def _routes_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
     return all(
-        first.get(field, "UNVERIFIED") == second.get(field, "UNVERIFIED")
+        first.get(field) == second.get(field)
         for field in (
+            "declared_route",
+            "declared_model",
+            "declared_effort",
             "selected_model",
             "selected_effort",
-            "observed_model",
-            "observed_effort",
+            "selection_mechanism",
+            "runtime_observation",
+            "declared_route_compliance",
+            "experiment",
         )
     )
+
+
+def _validate_selection_mechanism(value: Any) -> dict[str, Any]:
+    mechanism = _as_object(value, "route selection_mechanism")
+    kind = mechanism.get("kind")
+    required = {
+        "host_controls": {
+            "model_selector": "model",
+            "effort_selector": "reasoning_effort",
+            "context_field": "control_surface",
+        },
+        "cli_flags": {
+            "model_selector": "--model",
+            "effort_selector": "model_reasoning_effort",
+            "context_field": None,
+        },
+        "cli_profile": {
+            "model_selector": "model",
+            "effort_selector": "model_reasoning_effort",
+            "context_field": "profile",
+        },
+        "api_parameters": {
+            "model_selector": "model",
+            "effort_selector": "reasoning.effort",
+            "context_field": None,
+        },
+    }.get(kind)
+    if required is None:
+        raise WorkflowError(
+            "route selection mechanism must be host_controls, cli_flags, "
+            "cli_profile, or api_parameters"
+        )
+    if (
+        mechanism.get("model_selector") != required["model_selector"]
+        or mechanism.get("effort_selector") != required["effort_selector"]
+    ):
+        raise WorkflowError(
+            "route selection mechanism does not name executable model and effort "
+            "selectors"
+        )
+    context_field = required["context_field"]
+    if context_field is not None and (
+        not isinstance(mechanism.get(context_field), str)
+        or not mechanism[context_field]
+    ):
+        raise WorkflowError(
+            f"route selection mechanism requires non-empty {context_field}"
+        )
+    return mechanism
 
 
 def _has_authoritative_decision(
@@ -258,21 +330,72 @@ def _has_authoritative_decision(
         return False
 
 
-def _validate_verifier_registration(
-    record: dict[str, Any], tasks: dict[str, Any], exact_base: str
-) -> None:
-    key = record.get("task_key")
-    if key not in tasks:
-        raise WorkflowError("verifier registration must bind a registered task")
-    _identity(record.get("subject"), exact_base)
-    _verification_request(record)
-    if (
-        not isinstance(record.get("verifier_reference"), str)
-        or not record["verifier_reference"]
-    ):
-        raise WorkflowError("verifier registration requires a verifier_reference")
-    if record.get("accepted") is not True:
-        raise WorkflowError("verifier registration must be explicitly accepted")
+def _writer_exception_matches(
+    evidence: Any,
+    task: dict[str, Any],
+    exact_base: str,
+    writer_mode: str | None = None,
+) -> bool:
+    try:
+        evidence = _as_object(evidence, "writer exception decision")
+        identity = _identity(task.get("subject"), exact_base)
+        scope = _as_object(evidence.get("exception_scope"), "writer exception scope")
+        return (
+            evidence.get("kind") == "decision"
+            and evidence.get("decision_type") == "exceptional_writer"
+            and evidence.get("actor") == "maintainer"
+            and evidence.get("approved") is True
+            and isinstance(evidence.get("reference"), str)
+            and bool(evidence["reference"])
+            and _has_authoritative_decision(
+                evidence,
+                task["task_key"],
+                identity,
+                exact_base,
+                task["maintainer_authorization"]["authority_reference"],
+            )
+            and scope.get("task_key") == task["task_key"]
+            and _identity(scope.get("subject"), exact_base) == identity
+            and scope.get("exact_base") == exact_base
+            and set(
+                normalized_path(path)
+                for path in _as_list(scope.get("owned_paths"), "writer exception paths")
+            )
+            == set(task["owned_paths"])
+            and scope.get("writer_mode") in {"root", "subagent"}
+            and (writer_mode is None or scope.get("writer_mode") == writer_mode)
+            and isinstance(scope.get("reason"), str)
+            and bool(scope["reason"])
+        )
+    except (KeyError, WorkflowError):
+        return False
+
+
+def _require_writer_exception(
+    state: dict[str, Any],
+    task: dict[str, Any],
+    record: dict[str, Any],
+    writer_mode: str,
+) -> dict[str, Any]:
+    reference = record.get("writer_exception_reference")
+    if not isinstance(reference, str) or not reference:
+        raise WorkflowError(
+            "exceptional writer activation requires a durable maintainer exception "
+            "reference"
+        )
+    matches = [
+        evidence
+        for evidence in state["evidence"]
+        if evidence.get("reference") == reference
+        and _writer_exception_matches(
+            evidence, task, state["repository"]["exact_base"], writer_mode
+        )
+    ]
+    if len(matches) != 1:
+        raise WorkflowError(
+            "writer exception reference is not a task/subject-bound maintainer decision"
+        )
+    return matches[0]
 
 
 def _structured_references(
@@ -299,8 +422,17 @@ def _structured_references(
 
 def validate_route(route: Any, task_class: str | None = None) -> None:
     route = _as_object(route, "route")
+    declared_route = route.get("declared_route")
+    declared_model = route.get("declared_model")
+    declared_effort = route.get("declared_effort")
     selected_model = route.get("selected_model")
     selected_effort = route.get("selected_effort")
+    if not isinstance(declared_route, str) or not declared_route:
+        raise WorkflowError("declared route is required")
+    if not isinstance(declared_model, str) or not declared_model:
+        raise WorkflowError("declared model is required")
+    if not isinstance(declared_effort, str) or not declared_effort:
+        raise WorkflowError("declared reasoning effort is required")
     if not isinstance(selected_model, str) or not selected_model:
         raise WorkflowError(
             "selected model is required; prompt text is not route evidence"
@@ -309,23 +441,427 @@ def validate_route(route: Any, task_class: str | None = None) -> None:
         raise WorkflowError(
             "selected reasoning effort is required; prompt text is not route evidence"
         )
-    for observed in ("observed_model", "observed_effort"):
-        value = route.get(observed, "UNVERIFIED")
-        if not isinstance(value, str) or not value:
-            raise WorkflowError(f"{observed} must be a value or UNVERIFIED")
-    if route.get("observed_model", "UNVERIFIED") not in {"UNVERIFIED", selected_model}:
-        raise WorkflowError("observed_model does not match the selected model")
-    if route.get("observed_effort", "UNVERIFIED") not in {
-        "UNVERIFIED",
-        selected_effort,
-    }:
+    if selected_model != declared_model or selected_effort != declared_effort:
+        raise WorkflowError("selected route does not match the declared route")
+    _validate_selection_mechanism(route.get("selection_mechanism"))
+    observation = _as_object(route.get("runtime_observation"), "runtime_observation")
+    availability = observation.get("availability")
+    source = observation.get("source")
+    if availability not in {"OBSERVED", "UNAVAILABLE"}:
         raise WorkflowError(
-            "observed_effort does not match the selected reasoning effort"
+            "runtime observation availability must be OBSERVED or UNAVAILABLE"
+        )
+    if not isinstance(source, str) or not source:
+        raise WorkflowError("runtime observation source is required")
+    observed_model = observation.get("model")
+    observed_effort = observation.get("effort")
+    if availability == "OBSERVED":
+        if not all(
+            isinstance(value, str) and value and value != "UNVERIFIED"
+            for value in (observed_model, observed_effort)
+        ):
+            raise WorkflowError(
+                "observed runtime model and effort are required when telemetry "
+                "is available"
+            )
+        expected_compliance = (
+            "PASS"
+            if observed_model == declared_model and observed_effort == declared_effort
+            else "FAIL"
+        )
+    else:
+        if observed_model != "UNVERIFIED" or observed_effort != "UNVERIFIED":
+            raise WorkflowError(
+                "unavailable runtime telemetry must use UNVERIFIED observed values"
+            )
+        expected_compliance = "UNVERIFIED"
+    if route.get("declared_route_compliance") != expected_compliance:
+        raise WorkflowError(
+            "declared route compliance does not match runtime observation availability"
+        )
+    experiment = _as_object(route.get("experiment"), "route experiment")
+    label = experiment.get("label")
+    if label not in {
+        "NOT_EXPERIMENT",
+        "CONTROL",
+        "EXPERIMENTAL",
+        "OBSERVATIONAL",
+    }:
+        raise WorkflowError("unknown route experiment label")
+    if label in {"CONTROL", "EXPERIMENTAL"}:
+        if experiment.get("predeclared") is not True or not all(
+            isinstance(experiment.get(name), str) and experiment[name]
+            for name in (
+                "trial_id",
+                "pair_id",
+                "run_id",
+                "protocol_ref",
+                "frozen_task_identity",
+                "isolation_ref",
+                "task_mix",
+            )
+        ):
+            raise WorkflowError(
+                "control and experimental runs require a predeclared matched pair "
+                "with frozen-task and isolation metadata"
+            )
+        if experiment["protocol_ref"] != TRIAL_PROTOCOL_REF:
+            raise WorkflowError(
+                "matched run protocol_ref is not the Ultra trial protocol"
+            )
+        if experiment["task_mix"] not in TRIAL_TASK_MIX:
+            raise WorkflowError("matched run task_mix is not part of the Ultra trial")
+    elif experiment.get("predeclared") is not False:
+        raise WorkflowError(
+            "non-experimental and observational runs cannot claim predeclaration"
         )
     if task_class in PUBLIC_ROUTE:
-        expected_model, efforts = PUBLIC_ROUTE[task_class]
-        if selected_model != expected_model or selected_effort not in efforts:
+        expected_route, efforts = PUBLIC_ROUTE[task_class]
+        if label == "EXPERIMENTAL":
+            route_allowed = declared_route == "sol-ultra" and declared_effort == "ultra"
+        elif label == "CONTROL" and declared_route == "sol-high":
+            route_allowed = declared_effort == "high"
+        else:
+            route_allowed = (
+                declared_route == expected_route and declared_effort in efforts
+            )
+        if not route_allowed:
             raise WorkflowError(f"route is not permitted for task class {task_class}")
+    marker = ROUTE_MODEL_MARKER.get(declared_route)
+    if marker is None or marker not in declared_model.casefold():
+        raise WorkflowError("declared model does not match the declared route family")
+
+
+def _nonnegative_number(value: Any, label: str, *, integer: bool = False) -> float:
+    expected = int if integer else (int, float)
+    if isinstance(value, bool) or not isinstance(value, expected) or value < 0:
+        kind = "integer" if integer else "number"
+        raise WorkflowError(f"{label} must be a non-negative {kind}")
+    return float(value)
+
+
+def _bounded_score(value: Any, label: str) -> float:
+    score = _nonnegative_number(value, label)
+    if score > 100:
+        raise WorkflowError(f"{label} must be between 0 and 100")
+    return score
+
+
+def _close_score(actual: float, expected: float) -> bool:
+    return abs(actual - expected) <= 0.01
+
+
+def _clamp_score(value: float) -> float:
+    return min(100.0, max(0.0, value))
+
+
+def _validate_trial_score(score: Any, label: str) -> dict[str, Any]:
+    score = _as_object(score, label)
+    if not isinstance(score.get("ledger_ref"), str) or not score["ledger_ref"]:
+        raise WorkflowError(f"{label} ledger_ref is required")
+    raw = _as_object(score.get("raw"), f"{label} raw metrics")
+    for name in ("input_tokens", "cached_input_tokens", "output_tokens"):
+        _nonnegative_number(raw.get(name), f"{label} {name}", integer=True)
+    _nonnegative_number(raw.get("elapsed_seconds"), f"{label} elapsed_seconds")
+    for name in ("agent_sessions", "redundant_full_gate_runs"):
+        _nonnegative_number(raw.get(name), f"{label} {name}", integer=True)
+    for name in (
+        "credited_ledger_weight",
+        "total_ledger_weight",
+        "false_positives",
+        "avoidable_blocking_clarifications",
+        "avoidable_tool_or_test_retries",
+        "incomplete_outcome",
+        "handoff_passed_items",
+    ):
+        _nonnegative_number(raw.get(name), f"{label} {name}", integer=True)
+    if raw.get("acceptance_complete") not in {True, False}:
+        raise WorkflowError(f"{label} acceptance_complete must be boolean")
+    if raw["credited_ledger_weight"] > raw["total_ledger_weight"]:
+        raise WorkflowError(f"{label} credited ledger weight exceeds the ledger")
+    if raw["incomplete_outcome"] not in {0, 1}:
+        raise WorkflowError(f"{label} incomplete_outcome must be zero or one")
+    if raw["handoff_passed_items"] > 10:
+        raise WorkflowError(f"{label} handoff_passed_items exceeds ten")
+    expected_effective = (
+        max(0, raw["input_tokens"] - raw["cached_input_tokens"]) + raw["output_tokens"]
+    )
+    if raw.get("effective_tokens") != expected_effective:
+        raise WorkflowError(f"{label} effective_tokens does not match the formula")
+    components = _as_object(score.get("components"), f"{label} score components")
+    for name in ("quality", "autonomy", "efficiency", "handoff", "total"):
+        _bounded_score(components.get(name), f"{label} {name}")
+    evidence = _as_list(score.get("ledger_evidence_refs"), f"{label} ledger evidence")
+    if not evidence or not all(isinstance(item, str) and item for item in evidence):
+        raise WorkflowError(f"{label} ledger evidence must contain references")
+    expected_components = {
+        "autonomy": _clamp_score(
+            100
+            - 20 * raw["avoidable_blocking_clarifications"]
+            - 10 * raw["avoidable_tool_or_test_retries"]
+            - 25 * raw["incomplete_outcome"]
+        ),
+        "handoff": float(10 * raw["handoff_passed_items"]),
+    }
+    if raw["total_ledger_weight"] > 0:
+        expected_components["quality"] = _clamp_score(
+            100.0 * raw["credited_ledger_weight"] / raw["total_ledger_weight"]
+            - min(20, 5 * raw["false_positives"])
+        )
+    for name, expected in expected_components.items():
+        if not _close_score(float(components[name]), expected):
+            raise WorkflowError(f"{label} {name} does not match raw scoring inputs")
+    expected_total = (
+        0.50 * components["quality"]
+        + 0.20 * components["autonomy"]
+        + 0.20 * components["efficiency"]
+        + 0.10 * components["handoff"]
+    )
+    if not _close_score(float(components["total"]), expected_total):
+        raise WorkflowError(f"{label} total does not match the normalized formula")
+    return score
+
+
+def _validate_pair_ledger(
+    control: dict[str, Any], experimental: dict[str, Any], pair: dict[str, Any]
+) -> None:
+    pair_id = pair["pair_id"]
+    ledger_ref = pair.get("ledger_ref")
+    if not isinstance(ledger_ref, str) or not ledger_ref:
+        raise WorkflowError(f"trial pair {pair_id} shared ledger_ref is required")
+    runs = (control, experimental)
+    if any(run["score"].get("ledger_ref") != ledger_ref for run in runs):
+        raise WorkflowError(f"trial pair {pair_id} runs do not share one ledger")
+    ledger_weights = {run["score"]["raw"]["total_ledger_weight"] for run in runs}
+    if len(ledger_weights) != 1:
+        raise WorkflowError(f"trial pair {pair_id} runs do not share one ledger weight")
+    if next(iter(ledger_weights)) == 0:
+        expected_quality = (
+            100.0
+            if all(run["score"]["raw"]["acceptance_complete"] for run in runs)
+            else 0.0
+        )
+        if any(
+            not _close_score(
+                float(run["score"]["components"]["quality"]), expected_quality
+            )
+            for run in runs
+        ):
+            raise WorkflowError(
+                f"trial pair {pair_id} zero-weight quality must use both runs' "
+                "acceptance results"
+            )
+
+
+def _pair_metric_score(pair_minimum: float, run_value: float) -> float:
+    if run_value == 0:
+        return 100.0
+    return 100.0 * pair_minimum / run_value
+
+
+def _validate_pair_efficiency(
+    control: dict[str, Any], experimental: dict[str, Any], pair_id: str
+) -> None:
+    weights = {
+        "effective_tokens": 0.50,
+        "elapsed_seconds": 0.30,
+        "agent_sessions": 0.10,
+        "redundant_full_gate_runs": 0.10,
+    }
+    runs = (control, experimental)
+    for run in runs:
+        raw = run["score"]["raw"]
+        expected = 0.0
+        for metric, weight in weights.items():
+            pair_minimum = min(float(item["score"]["raw"][metric]) for item in runs)
+            expected += weight * _pair_metric_score(pair_minimum, float(raw[metric]))
+        actual = float(run["score"]["components"]["efficiency"])
+        if not _close_score(actual, expected):
+            raise WorkflowError(
+                f"trial pair {pair_id} efficiency does not match paired raw metrics"
+            )
+
+
+def validate_route_trial(record: Any) -> dict[str, Any]:
+    """Validate whether a completed route comparison may inform route defaults."""
+
+    record = _as_object(record, "route trial")
+    trial_id = record.get("trial_id")
+    if not isinstance(trial_id, str) or not trial_id:
+        raise WorkflowError("route trial_id is required")
+    classification = record.get("classification")
+    if classification == "OBSERVATIONAL":
+        if record.get("eligible_for_default_route_decision") is not False:
+            raise WorkflowError(
+                "observational trials cannot support route-default decisions"
+            )
+        if not isinstance(record.get("reason"), str) or not record["reason"]:
+            raise WorkflowError("observational trial requires a reason")
+        return copy.deepcopy(record)
+    if classification != "MATCHED_TRIAL":
+        raise WorkflowError("route trial classification is unknown")
+    if record.get("status") != "COMPLETE":
+        raise WorkflowError("matched route trial must be complete")
+    if record.get("protocol_ref") != TRIAL_PROTOCOL_REF:
+        raise WorkflowError("matched route trial must use the Ultra trial protocol")
+    if record.get("eligible_for_default_route_decision") is not True:
+        raise WorkflowError(
+            "matched trial must explicitly claim route-default evidence eligibility"
+        )
+    adjudication = _as_object(record.get("adjudication"), "trial adjudication")
+    if adjudication.get("blinded") is not True or not all(
+        isinstance(adjudication.get(name), str) and adjudication[name]
+        for name in ("alias_seed", "adjudicator_ref", "ledger_ref", "formula_ref")
+    ):
+        raise WorkflowError(
+            "matched trial requires blinded, reproducible adjudication metadata"
+        )
+    if adjudication["formula_ref"] != TRIAL_PROTOCOL_REF:
+        raise WorkflowError("trial scoring formula_ref is not the Ultra trial protocol")
+    pairs = _as_list(record.get("pairs"), "route trial pairs")
+    if len(pairs) != 6:
+        raise WorkflowError("matched route trial requires exactly six pairs")
+    pair_ids: set[str] = set()
+    run_ids: set[str] = set()
+    mix_counts = {name: 0 for name in TRIAL_TASK_MIX}
+    total_deltas: list[float] = []
+    quality_deltas: list[float] = []
+    for pair_value in pairs:
+        pair = _as_object(pair_value, "route trial pair")
+        pair_id = pair.get("pair_id")
+        if not isinstance(pair_id, str) or not pair_id or pair_id in pair_ids:
+            raise WorkflowError("route trial pair_id must be unique and non-empty")
+        pair_ids.add(pair_id)
+        task_mix = pair.get("task_mix")
+        if task_mix not in mix_counts:
+            raise WorkflowError("route trial pair has an unknown task_mix")
+        mix_counts[task_mix] += 1
+        if (
+            not all(
+                isinstance(pair.get(name), str) and pair[name]
+                for name in (
+                    "exact_base",
+                    "frozen_task_identity",
+                    "isolation_ref",
+                )
+            )
+            or pair.get("isolation_verified") is not True
+        ):
+            raise WorkflowError(
+                "route trial pair requires a frozen task and verified isolation"
+            )
+        runs = _as_list(pair.get("runs"), f"trial pair {pair_id} runs")
+        if len(runs) != 2:
+            raise WorkflowError("each route trial pair requires exactly two runs")
+        by_label: dict[str, dict[str, Any]] = {}
+        context_ids: set[str] = set()
+        for run_value in runs:
+            run = _as_object(run_value, f"trial pair {pair_id} run")
+            run_id = run.get("run_id")
+            context_id = run.get("context_identity")
+            task_class = run.get("task_class")
+            if (
+                not isinstance(run_id, str)
+                or not run_id
+                or run_id in run_ids
+                or not isinstance(context_id, str)
+                or not context_id
+                or context_id in context_ids
+                or task_class not in PUBLIC_ROUTE
+            ):
+                raise WorkflowError(
+                    "trial runs require unique run/context identities and a task class"
+                )
+            run_ids.add(run_id)
+            context_ids.add(context_id)
+            route = _as_object(run.get("route"), f"trial run {run_id} route")
+            validate_route(route, task_class)
+            experiment = route["experiment"]
+            label = experiment["label"]
+            if label not in {"CONTROL", "EXPERIMENTAL"} or label in by_label:
+                raise WorkflowError(
+                    "each route trial pair requires one control and one "
+                    "experimental run"
+                )
+            if any(
+                experiment.get(field) != expected
+                for field, expected in {
+                    "trial_id": trial_id,
+                    "pair_id": pair_id,
+                    "run_id": run_id,
+                    "protocol_ref": record["protocol_ref"],
+                    "frozen_task_identity": pair["frozen_task_identity"],
+                    "isolation_ref": pair["isolation_ref"],
+                    "task_mix": task_mix,
+                }.items()
+            ):
+                raise WorkflowError(
+                    "trial run route is not bound to its frozen pair metadata"
+                )
+            run["score"] = _validate_trial_score(
+                run.get("score"), f"trial run {run_id} score"
+            )
+            by_label[label] = run
+        if set(by_label) != {"CONTROL", "EXPERIMENTAL"}:
+            raise WorkflowError(
+                "each route trial pair requires one control and one experimental run"
+            )
+        if by_label["CONTROL"]["task_class"] != by_label["EXPERIMENTAL"]["task_class"]:
+            raise WorkflowError("paired trial runs must use the same frozen task class")
+        _validate_pair_ledger(by_label["CONTROL"], by_label["EXPERIMENTAL"], pair)
+        _validate_pair_efficiency(
+            by_label["CONTROL"], by_label["EXPERIMENTAL"], pair_id
+        )
+        total_deltas.append(
+            float(by_label["EXPERIMENTAL"]["score"]["components"]["total"])
+            - float(by_label["CONTROL"]["score"]["components"]["total"])
+        )
+        quality_deltas.append(
+            float(by_label["EXPERIMENTAL"]["score"]["components"]["quality"])
+            - float(by_label["CONTROL"]["score"]["components"]["quality"])
+        )
+    if mix_counts != TRIAL_TASK_MIX:
+        raise WorkflowError("route trial does not match the required six-pair task mix")
+    aggregate = _as_object(record.get("aggregate"), "route trial aggregate")
+    for name in ("report_ref", "p1_p2_differences_ref"):
+        if not isinstance(aggregate.get(name), str) or not aggregate[name]:
+            raise WorkflowError(f"route trial aggregate {name} is required")
+    expected_aggregate = {
+        "mean_total_delta": statistics.fmean(total_deltas),
+        "median_total_delta": statistics.median(total_deltas),
+        "mean_quality_delta": statistics.fmean(quality_deltas),
+    }
+    for name, expected in expected_aggregate.items():
+        actual = aggregate.get(name)
+        if (
+            isinstance(actual, bool)
+            or not isinstance(actual, (int, float))
+            or not _close_score(float(actual), expected)
+        ):
+            raise WorkflowError(f"route trial aggregate {name} is not reproducible")
+    if not isinstance(aggregate.get("escaped_p1"), bool):
+        raise WorkflowError("route trial aggregate escaped_p1 must be boolean")
+    if aggregate.get("outcome") not in {
+        "MATERIAL_QUALITY_BENEFIT",
+        "NO_MATERIAL_BENEFIT",
+        "TIE",
+    }:
+        raise WorkflowError("route trial aggregate outcome is unknown")
+    if aggregate.get("recommendation") not in {
+        "ADOPT_EXPERIMENTAL",
+        "KEEP_CONTROL",
+        "NO_CHANGE",
+    }:
+        raise WorkflowError("route trial aggregate recommendation is unknown")
+    if aggregate.get("recommendation") == "ADOPT_EXPERIMENTAL" and (
+        aggregate.get("outcome") != "MATERIAL_QUALITY_BENEFIT"
+        or aggregate["escaped_p1"]
+    ):
+        raise WorkflowError(
+            "experimental route adoption requires material quality benefit and no "
+            "escaped P1"
+        )
+    return copy.deepcopy(record)
 
 
 def validate_task(task: Any, *, exact_base: str | None = None) -> dict[str, Any]:
@@ -450,6 +986,10 @@ def validate_state(state: Any) -> dict[str, Any]:
         if overlap:
             raise WorkflowError(f"active ownership path collision: {overlap!r}")
         active_paths.extend(paths)
+    evidence_records = [
+        _as_object(item, "evidence")
+        for item in _as_list(state.get("evidence"), "evidence")
+    ]
     workers = _as_list(state.get("workers"), "workers")
     seen_worker_refs: set[str] = set()
     active_worker_tasks: set[str] = set()
@@ -498,6 +1038,38 @@ def validate_state(state: Any) -> dict[str, Any]:
                     "more than one active or spawn-requested worker exists for a task"
                 )
             active_worker_tasks.add(key)
+        execution_mode = worker.get("execution_mode", "subagent")
+        if execution_mode not in {"root", "subagent"}:
+            raise WorkflowError("worker execution_mode must be root or subagent")
+        if (
+            execution_mode == "root"
+            and worker.get("reference") != f"root:{worker.get('task_key')}"
+        ):
+            raise WorkflowError("root writer reference must be task-specific")
+        if execution_mode == "subagent" and worker.get("writer") is True:
+            task = tasks.get(worker.get("task_key"))
+            if (
+                task is None
+                or len(
+                    [
+                        evidence
+                        for evidence in evidence_records
+                        if evidence.get("reference")
+                        == worker.get("writer_exception_reference")
+                        and _writer_exception_matches(
+                            evidence,
+                            task,
+                            repository["exact_base"],
+                            execution_mode,
+                        )
+                    ]
+                )
+                != 1
+            ):
+                raise WorkflowError(
+                    "writer subagent lacks a durable task/subject-bound maintainer "
+                    "exception"
+                )
         _validate_monitor(worker.get("monitor"), worker["status"])
     if _active_writer_count(state) > 2:
         raise WorkflowError("a third active implementation writer is prohibited")
@@ -510,8 +1082,38 @@ def validate_state(state: Any) -> dict[str, Any]:
                 "second active implementation writer requires every recorded "
                 "independence guard"
             )
-    for field in ("evidence", "verification", "checkpoints", "handoffs", "reviews"):
+        second = active_writers[1]
+        second_task = tasks[second["task_key"]]
+        if (
+            len(
+                [
+                    evidence
+                    for evidence in evidence_records
+                    if evidence.get("reference")
+                    == second.get("writer_exception_reference")
+                    and _writer_exception_matches(
+                        evidence,
+                        second_task,
+                        repository["exact_base"],
+                        second.get("execution_mode", "subagent"),
+                    )
+                ]
+            )
+            != 1
+        ):
+            raise WorkflowError(
+                "second active implementation writer lacks a durable maintainer "
+                "exception"
+            )
+    for field in (
+        "evidence",
+        "verification",
+        "checkpoints",
+        "handoffs",
+        "reviews",
+    ):
         _as_list(state.get(field), field)
+    route_trials = _as_list(state.get("route_trials", []), "route_trials")
     for evidence in state["evidence"]:
         evidence = _as_object(evidence, "evidence")
         if evidence.get("kind") == "decision":
@@ -527,7 +1129,8 @@ def validate_state(state: Any) -> dict[str, Any]:
                     "decision evidence lacks authoritative task/subject provenance"
                 )
         elif evidence.get("kind") == "verifier_registration":
-            _validate_verifier_registration(evidence, tasks, repository["exact_base"])
+            raise WorkflowError("final-verifier agent registrations are prohibited")
+    final_gates: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for verification in state["verification"]:
         verification = _as_object(verification, "verification record")
         key = verification.get("task_key")
@@ -543,27 +1146,27 @@ def validate_state(state: Any) -> dict[str, Any]:
         }:
             raise WorkflowError("unknown verification status")
         if "verifier_reference" in verification:
-            verification_sequence = verification.get("sequence")
-            if (
-                isinstance(verification_sequence, bool)
-                or not isinstance(verification_sequence, int)
-                or verification_sequence <= 0
+            raise WorkflowError("final-verifier agent references are prohibited")
+        subject = _identity(verification.get("subject"), repository["exact_base"])
+        if (
+            verification.get("command") == FINAL_GATE_COMMAND
+            or verification.get("verification_type") == "public_safety"
+        ) and verification.get("executor") != ROOT_EXECUTOR:
+            raise WorkflowError(
+                "final gate and public-safety checks must be root-executed"
+            )
+        if verification.get("command") == FINAL_GATE_COMMAND:
+            subject_value = subject.get("head", subject.get("patch", ""))
+            gate_key = (key, subject_value)
+            prior_gates = final_gates.get(gate_key, [])
+            if prior_gates and not (
+                verification.get("rerun_reason") == "EVIDENCE_LOSS"
+                and all(item.get("invalidated") is True for item in prior_gates)
             ):
                 raise WorkflowError(
-                    "verifier-bound verification requires a positive integer sequence"
+                    "duplicate full gate exists for one immutable candidate revision"
                 )
-            if not _registered_verifier(
-                state,
-                key,
-                _identity(verification.get("subject"), repository["exact_base"]),
-                verification,
-                verification.get("verifier_reference"),
-                verification_sequence=verification_sequence,
-            ):
-                raise WorkflowError(
-                    "verifier-bound verification requires a prior accepted exact "
-                    "task/subject/request verifier registration"
-                )
+            final_gates.setdefault(gate_key, []).append(verification)
     review_keys: set[str] = set()
     for review in state["reviews"]:
         review = _as_object(review, "review")
@@ -574,13 +1177,18 @@ def validate_state(state: Any) -> dict[str, Any]:
         if review.get("status") not in {
             "REQUIRED",
             "REPAIR_IN_PROGRESS",
-            "REPAIR_LIMIT_REACHED",
             "PASS",
         }:
             raise WorkflowError("unknown review status")
-        if review.get("reviewers") != 1 or review.get("repair_cycles") not in {0, 1}:
+        repair_cycles = review.get("repair_cycles")
+        if (
+            review.get("reviewers") != 1
+            or isinstance(repair_cycles, bool)
+            or not isinstance(repair_cycles, int)
+            or repair_cycles < 0
+        ):
             raise WorkflowError(
-                "review must retain one reviewer and at most one repair cycle"
+                "review must retain one reviewer and a non-negative repair count"
             )
         if not isinstance(review.get("subject"), dict):
             raise WorkflowError("review must bind an exact subject")
@@ -591,6 +1199,12 @@ def validate_state(state: Any) -> dict[str, Any]:
             raise WorkflowError("review must use the cold Terra-high read-only route")
         if not isinstance(review.get("rubric_ref"), str) or not review["rubric_ref"]:
             raise WorkflowError("review rubric reference is required")
+    trial_ids: set[str] = set()
+    for trial in route_trials:
+        validated_trial = validate_route_trial(trial)
+        if validated_trial["trial_id"] in trial_ids:
+            raise WorkflowError("route trial_id is already registered")
+        trial_ids.add(validated_trial["trial_id"])
     return state
 
 
@@ -691,9 +1305,16 @@ def acquire_ownership(state: dict[str, Any], record: dict[str, Any]) -> dict[str
     if set(paths) != set(task["owned_paths"]):
         raise WorkflowError("ownership paths must exactly match the task paths")
     for lease in state["ownership"]:
+        if (
+            lease.get("active")
+            and lease.get("task_key") == key
+            and set(lease.get("paths", [])) == set(paths)
+        ):
+            state["authorization_state"] = "IMPLEMENTATION_READY"
+            return lease
+    for lease in state["ownership"]:
         if lease.get("active") and (
-            lease.get("task_key") == key
-            or any(
+            any(
                 paths_overlap(normalized_path(existing), path)
                 for existing in lease["paths"]
                 for path in paths
@@ -730,7 +1351,12 @@ def _active_writer_count(state: dict[str, Any]) -> int:
     )
 
 
-def _check_writer_capacity(state: dict[str, Any], record: dict[str, Any]) -> None:
+def _check_writer_capacity(
+    state: dict[str, Any],
+    task: dict[str, Any],
+    record: dict[str, Any],
+    writer_mode: str,
+) -> dict[str, Any] | None:
     count = _active_writer_count(state)
     if count >= 2:
         raise WorkflowError("a third active implementation writer is prohibited")
@@ -742,6 +1368,61 @@ def _check_writer_capacity(state: dict[str, Any], record: dict[str, Any]) -> Non
             raise WorkflowError(
                 "second writer requires every recorded independence guard"
             )
+        return _require_writer_exception(state, task, record, writer_mode)
+    return None
+
+
+def _activate_root_writer(
+    state: dict[str, Any], task: dict[str, Any], record: dict[str, Any]
+) -> dict[str, Any]:
+    """Activate the root task as the default implementation writer."""
+
+    if task["route"]["declared_route_compliance"] == "FAIL":
+        raise WorkflowError("observed route mismatch blocks implementation")
+    key = task["task_key"]
+    reference = f"root:{key}"
+    existing = next(
+        (worker for worker in state["workers"] if worker.get("reference") == reference),
+        None,
+    )
+    if existing is not None:
+        if existing.get("status") not in {"COMPLETE", "RETIRED"}:
+            raise WorkflowError("task already has an active root writer")
+        exception = _check_writer_capacity(state, task, record, "root")
+        existing.update(
+            {
+                "task_class": task["task_class"],
+                "writer": True,
+                "status": "ACTIVE",
+                "route": copy.deepcopy(task["route"]),
+                "attempt": existing.get("attempt", 1) + 1,
+                "execution_mode": "root",
+                "writer_exception_reference": (
+                    exception["reference"] if exception is not None else None
+                ),
+                "independence_guards": copy.deepcopy(record.get("independence_guards")),
+            }
+        )
+        _reset_monitor(existing["monitor"], "ACTIVE")
+        return existing
+    exception = _check_writer_capacity(state, task, record, "root")
+    root = {
+        "reference": reference,
+        "task_key": key,
+        "task_class": task["task_class"],
+        "writer": True,
+        "status": "ACTIVE",
+        "route": copy.deepcopy(task["route"]),
+        "attempt": 1,
+        "execution_mode": "root",
+        "writer_exception_reference": (
+            exception["reference"] if exception is not None else None
+        ),
+        "independence_guards": copy.deepcopy(record.get("independence_guards")),
+        "monitor": _new_monitor("ACTIVE"),
+    }
+    state["workers"].append(root)
+    return root
 
 
 def register_worker(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
@@ -803,6 +1484,7 @@ def register_worker(state: dict[str, Any], record: dict[str, Any]) -> dict[str, 
         raise WorkflowError("task already has an active worker")
     manual_intent["reference"] = reference
     manual_intent["status"] = "ACTIVE"
+    manual_intent["execution_mode"] = "subagent"
     _reset_monitor(manual_intent["monitor"], "ACTIVE")
     return manual_intent
 
@@ -1031,14 +1713,42 @@ def record_evidence(state: dict[str, Any], record: dict[str, Any]) -> dict[str, 
             raise WorkflowError(
                 "decision evidence lacks authoritative task/subject provenance"
             )
+        if record.get("decision_type") == "exceptional_writer":
+            if not _writer_exception_matches(
+                record, state["tasks"][key], state["repository"]["exact_base"]
+            ):
+                raise WorkflowError(
+                    "writer exception must be a task/subject-bound maintainer decision"
+                )
+            if any(
+                evidence.get("reference") == record["reference"]
+                for evidence in state["evidence"]
+            ):
+                raise WorkflowError("writer exception reference is already registered")
     elif record["kind"] == "verifier_registration":
-        _validate_verifier_registration(
-            record, state["tasks"], state["repository"]["exact_base"]
-        )
+        raise WorkflowError("final-verifier agent registrations are prohibited")
     stored = copy.deepcopy(record)
     stored["sequence"] = _next_sequence(state)
     state["evidence"].append(stored)
     return {"recorded": "evidence", "count": len(state["evidence"])}
+
+
+def record_route_trial(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    validate_state(state)
+    trial = validate_route_trial(record)
+    trials = state.setdefault("route_trials", [])
+    if any(existing.get("trial_id") == trial["trial_id"] for existing in trials):
+        raise WorkflowError("route trial_id is already registered")
+    stored = copy.deepcopy(trial)
+    stored["sequence"] = _next_sequence(state)
+    trials.append(stored)
+    return {
+        "recorded": "route_trial",
+        "trial_id": trial["trial_id"],
+        "eligible_for_default_route_decision": trial[
+            "eligible_for_default_route_decision"
+        ],
+    }
 
 
 def record_verification(
@@ -1070,18 +1780,39 @@ def record_verification(
         raise WorkflowError("unknown verification status")
     subject = _identity(record["subject"], state["repository"]["exact_base"])
     request = _verification_request(record)
-    if "verifier_reference" in record and not _registered_verifier(
-        state,
-        key,
-        subject,
-        record,
-        record.get("verifier_reference"),
-        verification_sequence=state["event_sequence"] + 1,
-    ):
-        raise WorkflowError(
-            "verifier-bound verification requires a prior accepted exact "
-            "task/subject/request verifier registration"
-        )
+    if "verifier_reference" in record:
+        raise WorkflowError("final-verifier agent references are prohibited")
+    is_final_gate = record["command"] == FINAL_GATE_COMMAND
+    is_public_safety = record.get("verification_type") == "public_safety"
+    if (is_final_gate or is_public_safety) and record.get("executor") != ROOT_EXECUTOR:
+        raise WorkflowError("final gate and public-safety checks must be root-executed")
+    if is_final_gate:
+        handoff = _latest_handoff(state, key)
+        if handoff is None or handoff.get("identity") != subject:
+            raise WorkflowError("final gate requires the exact final assembled handoff")
+        review = _review_for_task(state, key)
+        if review_required(state["tasks"][key])["required"] and (
+            review is None
+            or review.get("status") != "PASS"
+            or review.get("subject") != subject
+        ):
+            raise WorkflowError(
+                "final gate requires a passing exact-subject cold review"
+            )
+        prior_gates = [
+            existing
+            for existing in state["verification"]
+            if existing.get("task_key") == key
+            and existing.get("subject") == subject
+            and existing.get("command") == FINAL_GATE_COMMAND
+        ]
+        if prior_gates and not (
+            record.get("rerun_reason") == "EVIDENCE_LOSS"
+            and all(existing.get("invalidated") is True for existing in prior_gates)
+        ):
+            raise WorkflowError(
+                "full gate already recorded for this immutable candidate revision"
+            )
     for existing in state["verification"]:
         if existing.get("reference") == record["reference"] and not (
             existing.get("task_key") == key
@@ -1319,8 +2050,8 @@ def next_action(state: dict[str, Any]) -> str:
         "RECONCILE": "VALIDATE_AUTHORITATIVE_STATE",
         "DELIBERATE": "DETERMINE_NEXT_LEGAL_TRANSITION",
         "DECIDE": "RECORD_DECISION_OR_STOP",
-        "PLAN": "PREPARE_MANUAL_LAUNCH_PACKET",
-        "DISPATCH": "AWAIT_MANUAL_WORKER_REFERENCE",
+        "PLAN": "ACQUIRE_OWNERSHIP_AND_START_ROOT_IMPLEMENTATION",
+        "DISPATCH": "ROOT_IMPLEMENTATION_OR_EXCEPTIONAL_WORKER_EVENT",
         "VERIFY": "REUSE_OR_RUN_REQUIRED_VERIFICATION",
         "INTEGRATE": "AWAIT_MAINTAINER_INTEGRATION_AUTHORIZATION",
         "CLOSE": "STOP",
@@ -1338,9 +2069,10 @@ def _advance_result(
 ) -> dict[str, Any]:
     result = {
         "advanced": advanced,
+        "phase": state["phase"],
+        "authorization_state": state["authorization_state"],
         "next_action": next_step,
         "automatic_transitions": transitions,
-        "context": compile_context(state),
     }
     result.update(extra)
     return result
@@ -1424,49 +2156,6 @@ def _refresh_verification_authorization(state: dict[str, Any]) -> None:
                 state["authorization_state"] = "VERIFIED"
                 return
     state["authorization_state"] = "IMPLEMENTING"
-
-
-def _registered_verifier(
-    state: dict[str, Any],
-    task_key: str,
-    subject: dict[str, Any],
-    requested: dict[str, Any],
-    verifier_reference: Any,
-    *,
-    verification_sequence: Any = None,
-) -> bool:
-    if not isinstance(verifier_reference, str) or not verifier_reference:
-        return False
-    request_identity = _verification_request(requested)
-    if verification_sequence is not None and (
-        not isinstance(verification_sequence, int) or verification_sequence < 0
-    ):
-        return False
-    for evidence in state["evidence"]:
-        if (
-            evidence.get("kind") != "verifier_registration"
-            or evidence.get("task_key") != task_key
-            or evidence.get("accepted") is not True
-            or evidence.get("verifier_reference") != verifier_reference
-        ):
-            continue
-        try:
-            if (
-                _identity(evidence.get("subject"), subject["base"]) != subject
-                or _verification_request(evidence) != request_identity
-            ):
-                continue
-        except WorkflowError:
-            continue
-        if verification_sequence is None:
-            return True
-        registration_sequence = evidence.get("sequence")
-        if (
-            isinstance(registration_sequence, int)
-            and registration_sequence < verification_sequence
-        ):
-            return True
-    return False
 
 
 def _integration_evidence(
@@ -1573,16 +2262,14 @@ def _authorize_integration(state: dict[str, Any], record: dict[str, Any]) -> Non
             and item.get("status") == "PASS"
             and item.get("sequence", 0) > handoff.get("sequence", 0)
             and item.get("sequence", 0) > review_sequence
-            and _registered_verifier(
-                state, key, identity, final_request, item.get("verifier_reference")
-            )
+            and item.get("executor") == ROOT_EXECUTOR
         ):
             final_gate = item
             break
     if final_gate is None:
         raise WorkflowError(
             "integration authorization requires current exact-subject "
-            "registered-verifier temper-gate all PASS evidence after final assembly"
+            "root-executed temper-gate all PASS evidence after final assembly"
         )
     public_safety = None
     for item in reversed(state["verification"]):
@@ -1599,6 +2286,7 @@ def _authorize_integration(state: dict[str, Any], record: dict[str, Any]) -> Non
         if (
             _latest_verification(state, key, identity, public_request) is item
             and item.get("status") == "PASS"
+            and item.get("executor") == ROOT_EXECUTOR
         ):
             public_safety = item
             break
@@ -1621,6 +2309,9 @@ def _create_dispatch_intent(
     writer = TASK_WRITE_CAPABILITY[task["task_class"]]
     if not writer:
         raise WorkflowError("read-only task class cannot dispatch a writer")
+    exception = _require_writer_exception(state, task, record, "subagent")
+    if task["route"]["declared_route_compliance"] == "FAIL":
+        raise WorkflowError("observed route mismatch blocks implementation")
     if "writer" in record and record["writer"] is not writer:
         raise WorkflowError("worker write capability is derived from task class")
     supplied_route = record.get("route")
@@ -1634,7 +2325,7 @@ def _create_dispatch_intent(
     ):
         raise WorkflowError("dispatch requires an active ownership lease")
     validate_route(task["route"], task["task_class"])
-    _check_writer_capacity(state, record)
+    _check_writer_capacity(state, task, record, "subagent")
     intent = {
         "reference": f"manual:{key}",
         "task_key": key,
@@ -1643,6 +2334,8 @@ def _create_dispatch_intent(
         "status": "SPAWN_REQUESTED",
         "route": copy.deepcopy(task["route"]),
         "attempt": record.get("attempt", 1),
+        "execution_mode": "subagent",
+        "writer_exception_reference": exception["reference"],
         "independence_guards": copy.deepcopy(record.get("independence_guards")),
         "monitor": _new_monitor("SPAWN_REQUESTED"),
     }
@@ -1694,11 +2387,22 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
             None,
         )
         if existing is not None:
+            if existing.get("execution_mode") == "root":
+                return _advance_result(
+                    state,
+                    advanced=False,
+                    next_step="ROOT_IMPLEMENTATION_IN_PROGRESS",
+                    transitions=[],
+                )
             return _advance_result(
                 state,
                 advanced=False,
                 next_step="AWAIT_MANUAL_WORKER_REFERENCE",
                 transitions=[],
+            )
+        if record.get("writer_mode") != "subagent":
+            raise WorkflowError(
+                "manual writer continuation requires writer_mode subagent"
             )
         _create_dispatch_intent(state, task, record)
         return _advance_result(
@@ -1727,10 +2431,28 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
                 next_step="ACQUIRE_REQUIRED_OWNERSHIP",
                 transitions=transitions,
             )
-        _create_dispatch_intent(state, task, record)
+        writer_mode = record.get("writer_mode", "root")
+        if writer_mode == "root":
+            root_writer = _activate_root_writer(state, task, record)
+        elif writer_mode == "subagent":
+            _create_dispatch_intent(state, task, record)
+            root_writer = None
+        else:
+            raise WorkflowError("writer_mode must be root or subagent")
         transition(state, "DISPATCH")
         state["authorization_state"] = "IMPLEMENTING"
         transitions.append("DISPATCH")
+        if root_writer is not None:
+            return _advance_result(
+                state,
+                advanced=True,
+                next_step="ROOT_IMPLEMENTATION_IN_PROGRESS",
+                transitions=transitions,
+                root_writer={
+                    "reference": root_writer["reference"],
+                    "attempt": root_writer["attempt"],
+                },
+            )
         return _advance_result(
             state,
             advanced=True,
@@ -1801,13 +2523,6 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
                 transitions=transitions,
                 review_packet=copy.deepcopy(review),
             )
-        if review["status"] == "REPAIR_LIMIT_REACHED":
-            return _advance_result(
-                state,
-                advanced=False,
-                next_step="REPAIR_LIMIT_REACHED",
-                transitions=transitions,
-            )
         if review["status"] == "REPAIR_IN_PROGRESS" and review["subject"] != subject:
             review["subject"] = copy.deepcopy(subject)
             review["status"] = "REQUIRED"
@@ -1817,22 +2532,14 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
                 review["status"] = "PASS"
                 review["completed_sequence"] = _next_sequence(state)
             elif review_status == "REPAIR_REQUIRED":
-                if review["repair_cycles"] >= 1:
-                    review["status"] = "REPAIR_LIMIT_REACHED"
-                    return _advance_result(
-                        state,
-                        advanced=False,
-                        next_step="REPAIR_LIMIT_REACHED",
-                        transitions=transitions,
-                    )
-                review["repair_cycles"] = 1
+                review["repair_cycles"] += 1
                 review["status"] = "REPAIR_IN_PROGRESS"
                 _transition_with_authorization(state, "PLAN", "MAINTAINER_AUTHORIZED")
                 transitions.append("PLAN")
                 return _advance_result(
                     state,
                     advanced=True,
-                    next_step="REPAIR_CYCLE_PERMITTED",
+                    next_step="REPAIR_IN_SCOPE",
                     transitions=transitions,
                     review_packet=copy.deepcopy(review),
                 )
@@ -1906,6 +2613,8 @@ def build_parser() -> argparse.ArgumentParser:
             "acquire-ownership",
             "release-ownership",
             "record-evidence",
+            "validate-route-trial",
+            "record-route-trial",
             "record-verification",
             "verification-reuse",
             "checkpoint",
@@ -1956,6 +2665,17 @@ def main(argv: list[str] | None = None) -> int:
             result, changed = release_ownership(state, record), True
         elif args.command == "record-evidence":
             result, changed = record_evidence(state, record), True
+        elif args.command == "validate-route-trial":
+            trial = validate_route_trial(record)
+            result = {
+                "valid": True,
+                "trial_id": trial["trial_id"],
+                "eligible_for_default_route_decision": trial[
+                    "eligible_for_default_route_decision"
+                ],
+            }
+        elif args.command == "record-route-trial":
+            result, changed = record_route_trial(state, record), True
         elif args.command == "record-verification":
             result, changed = record_verification(state, record), True
         elif args.command == "verification-reuse":

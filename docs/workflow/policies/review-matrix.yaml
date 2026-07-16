@@ -17,8 +17,8 @@ phase1_public_review_rows:
   cold_technical_review:
     default: one_cold_terra_high_when_triggered
     required_evidence: [exact_subject_identity, rubric, evidence_refs, no_write_ownership]
-    elevate_when: [one_concrete_unresolved_finding_after_review]
-    elevated_route: bounded_second_perspective_only
+    elevate_when: [maintainer_decision_required]
+    elevated_route: maintainer_gate
   maintainer_decision_gate:
     default: maintainer_gate
     required_evidence: [decision_delta, constraints, verified_evidence, viable_options_when_needed]
@@ -29,7 +29,8 @@ phase1_multiplicity_policy:
   multiple_triggers: strengthen_one_rubric_without_creating_another_reviewer
   default_reviewer_count: 1
   protected_boundary_review: exactly_one_cold_terra_high
-  second_reviewer_requires: [one_specific_unresolved_finding, recorded_reason_for_independent_perspective]
+  maximum_independent_reviewers: 1
+  second_reviewer: prohibited_in_phase1
   automatic_stacking: prohibited
   public_rule: "Reviewers and model perspectives do not stack automatically. Unexercised premium or diversity review routes remain private."
   file_count_alone_triggers_review: false
