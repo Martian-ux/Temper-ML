@@ -129,6 +129,23 @@ def verification_record(subject=IDENTITY, key="task-one", **extra):
     return value
 
 
+def public_safety_record(subject=IDENTITY, key="task-one", **extra):
+    value = {
+        "task_key": key,
+        "reference": "verification:public",
+        "subject": subject,
+        "command": ["python", "scripts/public-safety.py"],
+        "scope": ["repository"],
+        "environment": {"lock": "committed"},
+        "side_effects": [],
+        "status": "PASS",
+        "verification_type": "public_safety",
+        "executor": "root",
+    }
+    value.update(extra)
+    return value
+
+
 def decision(key="task-one", identity=IDENTITY):
     return {
         "kind": "decision",
@@ -214,6 +231,13 @@ def matched_trial():
                         "selected_effort": "ultra",
                     }
                 )
+            selected_route["runtime_observation"] = {
+                "availability": "OBSERVED",
+                "source": "host_task_metadata",
+                "model": selected_route["declared_model"],
+                "effort": selected_route["declared_effort"],
+            }
+            selected_route["declared_route_compliance"] = "PASS"
             selected_route["experiment"] = matched_experiment(
                 label, pair_id, run_id, mix
             )
@@ -364,26 +388,15 @@ def dispatch_exceptional_worker(workflow, value, key="task-one"):
     return workflow.register_worker(value, {"reference": "writer-one", "task_key": key})
 
 
-def completed_candidate(workflow, value, key="task-one"):
+def assembled_candidate(workflow, value, key="task-one"):
     dispatch_worker(workflow, value, key)
     workflow.record_evidence(value, decision(key))
     workflow.ingest_handoff(value, handoff(key))
     workflow.record_verification(value, verification_record(key=key))
-    workflow.record_verification(
-        value,
-        {
-            "task_key": key,
-            "reference": "verification:public",
-            "subject": IDENTITY,
-            "command": ["python", "scripts/public-safety.py"],
-            "scope": ["repository"],
-            "environment": {"lock": "committed"},
-            "side_effects": [],
-            "status": "PASS",
-            "verification_type": "public_safety",
-            "executor": "root",
-        },
-    )
+
+
+def completed_candidate(workflow, value, key="task-one"):
+    assembled_candidate(workflow, value, key)
     if not workflow.review_required(value["tasks"][key])["required"]:
         workflow.record_verification(
             value,
@@ -396,6 +409,7 @@ def completed_candidate(workflow, value, key="task-one"):
                 "executor": "root",
             },
         )
+        workflow.record_verification(value, public_safety_record(key=key))
 
 
 def test_canonical_cold_technical_review_class_is_routed():
@@ -689,7 +703,10 @@ def test_integration_requires_cold_review_final_gate_and_public_safety_evidence(
     completed_candidate(workflow, value)
     record = {"task_key": "task-one", "verification_request": verification_request()}
     workflow.advance(value, record)
-    workflow.advance(value, {**record, "review_status": "PASS"})
+    assert (
+        workflow.advance(value, {**record, "review_status": "PASS"})["next_action"]
+        == "RUN_ROOT_FINAL_GATE"
+    )
     request = {
         "actor": "maintainer",
         "authorization_state": "INTEGRATION_AUTHORIZED",
@@ -699,6 +716,7 @@ def test_integration_requires_cold_review_final_gate_and_public_safety_evidence(
         "verification_reference": "verification:unit",
         "verification_request": verification_request(),
     }
+    workflow.record_verification(value, public_safety_record())
     with pytest.raises(workflow.WorkflowError, match="root-executed"):
         workflow.authorize(value, request)
     workflow.record_verification(
@@ -711,6 +729,20 @@ def test_integration_requires_cold_review_final_gate_and_public_safety_evidence(
             "status": "PASS",
             "executor": "root",
         },
+    )
+    assert workflow.advance(value, record)["next_action"] == (
+        "RUN_ROOT_PUBLIC_SAFETY_AUDIT"
+    )
+    with pytest.raises(workflow.WorkflowError, match="public-safety"):
+        workflow.authorize(value, request)
+    workflow.record_verification(value, public_safety_record())
+    result = workflow.advance(value, {**record, "review_status": "PASS"})
+    assert result["next_action"] == "AWAIT_MAINTAINER_INTEGRATION_AUTHORIZATION"
+    assert result["integration_evidence"]["final_gate_reference"] == (
+        "verification:gate-after-review"
+    )
+    assert result["integration_evidence"]["public_safety_reference"] == (
+        "verification:public"
     )
     assert workflow.authorize(value, request)["phase"] == "INTEGRATE"
 
@@ -757,6 +789,98 @@ def test_final_gate_is_root_executed_once_per_immutable_candidate():
         )
 
 
+def test_failed_final_gate_returns_to_repair_without_requesting_a_duplicate():
+    workflow = load_workflow_module()
+    value = state(workflow)
+    workflow.register_task(value, task(task_class="protected_boundary_implementation"))
+    assembled_candidate(workflow, value)
+    record = {"task_key": "task-one", "verification_request": verification_request()}
+    workflow.advance(value, record)
+    assert (
+        workflow.advance(value, {**record, "review_status": "PASS"})["next_action"]
+        == "RUN_ROOT_FINAL_GATE"
+    )
+    failed_gate = {
+        "task_key": "task-one",
+        "reference": "verification:failed-gate",
+        "subject": IDENTITY,
+        **final_gate_request(),
+        "status": "FAIL",
+        "executor": "root",
+    }
+    workflow.record_verification(value, failed_gate)
+    with pytest.raises(workflow.WorkflowError, match="already recorded"):
+        workflow.record_verification(
+            value,
+            {
+                **failed_gate,
+                "reference": "verification:illegal-duplicate-gate",
+                "status": "PASS",
+            },
+        )
+    result = workflow.advance(value, record)
+    assert result["next_action"] == "REPAIR_IN_SCOPE"
+    assert result["failed_verification_type"] == "final_gate"
+    assert result["failed_verification_reference"] == "verification:failed-gate"
+    assert value["phase"] == "PLAN"
+    assert value["authorization_state"] == "MAINTAINER_AUTHORIZED"
+    assert value["reviews"][0]["status"] == "REPAIR_IN_PROGRESS"
+
+
+def test_unknown_final_gate_requires_evidence_reconciliation_not_a_rerun():
+    workflow = load_workflow_module()
+    value = state(workflow)
+    workflow.register_task(value, task())
+    assembled_candidate(workflow, value)
+    unknown_gate = {
+        "task_key": "task-one",
+        "reference": "verification:unknown-gate",
+        "subject": IDENTITY,
+        **final_gate_request(),
+        "status": "UNKNOWN",
+        "executor": "root",
+    }
+    workflow.record_verification(value, unknown_gate)
+    result = workflow.advance(
+        value,
+        {"task_key": "task-one", "verification_request": verification_request()},
+    )
+    assert result["next_action"] == "RECONCILE_FINAL_GATE_EVIDENCE"
+    assert result["verification_reference"] == "verification:unknown-gate"
+    assert result["verification_status"] == "UNKNOWN"
+    assert value["phase"] == "VERIFY"
+
+
+def test_failed_public_safety_audit_returns_to_repair():
+    workflow = load_workflow_module()
+    value = state(workflow)
+    workflow.register_task(value, task())
+    assembled_candidate(workflow, value)
+    workflow.record_verification(
+        value,
+        {
+            "task_key": "task-one",
+            "reference": "verification:gate",
+            "subject": IDENTITY,
+            **final_gate_request(),
+            "status": "PASS",
+            "executor": "root",
+        },
+    )
+    workflow.record_verification(
+        value,
+        public_safety_record(reference="verification:failed-public", status="FAIL"),
+    )
+    result = workflow.advance(
+        value,
+        {"task_key": "task-one", "verification_request": verification_request()},
+    )
+    assert result["next_action"] == "REPAIR_IN_SCOPE"
+    assert result["failed_verification_type"] == "public_safety"
+    assert result["failed_verification_reference"] == "verification:failed-public"
+    assert value["phase"] == "PLAN"
+
+
 def test_public_safety_requires_root_and_latest_pass():
     workflow = load_workflow_module()
     request = {
@@ -799,7 +923,7 @@ def test_authority_provenance_and_route_observation_fail_closed():
     invalid = task()
     invalid["route"]["runtime_observation"] = {
         "availability": "OBSERVED",
-        "source": "synthetic_telemetry",
+        "source": "host_task_metadata",
         "model": "other-model",
         "effort": "high",
     }
@@ -817,6 +941,17 @@ def test_authority_provenance_and_route_observation_fail_closed():
     )
     with pytest.raises(workflow.WorkflowError, match="route mismatch"):
         workflow.advance(value, {"task_key": "task-one"})
+
+    unsupported = task()
+    unsupported["route"]["runtime_observation"] = {
+        "availability": "OBSERVED",
+        "source": "synthetic_telemetry",
+        "model": unsupported["route"]["declared_model"],
+        "effort": unsupported["route"]["declared_effort"],
+    }
+    unsupported["route"]["declared_route_compliance"] = "PASS"
+    with pytest.raises(workflow.WorkflowError, match="supported telemetry source"):
+        workflow.validate_task(unsupported, exact_base=BASE)
 
 
 def test_route_selection_rejects_prompt_or_unknown_mechanisms():
@@ -933,6 +1068,75 @@ def test_route_trial_registry_requires_six_isolated_scored_pairs():
     )
     with pytest.raises(workflow.WorkflowError, match="same frozen task class"):
         workflow.validate_route_trial(mismatched_task_class)
+    unobserved = copy.deepcopy(complete)
+    unobserved_route = unobserved["pairs"][0]["runs"][0]["route"]
+    unobserved_route["runtime_observation"] = {
+        "availability": "UNAVAILABLE",
+        "source": "host_without_route_telemetry",
+        "model": "UNVERIFIED",
+        "effort": "UNVERIFIED",
+    }
+    unobserved_route["declared_route_compliance"] = "UNVERIFIED"
+    with pytest.raises(workflow.WorkflowError, match="supported observed telemetry"):
+        workflow.validate_route_trial(unobserved)
+
+    negative = copy.deepcopy(complete)
+    for pair in negative["pairs"]:
+        by_label = {run["route"]["experiment"]["label"]: run for run in pair["runs"]}
+        control_score = by_label["CONTROL"]["score"]
+        experimental_score = by_label["EXPERIMENTAL"]["score"]
+        by_label["CONTROL"]["score"] = experimental_score
+        by_label["EXPERIMENTAL"]["score"] = control_score
+    negative["aggregate"].update(
+        {
+            "mean_total_delta": -5,
+            "median_total_delta": -5,
+            "mean_quality_delta": -10,
+        }
+    )
+    with pytest.raises(workflow.WorkflowError, match="derived decision rule"):
+        workflow.validate_route_trial(negative)
+    negative["aggregate"].update(
+        {
+            "outcome": "NO_MATERIAL_BENEFIT",
+            "recommendation": "KEEP_CONTROL",
+        }
+    )
+    assert workflow.validate_route_trial(negative)["aggregate"]["recommendation"] == (
+        "KEEP_CONTROL"
+    )
+
+    escaped_p1 = copy.deepcopy(complete)
+    escaped_p1["aggregate"]["escaped_p1"] = True
+    with pytest.raises(workflow.WorkflowError, match="derived decision rule"):
+        workflow.validate_route_trial(escaped_p1)
+    escaped_p1["aggregate"]["recommendation"] = "KEEP_CONTROL"
+    assert workflow.validate_route_trial(escaped_p1)["aggregate"]["recommendation"] == (
+        "KEEP_CONTROL"
+    )
+
+    tie = copy.deepcopy(complete)
+    for pair in tie["pairs"]:
+        by_label = {run["route"]["experiment"]["label"]: run for run in pair["runs"]}
+        control_score = trial_score(80, pair["ledger_ref"])
+        control_score["raw"]["handoff_passed_items"] = 9
+        control_score["components"]["handoff"] = 90
+        control_score["components"]["total"] = 89
+        by_label["CONTROL"]["score"] = control_score
+        by_label["EXPERIMENTAL"]["score"] = trial_score(80, pair["ledger_ref"])
+    tie["aggregate"].update(
+        {
+            "mean_total_delta": 1,
+            "median_total_delta": 1,
+            "mean_quality_delta": 0,
+            "outcome": "TIE",
+            "recommendation": "KEEP_CONTROL",
+        }
+    )
+    assert workflow.validate_route_trial(tie)["aggregate"]["outcome"] == "TIE"
+    tie["aggregate"]["recommendation"] = "ADOPT_EXPERIMENTAL"
+    with pytest.raises(workflow.WorkflowError, match="derived decision rule"):
+        workflow.validate_route_trial(tie)
 
     observational = {
         "trial_id": "trial-observational",
@@ -1186,7 +1390,13 @@ def test_persisted_verifier_and_duplicate_gate_records_fail_validation():
     duplicate = state(workflow)
     workflow.register_task(duplicate, task())
     completed_candidate(workflow, duplicate)
-    second_gate = dict(duplicate["verification"][-1])
+    second_gate = dict(
+        next(
+            item
+            for item in duplicate["verification"]
+            if item["command"] == workflow.FINAL_GATE_COMMAND
+        )
+    )
     second_gate["reference"] = "verification:duplicate-gate"
     second_gate["sequence"] += 1
     duplicate["verification"].append(second_gate)
@@ -1382,9 +1592,20 @@ def test_route_trial_policy_is_explicit_and_matched():
     procedure = (
         root / "docs" / "workflow" / "procedures" / "model-route-and-experiment.md"
     ).read_text(encoding="utf-8")
+    verification_procedure = (
+        root / "docs" / "workflow" / "procedures" / "verification-review-and-handoff.md"
+    ).read_text(encoding="utf-8")
     assert "matched_pairs: 6" in policy
     assert "runs_per_pair: 2" in policy
     assert "total_runs: 12" in policy
+    assert (
+        "supported_sources: [host_task_metadata, codex.conversation_starts]" in policy
+    )
+    assert "abs(mean_total_delta) <= 1.0" in policy
     assert "isolated worktrees" in procedure
     assert "label the comparison `OBSERVATIONAL`" in procedure
     assert "total = 0.50 * quality" in procedure
+    assert "RUN_ROOT_FINAL_GATE" in verification_procedure
+    assert "RUN_ROOT_PUBLIC_SAFETY_AUDIT" in verification_procedure
+    assert "RECONCILE_FINAL_GATE_EVIDENCE" in verification_procedure
+    assert "RECONCILE_PUBLIC_SAFETY_EVIDENCE" in verification_procedure

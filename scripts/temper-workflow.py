@@ -71,6 +71,10 @@ ROUTE_MODEL_MARKER = {
     "sol-high": "sol",
     "sol-ultra": "sol",
 }
+SUPPORTED_ROUTE_TELEMETRY_SOURCES = {
+    "codex.conversation_starts",
+    "host_task_metadata",
+}
 TRIAL_PROTOCOL_REF = "docs/workflow/procedures/model-route-and-experiment.md"
 TRIAL_TASK_MIX = {
     "fixed_snapshot_cold_review": 2,
@@ -456,6 +460,10 @@ def validate_route(route: Any, task_class: str | None = None) -> None:
     observed_model = observation.get("model")
     observed_effort = observation.get("effort")
     if availability == "OBSERVED":
+        if source not in SUPPORTED_ROUTE_TELEMETRY_SOURCES:
+            raise WorkflowError(
+                "observed runtime route requires a supported telemetry source"
+            )
         if not all(
             isinstance(value, str) and value and value != "UNVERIFIED"
             for value in (observed_model, observed_effort)
@@ -776,6 +784,17 @@ def validate_route_trial(record: Any) -> dict[str, Any]:
             context_ids.add(context_id)
             route = _as_object(run.get("route"), f"trial run {run_id} route")
             validate_route(route, task_class)
+            observation = route["runtime_observation"]
+            if (
+                observation["availability"] != "OBSERVED"
+                or route["declared_route_compliance"] != "PASS"
+                or observation["model"] != route["declared_model"]
+                or observation["effort"] != route["declared_effort"]
+            ):
+                raise WorkflowError(
+                    "matched trial runs require supported observed telemetry "
+                    "proving declared-route compliance"
+                )
             experiment = route["experiment"]
             label = experiment["label"]
             if label not in {"CONTROL", "EXPERIMENTAL"} or label in by_label:
@@ -841,25 +860,36 @@ def validate_route_trial(record: Any) -> dict[str, Any]:
             raise WorkflowError(f"route trial aggregate {name} is not reproducible")
     if not isinstance(aggregate.get("escaped_p1"), bool):
         raise WorkflowError("route trial aggregate escaped_p1 must be boolean")
-    if aggregate.get("outcome") not in {
-        "MATERIAL_QUALITY_BENEFIT",
-        "NO_MATERIAL_BENEFIT",
-        "TIE",
-    }:
-        raise WorkflowError("route trial aggregate outcome is unknown")
-    if aggregate.get("recommendation") not in {
-        "ADOPT_EXPERIMENTAL",
-        "KEEP_CONTROL",
-        "NO_CHANGE",
-    }:
-        raise WorkflowError("route trial aggregate recommendation is unknown")
-    if aggregate.get("recommendation") == "ADOPT_EXPERIMENTAL" and (
-        aggregate.get("outcome") != "MATERIAL_QUALITY_BENEFIT"
-        or aggregate["escaped_p1"]
+    mean_total_delta = expected_aggregate["mean_total_delta"]
+    repeatable_pair_wins = sum(
+        total_delta > 1.0 and quality_delta > 1.0
+        for total_delta, quality_delta in zip(total_deltas, quality_deltas, strict=True)
+    )
+    if abs(mean_total_delta) <= 1.0:
+        expected_outcome = "TIE"
+    elif (
+        mean_total_delta > 1.0
+        and expected_aggregate["median_total_delta"] > 1.0
+        and expected_aggregate["mean_quality_delta"] > 1.0
+        and repeatable_pair_wins >= 4
     ):
+        expected_outcome = "MATERIAL_QUALITY_BENEFIT"
+    else:
+        expected_outcome = "NO_MATERIAL_BENEFIT"
+    if aggregate.get("outcome") != expected_outcome:
         raise WorkflowError(
-            "experimental route adoption requires material quality benefit and no "
-            "escaped P1"
+            "route trial aggregate outcome does not match the derived decision rule"
+        )
+    expected_recommendation = (
+        "ADOPT_EXPERIMENTAL"
+        if expected_outcome == "MATERIAL_QUALITY_BENEFIT"
+        and not aggregate["escaped_p1"]
+        else "KEEP_CONTROL"
+    )
+    if aggregate.get("recommendation") != expected_recommendation:
+        raise WorkflowError(
+            "route trial aggregate recommendation does not match the derived "
+            "decision rule"
         )
     return copy.deepcopy(record)
 
@@ -2163,6 +2193,8 @@ def _integration_evidence(
     handoff: dict[str, Any],
     verification: dict[str, Any],
     review: dict[str, Any] | None,
+    final_gate: dict[str, Any],
+    public_safety: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "task_key": task_key,
@@ -2170,6 +2202,8 @@ def _integration_evidence(
         "verification": copy.deepcopy(verification),
         "scope_safety": handoff["scope_safety"],
         "review": review["status"] if review is not None else "NOT_REQUIRED",
+        "final_gate_reference": final_gate["reference"],
+        "public_safety_reference": public_safety["reference"],
     }
 
 
@@ -2187,6 +2221,118 @@ def _matching_handoff_verification(
         == _verification_request(verification)
         for item in handoff.get("verification_references", [])
     )
+
+
+def _latest_root_final_gate(
+    state: dict[str, Any],
+    task_key: str,
+    identity: dict[str, Any],
+    handoff: dict[str, Any],
+    review: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    review_sequence = (
+        review.get("completed_sequence", review.get("sequence", 0))
+        if review is not None
+        else 0
+    )
+    candidate = next(
+        (
+            item
+            for item in reversed(state["verification"])
+            if item.get("task_key") == task_key
+            and item.get("subject") == identity
+            and item.get("command") == FINAL_GATE_COMMAND
+        ),
+        None,
+    )
+    if candidate is None:
+        return None
+    final_gate = _as_object(candidate, "final gate verification")
+    final_request = {
+        name: final_gate[name]
+        for name in ("command", "scope", "environment", "side_effects")
+    }
+    latest = _latest_verification(state, task_key, identity, final_request)
+    if latest is not final_gate:
+        return None
+    if (
+        final_gate.get("sequence", 0) <= handoff.get("sequence", 0)
+        or final_gate.get("sequence", 0) <= review_sequence
+        or final_gate.get("executor") != ROOT_EXECUTOR
+    ):
+        return None
+    return final_gate
+
+
+def _current_root_final_gate(
+    state: dict[str, Any],
+    task_key: str,
+    identity: dict[str, Any],
+    handoff: dict[str, Any],
+    review: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    final_gate = _latest_root_final_gate(state, task_key, identity, handoff, review)
+    if (
+        final_gate is not None
+        and final_gate.get("status") == "PASS"
+        and final_gate.get("invalidated") is not True
+    ):
+        return final_gate
+    return None
+
+
+def _latest_root_public_safety(
+    state: dict[str, Any],
+    task_key: str,
+    identity: dict[str, Any],
+    *,
+    after_sequence: int,
+) -> dict[str, Any] | None:
+    candidate = next(
+        (
+            item
+            for item in reversed(state["verification"])
+            if item.get("task_key") == task_key
+            and item.get("subject") == identity
+            and item.get("verification_type") == "public_safety"
+        ),
+        None,
+    )
+    if candidate is None:
+        return None
+    public_safety = _as_object(candidate, "public-safety verification")
+    public_request = {
+        name: public_safety[name]
+        for name in ("command", "scope", "environment", "side_effects")
+    }
+    latest = _latest_verification(state, task_key, identity, public_request)
+    if latest is not public_safety:
+        return None
+    if (
+        public_safety.get("sequence", 0) <= after_sequence
+        or public_safety.get("executor") != ROOT_EXECUTOR
+    ):
+        return None
+    return public_safety
+
+
+def _current_root_public_safety(
+    state: dict[str, Any],
+    task_key: str,
+    identity: dict[str, Any],
+    *,
+    after_sequence: int,
+) -> dict[str, Any] | None:
+    public_safety = _latest_root_public_safety(
+        state, task_key, identity, after_sequence=after_sequence
+    )
+    if (
+        public_safety is not None
+        and public_safety.get("status") == "PASS"
+        and public_safety.get("invalidated") is not True
+    ):
+        return public_safety
+    return None
 
 
 def _authorize_integration(state: dict[str, Any], record: dict[str, Any]) -> None:
@@ -2240,56 +2386,15 @@ def _authorize_integration(state: dict[str, Any], record: dict[str, Any]) -> Non
         raise WorkflowError(
             "integration authorization requires a passing review of the exact subject"
         )
-    review_sequence = (
-        review.get("completed_sequence", review.get("sequence", 0))
-        if review is not None
-        else 0
-    )
-    final_gate = None
-    for item in reversed(state["verification"]):
-        if (
-            item.get("task_key") != key
-            or item.get("subject") != identity
-            or item.get("command") != ["python", "scripts/temper-gate.py", "all"]
-        ):
-            continue
-        final_request = {
-            name: item[name]
-            for name in ("command", "scope", "environment", "side_effects")
-        }
-        if (
-            _latest_verification(state, key, identity, final_request) is item
-            and item.get("status") == "PASS"
-            and item.get("sequence", 0) > handoff.get("sequence", 0)
-            and item.get("sequence", 0) > review_sequence
-            and item.get("executor") == ROOT_EXECUTOR
-        ):
-            final_gate = item
-            break
+    final_gate = _current_root_final_gate(state, key, identity, handoff, review)
     if final_gate is None:
         raise WorkflowError(
             "integration authorization requires current exact-subject "
             "root-executed temper-gate all PASS evidence after final assembly"
         )
-    public_safety = None
-    for item in reversed(state["verification"]):
-        if (
-            item.get("task_key") != key
-            or item.get("subject") != identity
-            or item.get("verification_type") != "public_safety"
-        ):
-            continue
-        public_request = {
-            name: item[name]
-            for name in ("command", "scope", "environment", "side_effects")
-        }
-        if (
-            _latest_verification(state, key, identity, public_request) is item
-            and item.get("status") == "PASS"
-            and item.get("executor") == ROOT_EXECUTOR
-        ):
-            public_safety = item
-            break
+    public_safety = _current_root_public_safety(
+        state, key, identity, after_sequence=final_gate["sequence"]
+    )
     if public_safety is None:
         raise WorkflowError(
             "integration authorization requires exact-subject public-safety "
@@ -2529,8 +2634,9 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
         review_status = record.get("review_status")
         if review_status is not None:
             if review_status == "PASS":
-                review["status"] = "PASS"
-                review["completed_sequence"] = _next_sequence(state)
+                if review["status"] != "PASS":
+                    review["status"] = "PASS"
+                    review["completed_sequence"] = _next_sequence(state)
             elif review_status == "REPAIR_REQUIRED":
                 review["repair_cycles"] += 1
                 review["status"] = "REPAIR_IN_PROGRESS"
@@ -2553,13 +2659,94 @@ def advance(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
                 transitions=transitions,
                 review_packet=copy.deepcopy(review),
             )
+    final_gate = _current_root_final_gate(state, key, subject, handoff, review)
+    if final_gate is None:
+        latest_gate = _latest_root_final_gate(state, key, subject, handoff, review)
+        if latest_gate is not None:
+            if (
+                latest_gate.get("status") == "FAIL"
+                and latest_gate.get("invalidated") is not True
+            ):
+                if review is not None:
+                    review["status"] = "REPAIR_IN_PROGRESS"
+                _transition_with_authorization(state, "PLAN", "MAINTAINER_AUTHORIZED")
+                transitions.append("PLAN")
+                return _advance_result(
+                    state,
+                    advanced=True,
+                    next_step="REPAIR_IN_SCOPE",
+                    transitions=transitions,
+                    failed_verification_type="final_gate",
+                    failed_verification_reference=latest_gate["reference"],
+                )
+            return _advance_result(
+                state,
+                advanced=False,
+                next_step="RECONCILE_FINAL_GATE_EVIDENCE",
+                transitions=transitions,
+                verification_reference=latest_gate["reference"],
+                verification_status=latest_gate["status"],
+            )
+        return _advance_result(
+            state,
+            advanced=False,
+            next_step="RUN_ROOT_FINAL_GATE",
+            transitions=transitions,
+            verification_subject=copy.deepcopy(subject),
+            verification_command=copy.deepcopy(FINAL_GATE_COMMAND),
+        )
+    public_safety = _current_root_public_safety(
+        state, key, subject, after_sequence=final_gate["sequence"]
+    )
+    if public_safety is None:
+        latest_public_safety = _latest_root_public_safety(
+            state, key, subject, after_sequence=final_gate["sequence"]
+        )
+        if latest_public_safety is not None:
+            if (
+                latest_public_safety.get("status") == "FAIL"
+                and latest_public_safety.get("invalidated") is not True
+            ):
+                if review is not None:
+                    review["status"] = "REPAIR_IN_PROGRESS"
+                _transition_with_authorization(state, "PLAN", "MAINTAINER_AUTHORIZED")
+                transitions.append("PLAN")
+                return _advance_result(
+                    state,
+                    advanced=True,
+                    next_step="REPAIR_IN_SCOPE",
+                    transitions=transitions,
+                    failed_verification_type="public_safety",
+                    failed_verification_reference=latest_public_safety["reference"],
+                )
+            return _advance_result(
+                state,
+                advanced=False,
+                next_step="RECONCILE_PUBLIC_SAFETY_EVIDENCE",
+                transitions=transitions,
+                verification_reference=latest_public_safety["reference"],
+                verification_status=latest_public_safety["status"],
+            )
+        return _advance_result(
+            state,
+            advanced=False,
+            next_step="RUN_ROOT_PUBLIC_SAFETY_AUDIT",
+            transitions=transitions,
+            verification_subject=copy.deepcopy(subject),
+            final_gate_reference=final_gate["reference"],
+        )
     return _advance_result(
         state,
         advanced=False,
         next_step="AWAIT_MAINTAINER_INTEGRATION_AUTHORIZATION",
         transitions=transitions,
         integration_evidence=_integration_evidence(
-            key, handoff, reusable_verification, review
+            key,
+            handoff,
+            reusable_verification,
+            review,
+            final_gate,
+            public_safety,
         ),
     )
 

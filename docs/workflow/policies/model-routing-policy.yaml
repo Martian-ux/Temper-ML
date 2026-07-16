@@ -44,6 +44,7 @@ route_record:
     required: [availability, source, model, effort]
     availability: [OBSERVED, UNAVAILABLE]
     supported_sources: [host_task_metadata, codex.conversation_starts]
+    observed_source_rule: "OBSERVED is valid only for a supported source; a nonempty free-form source is insufficient."
     unavailable_values: {model: UNVERIFIED, effort: UNVERIFIED}
     rule: "Observation availability states whether supported telemetry exposed runtime values; it does not itself decide compliance."
   declared_route_compliance:
@@ -55,6 +56,7 @@ route_record:
   experiment:
     labels: [NOT_EXPERIMENT, CONTROL, EXPERIMENTAL, OBSERVATIONAL]
     matched_run_requirement: "CONTROL and EXPERIMENTAL require predeclared=true plus trial_id, pair_id, run_id, protocol_ref, frozen_task_identity, isolation_ref, and task_mix."
+    matched_result_runtime_requirement: "Every run in a MATCHED_TRIAL must have supported OBSERVED runtime model/effort, exact agreement with the declaration, and PASS declared-route compliance."
     observational_rule: "Any comparison that was not predeclared or did not use the same frozen task in isolated worktrees is OBSERVATIONAL and cannot establish a default route."
 
 selection_mechanisms:
@@ -86,9 +88,16 @@ ultra_trial:
   unmatched_result: OBSERVATIONAL
   result_registry:
     command: validate-route-trial
-    matched_requirement: "Exactly six complete pairs must bind unique run/context identities, the frozen task, verified isolation, the required task mix, one CONTROL and one EXPERIMENTAL route, one shared ledger and weight per pair, raw metrics, ledger evidence, pair-aware zero-weight quality, normalized component scores, and reproducible aggregate deltas."
+    matched_requirement: "Exactly six complete pairs must bind unique run/context identities, the frozen task, verified isolation, the required task mix, one CONTROL and one EXPERIMENTAL route with supported observed PASS telemetry, one shared ledger and weight per pair, raw metrics, ledger evidence, pair-aware zero-weight quality, normalized component scores, and reproducible aggregate deltas."
     observational_eligibility: false
     default_route_rule: "Only a MATCHED_TRIAL record accepted by the executable registry is eligible to inform a route-default decision; the maintainer still owns the decision."
+  decision_rule:
+    delta_direction: experimental_minus_control
+    tie: "TIE when abs(mean_total_delta) <= 1.0."
+    material_benefit: "MATERIAL_QUALITY_BENEFIT only when mean_total_delta, median_total_delta, and mean_quality_delta are each > 1.0 and at least four of six pairs have both total_delta and quality_delta > 1.0."
+    fallback: NO_MATERIAL_BENEFIT
+    recommendation: "ADOPT_EXPERIMENTAL only for MATERIAL_QUALITY_BENEFIT with escaped_p1=false; otherwise KEEP_CONTROL."
+    validation: "The registry derives and strictly validates outcome and recommendation; callers cannot select them."
 
 elevation_rule: "Routine work uses the least expensive sufficient route. Any elevation requires explicit recorded justification. Ultra is allowed only for a predeclared EXPERIMENTAL run or a separately authorized bounded architecture decision."
 projection_rule: "Only public-safe route declarations and results may be projected. Operational telemetry, receipts, task IDs, and provider identifiers remain private."
