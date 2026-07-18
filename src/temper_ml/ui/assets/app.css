@@ -725,7 +725,19 @@ pre,
   gap: 0.55rem;
 }
 
+.review-capture {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.55rem;
+}
+
+.review-capture label {
+  grid-column: 1 / -1;
+}
+
 .review-actions button,
+.review-capture button,
 .local-use-grid button {
   padding-inline: 0.75rem;
 }
@@ -979,6 +991,11 @@ pre {
 
   .review-actions {
     grid-column: 1;
+  }
+
+  .review-capture {
+    grid-column: 1;
+    grid-template-columns: 1fr;
   }
 
   .action-row,

@@ -576,6 +576,17 @@ class FixtureJourneyService:
 
     def evaluate_candidates(self) -> dict[str, object]:
         artifacts = self._candidate_artifacts()
+        current_integrity = {}
+        local_use = LocalUseService(self.project_root)
+        for key in ("ember", "slate"):
+            artifact = artifacts[key]
+            model, group, target = self._artifact_dependencies(artifact)
+            current_integrity[key] = local_use.inspect_artifact(
+                artifact,
+                model,
+                group,
+                target,
+            ).integrity
         service = EvaluationService(self.project_root)
         development = self._ensure_suite(service, CaseSuiteKind.DEVELOPMENT)
         confirmation = self._ensure_suite(service, CaseSuiteKind.CONFIRMATION)
@@ -590,7 +601,7 @@ class FixtureJourneyService:
                 candidate=record_reference(artifact),
                 evaluation_mode=EvaluationMode.FULL_SUITE,
                 artifact_integrity_status=ArtifactIntegrityStatus.PASSED,
-                artifact_integrity_evidence=artifact.integrity_evidence,
+                artifact_integrity_evidence=current_integrity[key].evidence_identity,
                 evidence_status=EvidenceStatus.PASSED,
                 metrics=(
                     MetricObservation(
@@ -701,7 +712,7 @@ class FixtureJourneyService:
         if assessment is None:
             raise ApplicationServiceError("user_decision_candidate_unassessed")
         decision = UserDecision(
-            decision_id=f"decision-fixture-{candidate_key}-{decision_status.value}",
+            decision_id=self._next_logical_id("decision-fixture", UserDecision),
             recommendation=record_reference(recommendation),
             candidate=candidate,
             status=decision_status,
@@ -982,12 +993,12 @@ class FixtureJourneyService:
         if candidate_key not in artifacts:
             raise ApplicationServiceError("candidate_not_found")
         artifact = artifacts[candidate_key]
-        decisions = self._records(UserDecision)
-        permitted = any(
-            decision.candidate == record_reference(artifact)
-            and decision.status
+        current = EvaluationService(self.project_root).current_decision()
+        permitted = (
+            current is not None
+            and current.candidate == record_reference(artifact)
+            and current.status
             in (UserDecisionStatus.SELECTED, UserDecisionStatus.PINNED)
-            for decision in decisions
         )
         if not permitted:
             raise ApplicationServiceError("local_use_selection_required")
@@ -1112,7 +1123,8 @@ class WorkspaceQueryService:
         recommendations = tuple(
             item for item in records if isinstance(item, Recommendation)
         )
-        decisions = tuple(item for item in records if isinstance(item, UserDecision))
+        decisions = EvaluationService(self.project_root).decision_history()
+        current_decision = decisions[-1] if decisions else None
         sessions = tuple(item for item in records if isinstance(item, LocalUseSession))
         exports = tuple(item for item in records if isinstance(item, AdapterExport))
         run_streams = {snapshot.stream_id: snapshot.events for snapshot in streams}
@@ -1219,6 +1231,8 @@ class WorkspaceQueryService:
                     "status": decision.status.value,
                     "evidence_status": decision.evidence_status_at_decision.value,
                     "override_reason": decision.override_reason,
+                    "current": decision is current_decision,
+                    "superseded": decision is not current_decision,
                 }
                 for decision in decisions
             ],
@@ -1233,11 +1247,9 @@ class WorkspaceQueryService:
                 bool(resolutions),
                 len(artifacts) >= 2,
                 bool(recommendations),
-                any(
-                    decision.status
-                    in (UserDecisionStatus.SELECTED, UserDecisionStatus.PINNED)
-                    for decision in decisions
-                ),
+                current_decision is not None
+                and current_decision.status
+                in (UserDecisionStatus.SELECTED, UserDecisionStatus.PINNED),
             ),
         }
 

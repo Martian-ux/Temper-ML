@@ -852,6 +852,47 @@ class EvaluationService:
         self.store.verify()
         return decision
 
+    def decision_history(self) -> tuple[UserDecision, ...]:
+        """Return immutable registry decisions in their append-only event order."""
+
+        decisions = {
+            record.identity.value: record
+            for stored in self.store.iter_records()
+            if isinstance((record := stored.record), UserDecision)
+        }
+        snapshots = [
+            snapshot
+            for snapshot in self.store.iter_streams()
+            if snapshot.stream_id == "user-decisions"
+        ]
+        if not snapshots:
+            if decisions:
+                raise ApplicationServiceError("user_decision_event_missing")
+            return ()
+        if len(snapshots) != 1:
+            raise ApplicationServiceError("user_decision_stream_ambiguous")
+        prefix = "user-decision-recorded-"
+        history: list[UserDecision] = []
+        for event in snapshots[0].events:
+            if event.event_type != "user_decision_recorded":
+                raise ApplicationServiceError("user_decision_event_invalid")
+            if not event.idempotency_key.startswith(prefix):
+                raise ApplicationServiceError("user_decision_event_invalid")
+            identity = event.idempotency_key.removeprefix(prefix)
+            decision = decisions.pop(identity, None)
+            if decision is None:
+                raise ApplicationServiceError("user_decision_event_invalid")
+            history.append(decision)
+        if decisions:
+            raise ApplicationServiceError("user_decision_event_missing")
+        return tuple(history)
+
+    def current_decision(self) -> UserDecision | None:
+        """Resolve the one current registry state; each later event supersedes it."""
+
+        history = self.decision_history()
+        return history[-1] if history else None
+
     def _persist_new(self, record: TypedRecord, *, conflict_code: str) -> None:
         try:
             require_no_conflicting_logical_revision(

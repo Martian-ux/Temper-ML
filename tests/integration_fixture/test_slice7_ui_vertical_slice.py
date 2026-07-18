@@ -180,6 +180,11 @@ def test_slice_seven_fixture_journey_is_complete_through_ui_and_cli(
     try:
         workspace = _get_workspace(restarted)
         assert workspace["store"]["record_counts"]["artifact"] == 2
+        assert any(
+            review["reference"]["identity"] == reviewed["result"]["review"]["identity"]
+            and review["stage"] == "recorded"
+            for review in workspace["evaluation"]["reviews"]
+        )
         assert workspace["dataset"]["prepared_bytes_available"] is False
         assert workspace["dataset"]["reimport_required"] is False
     finally:

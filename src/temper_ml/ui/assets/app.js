@@ -7,7 +7,7 @@ let workspace = null;
 let activeStage = "setup";
 let latestComparison = null;
 let blindAliases = [];
-let latestReviewReference = null;
+let preferredReviewIdentity = null;
 
 const actions = {
   setup: () => post("/api/v1/setup", {}),
@@ -28,9 +28,9 @@ const actions = {
   "blind-reveal": () => post("/api/v1/playground/reviews/blind/reveal", {}),
   evaluate: () => post("/api/v1/evaluation/run", {}),
   capture: () => {
-    if (!latestReviewReference) throw new Error("completed_review_required");
+    const review = selectedCompletedReview();
     return post("/api/v1/evaluation/capture", {
-      review_identity: latestReviewReference.identity,
+      review_identity: review.reference.identity,
       suite_kind: "development",
     });
   },
@@ -120,18 +120,16 @@ function consumeAction(action, result) {
   } else if (action === "compare") {
     latestComparison = result;
     blindAliases = [];
-    latestReviewReference = null;
     renderComparison(result, false);
   } else if (action === "solo-review") {
-    latestReviewReference = result.review;
+    preferredReviewIdentity = result.review.identity.value;
   } else if (action === "blind-prepare") {
     blindAliases = result.packet.entries[0].outputs.map((item) => item.alias);
-    latestReviewReference = null;
     renderBlindPacket(result.packet);
   } else if (action === "blind-seal") {
-    latestReviewReference = result.review;
+    preferredReviewIdentity = result.review.identity.value;
   } else if (action === "blind-reveal") {
-    latestReviewReference = result.review;
+    preferredReviewIdentity = result.review.identity.value;
     revealIdentities(result.candidate_mappings);
   } else if (action === "focused" || action === "batch" || action === "export") {
     renderLocalResult(result);
@@ -169,7 +167,41 @@ function renderWorkspace() {
   renderResolutions();
   renderRuns();
   renderRecommendation();
+  renderReviewCapture();
   renderInspector();
+}
+
+function renderReviewCapture() {
+  const target = document.querySelector("#review-capture-selection");
+  const reviews = completedReviews();
+  const existing = target.value;
+  target.replaceChildren(...(
+    reviews.length
+      ? reviews.map((review) => element(
+        "option",
+        "",
+        `${review.mode} · ${review.reference.logical_id} · ${review.stage}`,
+        { value: review.reference.identity.value },
+      ))
+      : [element("option", "", "No completed review recorded", { value: "" })]
+  ));
+  const requested = preferredReviewIdentity || existing;
+  if (reviews.some((review) => review.reference.identity.value === requested)) {
+    target.value = requested;
+  }
+  preferredReviewIdentity = null;
+}
+
+function completedReviews() {
+  const completedStages = new Set(["recorded", "blind_sealed", "blind_revealed"]);
+  return (workspace?.evaluation?.reviews || []).filter((review) => completedStages.has(review.stage));
+}
+
+function selectedCompletedReview() {
+  const selected = value("review-capture-selection");
+  const review = completedReviews().find((item) => item.reference.identity.value === selected);
+  if (!review) throw new Error("completed_review_required");
+  return review;
 }
 
 function renderStages() {

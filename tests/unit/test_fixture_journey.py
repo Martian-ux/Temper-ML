@@ -83,6 +83,41 @@ def test_fixture_journey_runs_two_real_candidates_and_gates_local_use(
     assert with_capture["saved_canonical_session"] is True
 
 
+def test_latest_registry_decision_exclusively_controls_local_use(
+    tmp_path: Path,
+) -> None:
+    service = FixtureJourneyService(tmp_path)
+    service.setup_project()
+    service.import_dataset()
+    service.resolve_candidates()
+    service.launch_candidates()
+    service.evaluate_candidates()
+
+    service.record_decision(candidate_key="ember", status="selected")
+    assert service.focused_local_use(candidate_key="ember", prompt="Ember selected")
+
+    service.record_decision(candidate_key="slate", status="selected")
+    with pytest.raises(ApplicationServiceError, match="local_use_selection_required"):
+        service.focused_local_use(candidate_key="ember", prompt="Ember superseded")
+    assert service.focused_local_use(candidate_key="slate", prompt="Slate selected")
+
+    service.record_decision(candidate_key="slate", status="rejected")
+    with pytest.raises(ApplicationServiceError, match="local_use_selection_required"):
+        service.focused_local_use(candidate_key="slate", prompt="Slate rejected")
+
+    service.record_decision(candidate_key="ember", status="selected")
+    assert service.focused_local_use(candidate_key="ember", prompt="Ember reselected")
+    registry = service.workspace()["registry"]
+    assert [item["status"] for item in registry] == [
+        "selected",
+        "selected",
+        "rejected",
+        "selected",
+    ]
+    assert [item["current"] for item in registry] == [False, False, False, True]
+    assert [item["superseded"] for item in registry] == [True, True, True, False]
+
+
 def test_fixture_journey_supports_blind_seal_before_reveal(tmp_path: Path) -> None:
     service = FixtureJourneyService(tmp_path)
     service.setup_project()
@@ -174,6 +209,32 @@ def test_workspace_rechecks_artifact_bytes_and_surfaces_failures(
     assert by_key["slate"]["available"] is False
     assert by_key["slate"]["integrity_status"] == "failed"
     assert by_key["slate"]["failure_code"] == "artifact_content_identity_mismatch"
+
+
+def test_evaluation_cannot_recommend_a_corrupted_artifact(tmp_path: Path) -> None:
+    service = FixtureJourneyService(tmp_path)
+    service.setup_project()
+    service.import_dataset()
+    service.resolve_candidates()
+    service.launch_candidates()
+
+    artifact = (
+        tmp_path
+        / ".temper-fixture-output"
+        / "artifacts"
+        / "artifact-fixture-runtime"
+        / "adapter.bin"
+    )
+    artifact.write_bytes(b"corrupted fixture adapter")
+
+    with pytest.raises(
+        ApplicationServiceError, match="artifact_content_identity_mismatch"
+    ):
+        service.evaluate_candidates()
+
+    workspace = service.workspace()
+    assert workspace["evaluation"]["results"] == []
+    assert workspace["recommendation"] is None
 
 
 def test_inference_settings_remain_bounded() -> None:
