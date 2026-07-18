@@ -82,6 +82,20 @@ TRIAL_TASK_MIX = {
     "architecture_or_invariant_design": 1,
     "mechanical_negative_control": 1,
 }
+TRIAL_TASK_CLASS_BY_MIX = {
+    "fixed_snapshot_cold_review": "cold_technical_review",
+    "bounded_implementation_or_repair": "normal_implementation",
+    "architecture_or_invariant_design": "protected_boundary_implementation",
+    "mechanical_negative_control": "mechanical_change",
+}
+PUBLIC_SAFETY_AUDIT_SCHEMA = "temper-public-safety-audit-v1"
+PUBLIC_SAFETY_AUDIT_CATEGORIES = (
+    "exact_staged_diff",
+    "file_and_binary_metadata",
+    "secrets_and_private_data",
+    "commit_message",
+    "author_committer_identity",
+)
 TASK_WRITE_CAPABILITY = {
     "routine_administration": False,
     "mechanical_change": True,
@@ -194,6 +208,55 @@ def _verification_request(record: dict[str, Any]) -> tuple[Any, Any, Any, Any]:
     if any(name not in record for name in required):
         raise WorkflowError("verification request identity is incomplete")
     return tuple(copy.deepcopy(record[name]) for name in required)
+
+
+def _validate_public_safety_audit(record: dict[str, Any]) -> None:
+    audit = _as_object(record.get("audit_result"), "public-safety audit_result")
+    if set(audit) != {"schema", "categories"}:
+        raise WorkflowError(
+            "public-safety audit_result requires only schema and categories"
+        )
+    if audit.get("schema") != PUBLIC_SAFETY_AUDIT_SCHEMA:
+        raise WorkflowError("public-safety audit_result schema is unsupported")
+    categories = _as_object(
+        audit.get("categories"), "public-safety audit_result categories"
+    )
+    if set(categories) != set(PUBLIC_SAFETY_AUDIT_CATEGORIES):
+        raise WorkflowError(
+            "public-safety audit_result must cover every mandatory audit category"
+        )
+    category_statuses = []
+    for category in PUBLIC_SAFETY_AUDIT_CATEGORIES:
+        result = _as_object(
+            categories[category], f"public-safety audit category {category}"
+        )
+        if set(result) != {"status", "evidence_ref"}:
+            raise WorkflowError(
+                "public-safety audit categories require only status and evidence_ref"
+            )
+        status = result.get("status")
+        if status not in {"PASS", "FAIL", "UNKNOWN", "NON_REUSABLE"}:
+            raise WorkflowError("public-safety audit category status is unknown")
+        if (
+            not isinstance(result.get("evidence_ref"), str)
+            or not result["evidence_ref"]
+        ):
+            raise WorkflowError(
+                "public-safety audit categories require an evidence reference"
+            )
+        category_statuses.append(status)
+    if "FAIL" in category_statuses:
+        expected_status = "FAIL"
+    elif "UNKNOWN" in category_statuses:
+        expected_status = "UNKNOWN"
+    elif "NON_REUSABLE" in category_statuses:
+        expected_status = "NON_REUSABLE"
+    else:
+        expected_status = "PASS"
+    if record.get("status") != expected_status:
+        raise WorkflowError(
+            "public-safety verification status does not match its audit categories"
+        )
 
 
 def _next_sequence(state: dict[str, Any]) -> int:
@@ -519,6 +582,11 @@ def validate_route(route: Any, task_class: str | None = None) -> None:
             )
         if experiment["task_mix"] not in TRIAL_TASK_MIX:
             raise WorkflowError("matched run task_mix is not part of the Ultra trial")
+        expected_task_class = TRIAL_TASK_CLASS_BY_MIX[experiment["task_mix"]]
+        if task_class is not None and task_class != expected_task_class:
+            raise WorkflowError(
+                "matched run task_mix does not match its required task class"
+            )
     elif experiment.get("predeclared") is not False:
         raise WorkflowError(
             "non-experimental and observational runs cannot claim predeclaration"
@@ -528,7 +596,9 @@ def validate_route(route: Any, task_class: str | None = None) -> None:
         if label == "EXPERIMENTAL":
             route_allowed = declared_route == "sol-ultra" and declared_effort == "ultra"
         elif label == "CONTROL" and declared_route == "sol-high":
-            route_allowed = declared_effort == "high"
+            route_allowed = (
+                task_class != "mechanical_change" and declared_effort == "high"
+            )
         else:
             route_allowed = (
                 declared_route == expected_route and declared_effort in efforts
@@ -731,6 +801,7 @@ def validate_route_trial(record: Any) -> dict[str, Any]:
         raise WorkflowError("matched route trial requires exactly six pairs")
     pair_ids: set[str] = set()
     run_ids: set[str] = set()
+    context_ids: set[str] = set()
     mix_counts = {name: 0 for name in TRIAL_TASK_MIX}
     total_deltas: list[float] = []
     quality_deltas: list[float] = []
@@ -762,7 +833,6 @@ def validate_route_trial(record: Any) -> dict[str, Any]:
         if len(runs) != 2:
             raise WorkflowError("each route trial pair requires exactly two runs")
         by_label: dict[str, dict[str, Any]] = {}
-        context_ids: set[str] = set()
         for run_value in runs:
             run = _as_object(run_value, f"trial pair {pair_id} run")
             run_id = run.get("run_id")
@@ -1178,9 +1248,11 @@ def validate_state(state: Any) -> dict[str, Any]:
         if "verifier_reference" in verification:
             raise WorkflowError("final-verifier agent references are prohibited")
         subject = _identity(verification.get("subject"), repository["exact_base"])
+        is_public_safety = verification.get("verification_type") == "public_safety"
+        if is_public_safety:
+            _validate_public_safety_audit(verification)
         if (
-            verification.get("command") == FINAL_GATE_COMMAND
-            or verification.get("verification_type") == "public_safety"
+            verification.get("command") == FINAL_GATE_COMMAND or is_public_safety
         ) and verification.get("executor") != ROOT_EXECUTOR:
             raise WorkflowError(
                 "final gate and public-safety checks must be root-executed"
@@ -1814,6 +1886,8 @@ def record_verification(
         raise WorkflowError("final-verifier agent references are prohibited")
     is_final_gate = record["command"] == FINAL_GATE_COMMAND
     is_public_safety = record.get("verification_type") == "public_safety"
+    if is_public_safety:
+        _validate_public_safety_audit(record)
     if (is_final_gate or is_public_safety) and record.get("executor") != ROOT_EXECUTOR:
         raise WorkflowError("final gate and public-safety checks must be root-executed")
     if is_final_gate:
@@ -2301,6 +2375,7 @@ def _latest_root_public_safety(
     if candidate is None:
         return None
     public_safety = _as_object(candidate, "public-safety verification")
+    _validate_public_safety_audit(public_safety)
     public_request = {
         name: public_safety[name]
         for name in ("command", "scope", "environment", "side_effects")

@@ -74,21 +74,28 @@ telemetry_verification:
 ultra_trial:
   protocol_ref: docs/workflow/procedures/model-route-and-experiment.md
   control_routes: [task_class_default, sol-high]
+  control_route_rule: "sol-high is permitted for non-mechanical control runs; the mechanical negative control must use its terra-medium task-class default."
   experimental_route: sol-ultra
   matched_pairs: 6
   runs_per_pair: 2
   total_runs: 12
   pair_composition: {control: 1, experimental: 1}
   task_mix:
-    fixed_snapshot_cold_reviews: 2
-    bounded_implementations_or_repairs: 2
+    fixed_snapshot_cold_review: 2
+    bounded_implementation_or_repair: 2
     architecture_or_invariant_design: 1
     mechanical_negative_control: 1
+  task_class_by_mix:
+    fixed_snapshot_cold_review: cold_technical_review
+    bounded_implementation_or_repair: normal_implementation
+    architecture_or_invariant_design: protected_boundary_implementation
+    mechanical_negative_control: mechanical_change
+  task_class_rule: "Every pair and both of its runs must use the task class mapped from its task_mix label; a label/class mismatch is not matched-trial evidence."
   isolation: "Each pair uses one frozen task packet, exact base, fixtures, acceptance criteria, and independent worktrees; neither run may consume the other's output."
   unmatched_result: OBSERVATIONAL
   result_registry:
     command: validate-route-trial
-    matched_requirement: "Exactly six complete pairs must bind unique run/context identities, the frozen task, verified isolation, the required task mix, one CONTROL and one EXPERIMENTAL route with supported observed PASS telemetry, one shared ledger and weight per pair, raw metrics, ledger evidence, pair-aware zero-weight quality, normalized component scores, and reproducible aggregate deltas."
+    matched_requirement: "Exactly six complete pairs must bind globally unique run/context identities, the frozen task, verified isolation, the required task mix and mapped task class, one CONTROL and one EXPERIMENTAL route with supported observed PASS telemetry, one shared ledger and weight per pair, raw metrics, ledger evidence, pair-aware zero-weight quality, normalized component scores, and reproducible aggregate deltas."
     observational_eligibility: false
     default_route_rule: "Only a MATCHED_TRIAL record accepted by the executable registry is eligible to inform a route-default decision; the maintainer still owns the decision."
   decision_rule:

@@ -129,18 +129,40 @@ def verification_record(subject=IDENTITY, key="task-one", **extra):
     return value
 
 
+def public_safety_audit_result(status="PASS"):
+    categories = (
+        "exact_staged_diff",
+        "file_and_binary_metadata",
+        "secrets_and_private_data",
+        "commit_message",
+        "author_committer_identity",
+    )
+    return {
+        "schema": "temper-public-safety-audit-v1",
+        "categories": {
+            category: {
+                "status": status,
+                "evidence_ref": f"evidence:public-safety:{category}",
+            }
+            for category in categories
+        },
+    }
+
+
 def public_safety_record(subject=IDENTITY, key="task-one", **extra):
+    status = extra.get("status", "PASS")
     value = {
         "task_key": key,
         "reference": "verification:public",
         "subject": subject,
-        "command": ["python", "scripts/public-safety.py"],
+        "command": ["manual", "public-safety-audit-v1"],
         "scope": ["repository"],
         "environment": {"lock": "committed"},
         "side_effects": [],
-        "status": "PASS",
+        "status": status,
         "verification_type": "public_safety",
         "executor": "root",
+        "audit_result": public_safety_audit_result(status),
     }
     value.update(extra)
     return value
@@ -214,13 +236,20 @@ def matched_trial():
         "architecture_or_invariant_design",
         "mechanical_negative_control",
     ]
+    task_class_by_mix = {
+        "fixed_snapshot_cold_review": "cold_technical_review",
+        "bounded_implementation_or_repair": "normal_implementation",
+        "architecture_or_invariant_design": "protected_boundary_implementation",
+        "mechanical_negative_control": "mechanical_change",
+    }
     pairs = []
     for index, mix in enumerate(task_mix, start=1):
         pair_id = f"pair-{index}"
+        task_class = task_class_by_mix[mix]
         runs = []
         for label, quality in (("CONTROL", 80), ("EXPERIMENTAL", 90)):
             run_id = f"run-{index}-{label.casefold()}"
-            selected_route = route()
+            selected_route = route(task_class)
             if label == "EXPERIMENTAL":
                 selected_route.update(
                     {
@@ -245,7 +274,7 @@ def matched_trial():
                 {
                     "run_id": run_id,
                     "context_identity": f"context-{index}-{label.casefold()}",
-                    "task_class": "normal_implementation",
+                    "task_class": task_class,
                     "route": selected_route,
                     "score": trial_score(quality, f"ledger:{pair_id}"),
                 }
@@ -735,6 +764,16 @@ def test_integration_requires_cold_review_final_gate_and_public_safety_evidence(
     )
     with pytest.raises(workflow.WorkflowError, match="public-safety"):
         workflow.authorize(value, request)
+    generic_public_safety = public_safety_record(
+        reference="verification:generic-public"
+    )
+    del generic_public_safety["audit_result"]
+    with pytest.raises(workflow.WorkflowError, match="audit_result"):
+        workflow.record_verification(value, generic_public_safety)
+    false_pass = public_safety_record(reference="verification:false-public-pass")
+    false_pass["audit_result"] = public_safety_audit_result("FAIL")
+    with pytest.raises(workflow.WorkflowError, match="does not match"):
+        workflow.record_verification(value, false_pass)
     workflow.record_verification(value, public_safety_record())
     result = workflow.advance(value, {**record, "review_status": "PASS"})
     assert result["next_action"] == "AWAIT_MAINTAINER_INTEGRATION_AUTHORIZATION"
@@ -897,18 +936,7 @@ def test_public_safety_requires_root_and_latest_pass():
     completed_candidate(workflow, stale_safety)
     workflow.record_verification(
         stale_safety,
-        {
-            "task_key": "task-one",
-            "reference": "verification:public",
-            "subject": IDENTITY,
-            "command": ["python", "scripts/public-safety.py"],
-            "scope": ["repository"],
-            "environment": {"lock": "committed"},
-            "side_effects": [],
-            "status": "FAIL",
-            "verification_type": "public_safety",
-            "executor": "root",
-        },
+        public_safety_record(status="FAIL"),
     )
     with pytest.raises(workflow.WorkflowError, match="public-safety"):
         workflow.authorize(stale_safety, request)
@@ -1039,6 +1067,12 @@ def test_route_trial_registry_requires_six_isolated_scored_pairs():
     ]["runs"][0]["context_identity"]
     with pytest.raises(workflow.WorkflowError, match="unique run/context"):
         workflow.validate_route_trial(reused_context)
+    reused_cross_pair_context = copy.deepcopy(complete)
+    reused_cross_pair_context["pairs"][1]["runs"][0]["context_identity"] = (
+        reused_cross_pair_context["pairs"][0]["runs"][0]["context_identity"]
+    )
+    with pytest.raises(workflow.WorkflowError, match="unique run/context"):
+        workflow.validate_route_trial(reused_cross_pair_context)
     unscored = copy.deepcopy(complete)
     del unscored["pairs"][0]["runs"][0]["score"]
     with pytest.raises(workflow.WorkflowError, match="score must be a JSON object"):
@@ -1062,12 +1096,43 @@ def test_route_trial_registry_requires_six_isolated_scored_pairs():
     zero_runs[1]["score"]["raw"]["acceptance_complete"] = False
     with pytest.raises(workflow.WorkflowError, match="both runs' acceptance"):
         workflow.validate_route_trial(mixed_zero_ledger)
-    mismatched_task_class = copy.deepcopy(complete)
-    mismatched_task_class["pairs"][0]["runs"][1]["task_class"] = (
-        "protected_boundary_implementation"
+    mismatched_task_mix_class = copy.deepcopy(complete)
+    for run in mismatched_task_mix_class["pairs"][0]["runs"]:
+        run["task_class"] = "normal_implementation"
+    with pytest.raises(workflow.WorkflowError, match="task_mix"):
+        workflow.validate_route_trial(mismatched_task_mix_class)
+    mechanical_pair = complete["pairs"][-1]
+    mechanical_control = next(
+        run
+        for run in mechanical_pair["runs"]
+        if run["route"]["experiment"]["label"] == "CONTROL"
     )
-    with pytest.raises(workflow.WorkflowError, match="same frozen task class"):
-        workflow.validate_route_trial(mismatched_task_class)
+    assert mechanical_control["task_class"] == "mechanical_change"
+    assert mechanical_control["route"]["declared_route"] == "terra-medium"
+    mechanical_sol_high = copy.deepcopy(complete)
+    mechanical_sol_high_control = next(
+        run
+        for run in mechanical_sol_high["pairs"][-1]["runs"]
+        if run["route"]["experiment"]["label"] == "CONTROL"
+    )
+    mechanical_sol_high_route = mechanical_sol_high_control["route"]
+    mechanical_sol_high_route.update(
+        {
+            "declared_route": "sol-high",
+            "declared_model": "gpt-5.6-sol",
+            "declared_effort": "high",
+            "selected_model": "gpt-5.6-sol",
+            "selected_effort": "high",
+            "runtime_observation": {
+                "availability": "OBSERVED",
+                "source": "host_task_metadata",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+            },
+        }
+    )
+    with pytest.raises(workflow.WorkflowError, match="not permitted"):
+        workflow.validate_route_trial(mechanical_sol_high)
     unobserved = copy.deepcopy(complete)
     unobserved_route = unobserved["pairs"][0]["runs"][0]["route"]
     unobserved_route["runtime_observation"] = {
@@ -1602,10 +1667,14 @@ def test_route_trial_policy_is_explicit_and_matched():
         "supported_sources: [host_task_metadata, codex.conversation_starts]" in policy
     )
     assert "abs(mean_total_delta) <= 1.0" in policy
+    assert "fixed_snapshot_cold_review: cold_technical_review" in policy
+    assert "mechanical_negative_control: mechanical_change" in policy
     assert "isolated worktrees" in procedure
     assert "label the comparison `OBSERVATIONAL`" in procedure
+    assert "globally unique run and context identities" in procedure
     assert "total = 0.50 * quality" in procedure
     assert "RUN_ROOT_FINAL_GATE" in verification_procedure
     assert "RUN_ROOT_PUBLIC_SAFETY_AUDIT" in verification_procedure
     assert "RECONCILE_FINAL_GATE_EVIDENCE" in verification_procedure
     assert "RECONCILE_PUBLIC_SAFETY_EVIDENCE" in verification_procedure
+    assert "temper-public-safety-audit-v1" in verification_procedure
