@@ -24,6 +24,7 @@ from temper_ml.runtime.recipe_resolution import RecipeResolutionError
 
 
 MAX_REQUEST_BYTES = 1024 * 1024
+REJECT_BODY_DRAIN_TIMEOUT_SECONDS = 0.25
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
 ASSET_TYPES = {
     "app.css": "text/css; charset=utf-8",
@@ -76,18 +77,18 @@ class TemperUiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         if not self._valid_host():
-            self._error(HTTPStatus.FORBIDDEN, "host_not_allowed")
+            self._reject_post(HTTPStatus.FORBIDDEN, "host_not_allowed")
             return
         if not self._valid_origin():
-            self._error(HTTPStatus.FORBIDDEN, "origin_not_allowed")
+            self._reject_post(HTTPStatus.FORBIDDEN, "origin_not_allowed")
             return
         if not secrets.compare_digest(
             self.headers.get("X-Temper-CSRF", ""), self.server.csrf_token
         ):
-            self._error(HTTPStatus.FORBIDDEN, "csrf_token_invalid")
+            self._reject_post(HTTPStatus.FORBIDDEN, "csrf_token_invalid")
             return
         if self.headers.get_content_type() != "application/json":
-            self._error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "content_type_invalid")
+            self._reject_post(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "content_type_invalid")
             return
         length = self._content_length()
         if length is None:
@@ -240,6 +241,33 @@ class TemperUiHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request_too_large")
             return None
         return length
+
+    def _reject_post(self, status: HTTPStatus, code: str) -> None:
+        self._drain_bounded_request_body()
+        self._error(status, code)
+
+    def _drain_bounded_request_body(self) -> None:
+        """Consume an already-sent small body so Windows closes cleanly."""
+
+        raw = self.headers.get("Content-Length")
+        try:
+            length = int(raw) if raw is not None else -1
+        except ValueError:
+            return
+        if length < 0 or length > MAX_REQUEST_BYTES:
+            return
+        original_timeout = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(REJECT_BODY_DRAIN_TIMEOUT_SECONDS)
+            if len(self.rfile.read(length)) != length:
+                self.close_connection = True
+        except OSError:
+            self.close_connection = True
+        finally:
+            try:
+                self.connection.settimeout(original_timeout)
+            except OSError:
+                self.close_connection = True
 
     def _valid_host(self) -> bool:
         supplied = self.headers.get("Host", "")

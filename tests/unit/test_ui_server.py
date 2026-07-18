@@ -1,6 +1,7 @@
 from http.client import HTTPConnection
 from pathlib import Path
 import threading
+import time
 
 import pytest
 
@@ -96,6 +97,28 @@ def test_ui_post_requires_origin_csrf_and_json(ui_server) -> None:
         content_type="text/plain",
     )
     assert status == 415
+
+
+def test_rejected_ui_post_times_out_an_incomplete_body(ui_server) -> None:
+    connection = HTTPConnection("127.0.0.1", ui_server.server_port, timeout=10)
+    connection.putrequest("POST", "/api/v1/setup")
+    connection.putheader("Origin", f"http://127.0.0.1:{ui_server.server_port}")
+    connection.putheader("Content-Type", "application/json")
+    connection.putheader("Content-Length", "2")
+    connection.endheaders()
+
+    started = time.monotonic()
+    response = connection.getresponse()
+    payload = response.read()
+    elapsed = time.monotonic() - started
+    connection.close()
+
+    assert response.status == 403
+    assert b'"code":"csrf_token_invalid"' in payload
+    assert elapsed < 2
+
+    status, _, _ = _request(ui_server, "GET", "/api/v1/workspace", origin=False)
+    assert status == 200
 
 
 def test_ui_routes_call_services_and_get_remains_read_only(ui_server) -> None:
