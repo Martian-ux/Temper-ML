@@ -9,6 +9,24 @@ let latestComparison = null;
 let blindAliases = [];
 let preferredReviewIdentity = null;
 
+const viewMeta = {
+  setup: ["Workspace / 01", "Overview", "Project state, evidence, and the next bounded action."],
+  data: ["Workspace / 02", "Data", "Import, inspect, and freeze deterministic training examples."],
+  recipe: ["Workspace / 03", "Recipes", "Resolve two visible candidate manifests against one target."],
+  run: ["Workspace / 04", "Runs", "Follow runtime evidence from launch through artifact integrity."],
+  evaluate: ["Workspace / 05", "Evaluate", "Compare synchronized outputs and record honest review evidence."],
+  use: ["Workspace / 06", "Local use", "Select one verified adapter for focused local work and export."],
+};
+
+const stageLabels = {
+  setup: "project setup",
+  data: "data import",
+  recipe: "recipe resolution",
+  run: "candidate runs",
+  evaluate: "evaluation",
+  use: "local use",
+};
+
 const actions = {
   setup: () => post("/api/v1/setup", {}),
   import: () => post("/api/v1/dataset/import", {
@@ -63,6 +81,10 @@ document.querySelectorAll("[data-stage]").forEach((button) => {
 
 document.querySelectorAll("[data-action]").forEach((button) => {
   button.addEventListener("click", async () => {
+    if (button.dataset.targetStage) {
+      showStage(button.dataset.targetStage);
+      return;
+    }
     const action = actions[button.dataset.action];
     if (!action) return;
     setBusy(true);
@@ -162,6 +184,7 @@ function renderResolvedCandidates(candidates) {
 
 function renderWorkspace() {
   if (!workspace) return;
+  renderOverview();
   renderStages();
   renderDataset();
   renderResolutions();
@@ -169,6 +192,104 @@ function renderWorkspace() {
   renderRecommendation();
   renderReviewCapture();
   renderInspector();
+}
+
+function renderOverview() {
+  const stages = workspace.stages || [];
+  const completed = stages.filter((stage) => stage.complete).length;
+  const allComplete = stages.length > 0 && completed === stages.length;
+  const started = Boolean(workspace.project);
+  const next = stages.find((stage) => !stage.complete);
+  const statusBoard = document.querySelector(".status-board");
+  const badge = document.querySelector("#overview-status-badge");
+  statusBoard?.classList.toggle("is-complete", allComplete);
+  badge?.classList.toggle("is-complete", allComplete);
+  if (badge) badge.textContent = allComplete ? "Journey verified" : started ? "In progress" : "Ready to begin";
+
+  const journeyState = document.querySelector("#overview-journey-state");
+  const journeyCopy = document.querySelector("#overview-journey-copy");
+  if (journeyState) journeyState.textContent = allComplete ? "Verified" : started ? `${completed} / ${stages.length} stages complete` : "Not started";
+  if (journeyCopy) journeyCopy.textContent = allComplete
+    ? "Selection and local-use evidence are recorded."
+    : next
+      ? `Next: ${stageLabels[next.key]}.`
+      : "Create the immutable project policy first.";
+
+  const gate = document.querySelector("#overview-gate-state");
+  if (gate) gate.textContent = workspace.store?.status === "verified" ? "Store verified" : "Awaiting records";
+  document.querySelector("#overview-record-count").textContent = formatNumber(workspace.store?.record_count ?? 0);
+  document.querySelector("#overview-artifact-count").textContent = formatNumber(workspace.artifacts?.length ?? 0);
+  document.querySelector("#project-context").textContent = workspace.project?.display_name || "Fixture runtime project";
+  renderCandidateOverview();
+
+  document.querySelectorAll("[data-journey-step]").forEach((item) => {
+    const stage = stages.find((candidate) => candidate.key === item.dataset.journeyStep);
+    item.classList.toggle("is-complete", Boolean(stage?.complete));
+    item.classList.toggle("is-current", stage?.key === next?.key || (allComplete && stage?.key === "use"));
+  });
+
+  const action = document.querySelector("#overview-action");
+  const title = document.querySelector("#next-action-title");
+  const copy = document.querySelector("#next-action-copy");
+  if (!action || !title || !copy) return;
+  if (!started) {
+    delete action.dataset.targetStage;
+    action.textContent = "Create project";
+    title.textContent = "Create fixture project";
+    copy.textContent = "Open the task-centered workspace and freeze its project policy.";
+    return;
+  }
+  const destination = next?.key || "use";
+  action.dataset.targetStage = destination;
+  action.textContent = allComplete ? "Open local use" : `Open ${stageLabels[destination]}`;
+  title.textContent = allComplete ? "Continue with the selected adapter" : `Continue to ${stageLabels[destination]}`;
+  copy.textContent = allComplete
+    ? "The fixture journey is complete and remains inspectable from the evidence ledger."
+    : "The prior stage is recorded; continue when you are ready.";
+}
+
+function renderCandidateOverview() {
+  const target = document.querySelector("#overview-candidates");
+  if (!target) return;
+  const resolutions = [...(workspace.resolutions || [])].sort((left, right) => left.rank - right.rank);
+  const rows = [
+    { key: "ember", label: "Ember / balanced", resolution: resolutions[0], runMatch: "run-fixture-runtime" },
+    { key: "slate", label: "Slate / capacity", resolution: resolutions[1], runMatch: "run-fixture-challenger" },
+  ];
+  const currentDecision = (workspace.registry || []).find((item) => item.current);
+  const hasCandidateState = rows.some((row) => row.resolution) || (workspace.artifacts || []).length > 0;
+  if (!hasCandidateState) {
+    target.replaceChildren(element("div", "empty-state", [
+      element("strong", "", "No candidate evidence yet"),
+      element("span", "", "Resolve recipes and run the fixture candidates to populate this ledger."),
+    ]));
+    return;
+  }
+  target.replaceChildren(
+    element("div", "candidate-table-head", [
+      element("span", "", "Candidate"),
+      element("span", "", "Manifest"),
+      element("span", "", "Run"),
+      element("span", "", "Integrity"),
+      element("span", "", "Registry"),
+    ]),
+    ...rows.map((row) => {
+      const run = (workspace.runs || []).find((item) => item.run_id === row.runMatch);
+      const artifact = (workspace.artifacts || []).find((item) => item.key === row.key);
+      const selected = artifact && currentDecision
+        && currentDecision.candidate.identity.value === artifact.reference.identity.value;
+      return element("div", `candidate-table-row${artifact?.available ? " is-ready" : ""}`, [
+        element("span", "candidate-primary", [
+          element("strong", "", row.label),
+          element("small", "", artifact?.reference.logical_id || "Artifact pending"),
+        ]),
+        element("span", "", row.resolution ? `Rank ${row.resolution.rank} / seed ${row.resolution.seed}` : "Pending"),
+        element("span", run?.status === "completed" ? "candidate-good" : "", run?.status || "Pending"),
+        element("span", artifact?.integrity_status === "passed" ? "candidate-good" : "", artifact?.integrity_status || "Pending"),
+        element("span", selected ? "candidate-good" : "", selected ? currentDecision.status : "Not selected"),
+      ]);
+    }),
+  );
 }
 
 function renderReviewCapture() {
@@ -180,7 +301,7 @@ function renderReviewCapture() {
       ? reviews.map((review) => element(
         "option",
         "",
-        `${review.mode} · ${review.reference.logical_id} · ${review.stage}`,
+        `${review.mode} / ${review.reference.logical_id} / ${review.stage}`,
         { value: review.reference.identity.value },
       ))
       : [element("option", "", "No completed review recorded", { value: "" })]
@@ -206,9 +327,9 @@ function selectedCompletedReview() {
 
 function renderStages() {
   (workspace.stages || []).forEach((stage) => {
-    const button = document.querySelector(`[data-stage="${stage.key}"]`);
+    const buttons = document.querySelectorAll(`[data-stage="${stage.key}"]`);
     const badge = document.querySelector(`[data-stage-state="${stage.key}"]`);
-    button?.classList.toggle("is-complete", stage.complete);
+    buttons.forEach((button) => button.classList.toggle("is-complete", stage.complete));
     badge?.classList.toggle("is-complete", stage.complete);
     if (badge) badge.textContent = stage.complete ? "Complete" : "Pending";
   });
@@ -277,13 +398,13 @@ function renderRuns() {
         "progress-track",
         element("span", percent >= 100 ? "is-full" : "is-partial", ""),
       ),
-      element("p", "", last ? `Step ${last.step} / ${last.total_steps} · loss ${last.loss_microunits} μ` : "No progress evidence yet."),
-      element("ul", "event-list", logs.map((log) => element("li", "", `${log.code} · ${log.step}`))),
+      element("p", "", last ? `Step ${last.step} / ${last.total_steps} / loss ${last.loss_microunits} micro-units` : "No progress evidence yet."),
+      element("ul", "event-list", logs.map((log) => element("li", "", `${log.code} / ${log.step}`))),
       element(
         "p",
         `artifact-line${artifact && !artifact.available ? " is-failed" : ""}`,
         artifact
-          ? `${artifact.reference.logical_id} · integrity ${artifact.integrity_status}${artifact.failure_code ? ` · ${artifact.failure_code}` : ""}`
+          ? `${artifact.reference.logical_id} / integrity ${artifact.integrity_status}${artifact.failure_code ? ` / ${artifact.failure_code}` : ""}`
           : "Artifact evidence pending.",
       ),
     ]);
@@ -334,7 +455,7 @@ function renderRecommendation() {
     element("div", "", [
       element("p", "eyebrow", `Confidence / ${recommendation.confidence}`),
       element("strong", "", label),
-      element("p", "conflict-line", recommendation.conflicts.join(" · ") || "No disclosed conflict"),
+      element("p", "conflict-line", recommendation.conflicts.join(" / ") || "No disclosed conflict"),
     ]),
     element("span", "stage-state is-complete", "Policy derived"),
   ]));
@@ -351,7 +472,7 @@ function renderLocalResult(result) {
 function renderInspector() {
   const project = workspace.project;
   document.querySelector("#inspector-status").textContent = project
-    ? `${project.display_name} · ${workspace.status}`
+    ? `${project.display_name} / ${workspace.status}`
     : "Awaiting project setup.";
   const ledger = {
     Records: workspace.store?.record_count ?? 0,
@@ -381,7 +502,13 @@ function showStage(stage) {
     if (button.dataset.stage === stage) button.setAttribute("aria-current", "step");
     else button.removeAttribute("aria-current");
   });
-  document.querySelector(`[data-panel="${activeStage}"] h1`)?.focus?.();
+  const meta = viewMeta[stage];
+  if (meta) {
+    document.querySelector("#view-kicker").textContent = meta[0];
+    document.querySelector("#view-title").textContent = meta[1];
+    document.querySelector("#view-subtitle").textContent = meta[2];
+  }
+  document.querySelector(`[data-panel="${activeStage}"] [data-panel-title]`)?.focus?.();
 }
 
 function showNotice(message, isError) {

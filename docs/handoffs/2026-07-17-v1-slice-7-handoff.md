@@ -15,6 +15,10 @@ merge, release, deployment, or production mutation.
 
 - A dependency-free HTTP server binds only to numeric loopback addresses and
   serves packaged HTML, CSS, JavaScript, and a same-origin JSON API.
+- A dense responsive dashboard summarizes verified store state, workflow
+  progress, candidate manifests, runtime and integrity evidence, the current
+  registry decision, and the next bounded action. Desktop, tablet, and narrow
+  layouts preserve the same journey without horizontal page scrolling.
 - The UI walks through fixture project setup, local dataset import and private
   preview, two distinct recipe resolutions, hardware preflight, verified run
   status, public-safe events, metrics, and artifact evidence.

@@ -81,6 +81,9 @@ def test_ui_shell_is_local_accessible_and_hardened(ui_server) -> None:
     assert "default-src 'none'" in headers["Content-Security-Policy"]
     assert b"Evaluation Playground" not in body
     assert b"Review outputs as evidence" in body
+    assert b"Evidence-ready candidates" in body
+    assert b'id="overview-candidates"' in body
+    assert b'id="workflow-steps"' in body
     assert b'id="review-capture-selection"' in body
     assert b"Convert selected review to case" in body
     assert b"general chat" not in body.lower()
