@@ -39,6 +39,12 @@ from temper_ml.app_services.experiments import (
     plan_replay,
     strict_replay_plan,
 )
+from temper_ml.app_services.fixture_journey import (
+    CandidateSpec,
+    FixtureJourneyService,
+    FixtureTokenizer,
+    WorkspaceQueryService,
+)
 from temper_ml.app_services.projects import (
     OpenedProject,
     ProjectCreateRequest,
@@ -46,6 +52,7 @@ from temper_ml.app_services.projects import (
 )
 from temper_ml.app_services.local_use import (
     AdapterExportRequest,
+    ArtifactInspection,
     LocalUseRequest,
     LocalUseResult,
     LocalUseService,
@@ -62,12 +69,14 @@ from temper_ml.app_services.runs import (
 __all__ = [
     "ApplicationServiceError",
     "AdapterExportRequest",
+    "ArtifactInspection",
     "BlindCandidateOutput",
     "BlindPacketEntry",
     "BlindReviewInput",
     "BlindReviewJudgment",
     "BlindReviewPacket",
     "CorrectionReport",
+    "CandidateSpec",
     "CsvDatasetAdapter",
     "DatasetAdapterError",
     "DatasetImportRequest",
@@ -78,6 +87,8 @@ __all__ = [
     "ExperimentFreezeRequest",
     "ExperimentService",
     "EvaluationService",
+    "FixtureJourneyService",
+    "FixtureTokenizer",
     "HuggingFaceRowsDatasetAdapter",
     "ImportedSource",
     "JsonDatasetAdapter",
@@ -103,6 +114,7 @@ __all__ = [
     "RunRecoveryRequest",
     "RunService",
     "VerifiedAdapterExport",
+    "WorkspaceQueryService",
     "adapted_replay_plan",
     "plan_replay",
     "strict_replay_plan",

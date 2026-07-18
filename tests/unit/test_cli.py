@@ -199,6 +199,29 @@ def test_usage_errors_do_not_echo_supplied_values(
     assert supplied not in captured.err
 
 
+def test_ui_command_passes_only_explicit_loopback_configuration(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def serve(project: str, *, host: str, port: int) -> None:
+        observed.update(project=project, host=host, port=port)
+
+    monkeypatch.setattr(cli_module, "serve_ui", serve)
+
+    assert main(["ui", str(tmp_path), "--host", "127.0.0.1", "--port", "0"]) == 0
+    assert observed == {
+        "project": str(tmp_path),
+        "host": "127.0.0.1",
+        "port": 0,
+    }
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
 def test_unexpected_cli_failures_do_not_echo_exception_text(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch
 ) -> None:

@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="temper-csrf" content="{{CSRF_TOKEN}}">
+    <title>Temper · Local evaluation lab</title>
+    <link rel="stylesheet" href="/assets/app.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#primary-workspace">Skip to workspace</a>
+    <header class="topbar">
+      <div class="wordmark" aria-label="Temper ML">
+        <span class="wordmark-mark" aria-hidden="true">T</span>
+        <span>TEMPER</span>
+        <span class="wordmark-context">LOCAL LAB</span>
+      </div>
+      <div class="topbar-status" aria-label="Runtime status">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span>Fixture CPU</span>
+        <span class="topbar-divider" aria-hidden="true"></span>
+        <span>Offline</span>
+      </div>
+    </header>
+
+    <div class="app-shell">
+      <nav class="workflow-rail" aria-label="Fixture workflow">
+        <p class="eyebrow">Workflow</p>
+        <ol id="workflow-steps" class="workflow-steps">
+          <li><button type="button" data-stage="setup" aria-current="step"><span>01</span>Setup</button></li>
+          <li><button type="button" data-stage="data"><span>02</span>Data</button></li>
+          <li><button type="button" data-stage="recipe"><span>03</span>Recipe</button></li>
+          <li><button type="button" data-stage="run"><span>04</span>Run</button></li>
+          <li><button type="button" data-stage="evaluate"><span>05</span>Evaluate</button></li>
+          <li><button type="button" data-stage="use"><span>06</span>Use</button></li>
+        </ol>
+        <div class="rail-note">
+          <span class="rail-note-key">Mode</span>
+          <strong>Deterministic fixture</strong>
+          <span>No network · no deployment</span>
+        </div>
+      </nav>
+
+      <main id="primary-workspace" class="workspace" tabindex="-1">
+        <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+        <section class="stage-panel is-active" data-panel="setup" aria-labelledby="setup-title">
+          <header class="panel-heading">
+            <div>
+              <p class="eyebrow">01 / Project</p>
+              <h1 id="setup-title">Open the local evidence workspace.</h1>
+            </div>
+            <span class="stage-state" data-stage-state="setup">Pending</span>
+          </header>
+          <p class="lead">A synthetic task, model revision, and immutable project policy establish the fixture journey.</p>
+          <div class="project-plane" aria-hidden="true">
+            <div class="project-orbit orbit-one"></div>
+            <div class="project-orbit orbit-two"></div>
+            <span class="project-node node-core">PROJECT</span>
+            <span class="project-node node-task">TASK</span>
+            <span class="project-node node-policy">POLICY</span>
+            <span class="project-node node-model">MODEL</span>
+          </div>
+          <div class="action-row">
+            <button class="primary-action" type="button" data-action="setup">Create fixture project</button>
+            <p>Writes only through <code>ProjectService</code>.</p>
+          </div>
+        </section>
+
+        <section class="stage-panel" data-panel="data" aria-labelledby="data-title" hidden>
+          <header class="panel-heading">
+            <div>
+              <p class="eyebrow">02 / Dataset</p>
+              <h1 id="data-title">Freeze exact training examples.</h1>
+            </div>
+            <span class="stage-state" data-stage-state="data">Pending</span>
+          </header>
+          <div class="split-layout">
+            <div>
+              <label for="dataset-format">Source format</label>
+              <select id="dataset-format">
+                <option value="fixture">Built-in synthetic fixture</option>
+                <option value="json">JSON</option>
+                <option value="jsonl">JSONL</option>
+                <option value="csv">CSV</option>
+              </select>
+              <label for="dataset-source">Local source</label>
+              <textarea id="dataset-source" rows="11" spellcheck="false" placeholder="Paste local JSON, JSONL, or CSV. The built-in fixture needs no source text."></textarea>
+              <button class="primary-action" type="button" data-action="import">Import and inspect</button>
+            </div>
+            <div class="metric-ledger" id="dataset-ledger" aria-label="Dataset statistics">
+              <div><span>Accepted rows</span><strong>—</strong></div>
+              <div><span>Excluded rows</span><strong>—</strong></div>
+              <div><span>Total tokens</span><strong>—</strong></div>
+              <div><span>Rendered bytes</span><strong>—</strong></div>
+            </div>
+          </div>
+          <div id="dataset-previews" class="preview-list" aria-label="Private dataset previews"></div>
+        </section>
+
+        <section class="stage-panel" data-panel="recipe" aria-labelledby="recipe-title" hidden>
+          <header class="panel-heading">
+            <div>
+              <p class="eyebrow">03 / Resolution</p>
+              <h1 id="recipe-title">Compare the manifest before execution.</h1>
+            </div>
+            <span class="stage-state" data-stage-state="recipe">Pending</span>
+          </header>
+          <p class="lead">Two bounded LoRA fixture recipes share one task and runtime target while keeping their exact settings visible.</p>
+          <div id="candidate-resolution" class="candidate-columns" aria-live="polite">
+            <div class="empty-state">Resolve candidates to inspect rank, alpha, seed, estimates, and preflight evidence.</div>
+          </div>
+          <button class="primary-action" type="button" data-action="resolve">Resolve and preflight</button>
+        </section>
+
+        <section class="stage-panel" data-panel="run" aria-labelledby="run-title" hidden>
+          <header class="panel-heading">
+            <div>
+              <p class="eyebrow">04 / Runtime</p>
+              <h1 id="run-title">Run the evidence, then inspect the artifact.</h1>
+            </div>
+            <span class="stage-state" data-stage-state="run">Pending</span>
+          </header>
+          <div class="run-control">
+            <div>
+              <span class="run-kicker">Fixture runtime</span>
+              <strong>Two candidates · serialized canonical writes</strong>
+            </div>
+            <button class="primary-action" type="button" data-action="launch">Launch both runs</button>
+          </div>
+          <div id="run-timelines" class="run-timelines">
+            <div class="empty-state">Progress, public-safe logs, checkpoints, and integrity receipts will appear here.</div>
+          </div>
+        </section>
+
+        <section class="stage-panel" data-panel="evaluate" aria-labelledby="evaluate-title" hidden>
+          <header class="panel-heading">
+            <div>
+              <p class="eyebrow">05 / Playground</p>
+              <h1 id="evaluate-title">Review outputs as evidence.</h1>
+            </div>
+            <span class="stage-state" data-stage-state="evaluate">Pending</span>
+          </header>
+          <div class="control-strip">
+            <label for="playground-prompt">Synchronized prompt</label>
+            <input id="playground-prompt" value="Rewrite this synthetic evaluation note" autocomplete="off">
+            <label for="maximum-tokens">Max tokens</label>
+            <input id="maximum-tokens" type="number" min="1" value="64">
+            <label for="inference-seed">Seed</label>
+            <input id="inference-seed" type="number" min="0" value="17">
+            <button class="primary-action" type="button" data-action="compare">Run comparison</button>
+          </div>
+          <div id="comparison-output" class="comparison-output">
+            <div class="empty-state">The same prompt and settings will run against both integrity-verified artifacts.</div>
+          </div>
+          <div class="review-ledger">
+            <div>
+              <label for="review-notes">Review notes</label>
+              <textarea id="review-notes" rows="4">Both outputs satisfy the deterministic fixture contract.</textarea>
+            </div>
+            <fieldset>
+              <legend>Task-fit ratings</legend>
+              <label>Ember <input id="rating-ember" type="number" value="1"></label>
+              <label>Slate <input id="rating-slate" type="number" value="1"></label>
+            </fieldset>
+            <div class="review-actions">
+              <button type="button" data-action="solo-review">Save solo review</button>
+              <button type="button" data-action="blind-prepare">Hide identities</button>
+              <button type="button" data-action="blind-seal">Seal judgment</button>
+              <button type="button" data-action="blind-reveal">Reveal mapping</button>
+              <button type="button" data-action="capture">Convert latest review to case</button>
+            </div>
+          </div>
+          <div class="evidence-action">
+            <div>
+              <span class="run-kicker">Policy evidence</span>
+              <strong>Equal synthetic metrics remain a disclosed tie.</strong>
+            </div>
+            <button class="primary-action" type="button" data-action="evaluate">Evaluate and recommend</button>
+          </div>
+          <div id="recommendation-view" class="recommendation-view"></div>
+        </section>
+
+        <section class="stage-panel" data-panel="use" aria-labelledby="use-title" hidden>
+          <header class="panel-heading">
+            <div>
+              <p class="eyebrow">06 / Local use</p>
+              <h1 id="use-title">Select deliberately. Use locally.</h1>
+            </div>
+            <span class="stage-state" data-stage-state="use">Pending</span>
+          </header>
+          <div class="selection-row">
+            <label for="candidate-selection">Candidate</label>
+            <select id="candidate-selection">
+              <option value="ember">Ember / balanced</option>
+              <option value="slate">Slate / capacity</option>
+            </select>
+            <button class="primary-action" type="button" data-action="select">Record selection</button>
+          </div>
+          <div class="local-use-grid">
+            <section aria-labelledby="focused-title">
+              <h2 id="focused-title">Focused inference</h2>
+              <p>One prompt, one response, no memory.</p>
+              <textarea id="focused-prompt" rows="5">Focused synthetic local-use prompt</textarea>
+              <button type="button" data-action="focused">Run and save</button>
+            </section>
+            <section aria-labelledby="batch-title">
+              <h2 id="batch-title">Local batch</h2>
+              <p>One prompt per line with shared deterministic settings.</p>
+              <textarea id="batch-prompts" rows="5">Synthetic batch prompt one&#10;Synthetic batch prompt two</textarea>
+              <button type="button" data-action="batch">Run batch</button>
+            </section>
+          </div>
+          <div id="local-output" class="local-output"></div>
+          <div class="export-row">
+            <div>
+              <span class="run-kicker">Portable adapter bundle</span>
+              <strong>Integrity manifest + compatibility requirements + provenance</strong>
+              <small>Export is not deployment readiness.</small>
+            </div>
+            <button class="primary-action" type="button" data-action="export">Verify export</button>
+          </div>
+        </section>
+      </main>
+
+      <aside class="evidence-inspector" aria-labelledby="inspector-title">
+        <div class="inspector-heading">
+          <p class="eyebrow">Evidence inspector</p>
+          <h2 id="inspector-title">Current state</h2>
+        </div>
+        <div id="inspector-status" class="inspector-status">Awaiting project setup.</div>
+        <dl id="inspector-ledger" class="inspector-ledger"></dl>
+        <details>
+          <summary>Exact response</summary>
+          <pre id="raw-evidence">No evidence yet.</pre>
+        </details>
+        <p class="inspector-footnote">Canonical records remain immutable. This view is derived and rebuildable.</p>
+      </aside>
+    </div>
+  </body>
+</html>
