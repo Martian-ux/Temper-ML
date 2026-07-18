@@ -1,43 +1,120 @@
-status: PROPOSED_NOT_AUTHORIZED
-authority_ref: maintainer-rulings.md#Bounded-maintainer-corrections-accepted
+status: ACTIVE
+authority_ref: AGENTS.md#model-routing
 routes:
   routine_administration:
-    model: luna_or_cheapest
+    declared_route: luna-or-cheapest
     efforts: [low, medium]
     repository_write: false
     review: none
-    route_observation: "Record selected values when available; unavailable runtime values remain UNVERIFIED."
   mechanical_change:
-    model: terra-medium
+    declared_route: terra-medium
     efforts: [medium]
     repository_write: true_after_maintainer_authorization
     review: risk_triggered_one_cold_terra_high_if_triggered
-    route_observation: "Prompt wording never proves selection or compliance."
   normal_implementation:
-    model: terra-high
+    declared_route: terra-high
     efforts: [high]
     repository_write: true_after_maintainer_authorization
+    executor: root
     review: risk_triggered_one_cold_terra_high_if_triggered
-    route_observation: "Observed model/effort or compliance may be UNVERIFIED when the platform does not expose them."
+  protected_boundary_implementation:
+    declared_route: terra-high
+    efforts: [high]
+    repository_write: true_after_maintainer_authorization
+    executor: root
+    review: exactly_one_cold_terra_high
   cold_technical_review:
-    model: terra-high
+    declared_route: terra-high
     efforts: [high]
     repository_write: false
-    review: one_cold_reviewer
-    route_observation: "The reviewer has no write ownership and does not stack automatically."
+    review: one_read_only_cold_reviewer
   maintainer_decision_gate:
-    model: none
-    preparation_model: terra-high
+    declared_route: none
+    preparation_route: terra-high
     actor: maintainer
     repository_write: false_until_maintainer_decision
-    review: maintainer_gate
-    route_observation: "Maintainer authority is not replaced by a model route."
-elevation_rule: "Routine work uses the least expensive sufficient route. Any elevation requires explicit recorded justification, and automatic review stacking is prohibited. Unexercised premium or diversity routes remain private."
-projection_rule: "Only this section may be used for the initial Phase 1 public routing projection. The full private model and task-class catalog remains private."
+
+route_record:
+  selection:
+    required: [declared_route, declared_model, declared_effort, selected_model, selected_effort, selection_mechanism]
+    mechanism_shape: {required: [kind, model_selector, effort_selector], kind: [host_controls, cli_flags, cli_profile, api_parameters]}
+    rule: "The exact selected model and effort must come from host controls, CLI flags/profile, or API parameters; prompt wording is not a selection mechanism."
+    unknown_selection: blocks_implementation_or_reviewer_launch
+  runtime_observation:
+    required: [availability, source, model, effort]
+    availability: [OBSERVED, UNAVAILABLE]
+    supported_sources: [host_task_metadata, codex.conversation_starts]
+    observed_source_rule: "OBSERVED is valid only for a supported source; a nonempty free-form source is insufficient."
+    unavailable_values: {model: UNVERIFIED, effort: UNVERIFIED}
+    rule: "Observation availability states whether supported telemetry exposed runtime values; it does not itself decide compliance."
+  declared_route_compliance:
+    values: [PASS, FAIL, UNVERIFIED]
+    observed_match: PASS
+    observed_mismatch: FAIL
+    telemetry_unavailable: UNVERIFIED
+    rule: "Compliance compares observed runtime values with the declared route only when observation is available."
+  experiment:
+    labels: [NOT_EXPERIMENT, CONTROL, EXPERIMENTAL, OBSERVATIONAL]
+    matched_run_requirement: "CONTROL and EXPERIMENTAL require predeclared=true plus trial_id, pair_id, run_id, protocol_ref, frozen_task_identity, isolation_ref, and task_mix."
+    matched_result_runtime_requirement: "Every run in a MATCHED_TRIAL must have supported OBSERVED runtime model/effort, exact agreement with the declaration, and PASS declared-route compliance."
+    observational_rule: "Any comparison that was not predeclared or did not use the same frozen task in isolated worktrees is OBSERVATIONAL and cannot establish a default route."
+
+selection_mechanisms:
+  host_controls: {model_selector: model, effort_selector: reasoning_effort, context_field: control_surface}
+  cli_flags: {model_selector: --model, effort_selector: model_reasoning_effort}
+  cli_profile: {model_selector: model, effort_selector: model_reasoning_effort, context_field: profile}
+  api_parameters: {model_selector: model, effort_selector: reasoning.effort}
+  rule: "The coordinator validates the mechanism kind and executable selectors. A free-form string, prompt instruction, or unknown mechanism blocks dispatch."
+telemetry_verification:
+  preferred: "Use host task metadata when it exposes both runtime model and effort."
+  cli: "Use the supported codex.conversation_starts OpenTelemetry event, whose run metadata includes model and reasoning settings."
+  jsonl_limit: "codex exec --json provides lifecycle and usage events but is not, by itself, evidence of the runtime model and effort."
+  privacy: "Telemetry receipts stay private and are never staged; public records contain only the allowed route result fields."
+
+ultra_trial:
+  protocol_ref: docs/workflow/procedures/model-route-and-experiment.md
+  control_routes: [task_class_default, sol-high]
+  control_route_rule: "sol-high is permitted for non-mechanical control runs; the mechanical negative control must use its terra-medium task-class default."
+  experimental_route: sol-ultra
+  matched_pairs: 6
+  runs_per_pair: 2
+  total_runs: 12
+  pair_composition: {control: 1, experimental: 1}
+  task_mix:
+    fixed_snapshot_cold_review: 2
+    bounded_implementation_or_repair: 2
+    architecture_or_invariant_design: 1
+    mechanical_negative_control: 1
+  task_class_by_mix:
+    fixed_snapshot_cold_review: cold_technical_review
+    bounded_implementation_or_repair: normal_implementation
+    architecture_or_invariant_design: protected_boundary_implementation
+    mechanical_negative_control: mechanical_change
+  task_class_rule: "Every pair and both of its runs must use the task class mapped from its task_mix label; a label/class mismatch is not matched-trial evidence."
+  isolation: "Each pair uses one frozen task packet, exact base, fixtures, acceptance criteria, and independent worktrees; neither run may consume the other's output."
+  unmatched_result: OBSERVATIONAL
+  result_registry:
+    command: validate-route-trial
+    matched_requirement: "Exactly six complete pairs must bind globally unique run/context identities, the frozen task, verified isolation, the required task mix and mapped task class, one CONTROL and one EXPERIMENTAL route with supported observed PASS telemetry, one shared ledger and weight per pair, raw metrics, ledger evidence, pair-aware zero-weight quality, normalized component scores, and reproducible aggregate deltas."
+    observational_eligibility: false
+    default_route_rule: "Only a MATCHED_TRIAL record accepted by the executable registry is eligible to inform a route-default decision; the maintainer still owns the decision."
+  decision_rule:
+    delta_direction: experimental_minus_control
+    tie: "TIE when abs(mean_total_delta) <= 1.0."
+    material_benefit: "MATERIAL_QUALITY_BENEFIT only when mean_total_delta, median_total_delta, and mean_quality_delta are each > 1.0 and at least four of six pairs have both total_delta and quality_delta > 1.0."
+    fallback: NO_MATERIAL_BENEFIT
+    recommendation: "ADOPT_EXPERIMENTAL only for MATERIAL_QUALITY_BENEFIT with escaped_p1=false; otherwise KEEP_CONTROL."
+    validation: "The registry derives and strictly validates outcome and recommendation; callers cannot select them."
+
+elevation_rule: "Routine work uses the least expensive sufficient route. Any elevation requires explicit recorded justification. Ultra is allowed only for a predeclared EXPERIMENTAL run or a separately authorized bounded architecture decision."
+projection_rule: "Only public-safe route declarations and results may be projected. Operational telemetry, receipts, task IDs, and provider identifiers remain private."
 effective_worker_limit:
   formula: "min(global_workflow_hard_ceiling, current_phase_limit, task_class_limit, task_packet_limit, model_route_limit, available_non_conflicting_ownership_capacity, explicit_maintainer_restriction)"
   ambiguity_rule: "Unknown or ambiguous ownership reduces available capacity; it never increases it."
+  routine_implementation_executor: root
+  routine_writer_subagent: prohibited
+  final_verifier_agent: prohibited
+  maximum_independent_reviewers: 1
   phase1_default_active_implementation_writers: 1
   phase1_absolute_writer_ceiling: 2
   third_implementation_writer: prohibited
-  read_only_reviewers_and_investigators_count_as_writers: false

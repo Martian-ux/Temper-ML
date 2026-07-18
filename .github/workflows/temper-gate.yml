@@ -2,7 +2,12 @@ name: Temper gate
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: temper-gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

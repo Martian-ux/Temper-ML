@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 
 import pytest
@@ -28,6 +29,42 @@ def state(workflow):
     return value
 
 
+def route(task_class="normal_implementation"):
+    if task_class == "routine_administration":
+        declared_route = "luna-or-cheapest"
+        model = "gpt-5.6-luna"
+        effort = "low"
+    elif task_class == "mechanical_change":
+        declared_route = "terra-medium"
+        model = "gpt-5.6-terra"
+        effort = "medium"
+    else:
+        declared_route = "terra-high"
+        model = "gpt-5.6-terra"
+        effort = "high"
+    return {
+        "declared_route": declared_route,
+        "declared_model": model,
+        "declared_effort": effort,
+        "selected_model": model,
+        "selected_effort": effort,
+        "selection_mechanism": {
+            "kind": "host_controls",
+            "model_selector": "model",
+            "effort_selector": "reasoning_effort",
+            "control_surface": "synthetic_host_controls",
+        },
+        "runtime_observation": {
+            "availability": "UNAVAILABLE",
+            "source": "synthetic_host_without_telemetry",
+            "model": "UNVERIFIED",
+            "effort": "UNVERIFIED",
+        },
+        "declared_route_compliance": "UNVERIFIED",
+        "experiment": {"label": "NOT_EXPERIMENT", "predeclared": False},
+    }
+
+
 def task(key="task-one", paths=None, task_class="normal_implementation"):
     subject = {"type": "patch", "base": BASE, "patch": f"sha256:synthetic-{key}"}
     return {
@@ -41,12 +78,7 @@ def task(key="task-one", paths=None, task_class="normal_implementation"):
         "verification": ["unit test"],
         "review": ["matrix"],
         "review_triggers": [],
-        "route": {
-            "selected_model": "terra-high",
-            "selected_effort": "high",
-            "observed_model": "UNVERIFIED",
-            "observed_effort": "UNVERIFIED",
-        },
+        "route": route(task_class),
         "stop_conditions": ["scope drift"],
         "authorization_state": "MAINTAINER_AUTHORIZED",
         "classification": "protected_boundary_implementation",
@@ -97,6 +129,45 @@ def verification_record(subject=IDENTITY, key="task-one", **extra):
     return value
 
 
+def public_safety_audit_result(status="PASS"):
+    categories = (
+        "exact_staged_diff",
+        "file_and_binary_metadata",
+        "secrets_and_private_data",
+        "commit_message",
+        "author_committer_identity",
+    )
+    return {
+        "schema": "temper-public-safety-audit-v1",
+        "categories": {
+            category: {
+                "status": status,
+                "evidence_ref": f"evidence:public-safety:{category}",
+            }
+            for category in categories
+        },
+    }
+
+
+def public_safety_record(subject=IDENTITY, key="task-one", **extra):
+    status = extra.get("status", "PASS")
+    value = {
+        "task_key": key,
+        "reference": "verification:public",
+        "subject": subject,
+        "command": ["manual", "public-safety-audit-v1"],
+        "scope": ["repository"],
+        "environment": {"lock": "committed"},
+        "side_effects": [],
+        "status": status,
+        "verification_type": "public_safety",
+        "executor": "root",
+        "audit_result": public_safety_audit_result(status),
+    }
+    value.update(extra)
+    return value
+
+
 def decision(key="task-one", identity=IDENTITY):
     return {
         "kind": "decision",
@@ -111,13 +182,192 @@ def decision(key="task-one", identity=IDENTITY):
     }
 
 
-def handoff(key="task-one", worker_reference="writer-one", identity=IDENTITY, **extra):
+def matched_experiment(label, pair_id, run_id, task_mix):
+    return {
+        "label": label,
+        "predeclared": True,
+        "trial_id": "trial-synthetic",
+        "pair_id": pair_id,
+        "run_id": run_id,
+        "protocol_ref": "docs/workflow/procedures/model-route-and-experiment.md",
+        "frozen_task_identity": f"sha256:frozen-{pair_id}",
+        "isolation_ref": f"isolation:{pair_id}",
+        "task_mix": task_mix,
+    }
+
+
+def trial_score(quality, ledger_ref):
+    return {
+        "ledger_ref": ledger_ref,
+        "raw": {
+            "input_tokens": 100,
+            "cached_input_tokens": 20,
+            "output_tokens": 20,
+            "effective_tokens": 100,
+            "elapsed_seconds": 10,
+            "agent_sessions": 1,
+            "redundant_full_gate_runs": 0,
+            "credited_ledger_weight": quality // 10,
+            "total_ledger_weight": 10,
+            "false_positives": 0,
+            "acceptance_complete": True,
+            "avoidable_blocking_clarifications": 0,
+            "avoidable_tool_or_test_retries": 0,
+            "incomplete_outcome": 0,
+            "handoff_passed_items": 10,
+        },
+        "components": {
+            "quality": quality,
+            "autonomy": 100,
+            "efficiency": 100,
+            "handoff": 100,
+            "total": 0.50 * quality + 50,
+        },
+        "ledger_evidence_refs": ["evidence:synthetic"],
+    }
+
+
+def matched_trial():
+    task_mix = [
+        "fixed_snapshot_cold_review",
+        "fixed_snapshot_cold_review",
+        "bounded_implementation_or_repair",
+        "bounded_implementation_or_repair",
+        "architecture_or_invariant_design",
+        "mechanical_negative_control",
+    ]
+    task_class_by_mix = {
+        "fixed_snapshot_cold_review": "cold_technical_review",
+        "bounded_implementation_or_repair": "normal_implementation",
+        "architecture_or_invariant_design": "protected_boundary_implementation",
+        "mechanical_negative_control": "mechanical_change",
+    }
+    pairs = []
+    for index, mix in enumerate(task_mix, start=1):
+        pair_id = f"pair-{index}"
+        task_class = task_class_by_mix[mix]
+        runs = []
+        for label, quality in (("CONTROL", 80), ("EXPERIMENTAL", 90)):
+            run_id = f"run-{index}-{label.casefold()}"
+            selected_route = route(task_class)
+            if label == "EXPERIMENTAL":
+                selected_route.update(
+                    {
+                        "declared_route": "sol-ultra",
+                        "declared_model": "gpt-5.6-sol",
+                        "declared_effort": "ultra",
+                        "selected_model": "gpt-5.6-sol",
+                        "selected_effort": "ultra",
+                    }
+                )
+            selected_route["runtime_observation"] = {
+                "availability": "OBSERVED",
+                "source": "host_task_metadata",
+                "model": selected_route["declared_model"],
+                "effort": selected_route["declared_effort"],
+            }
+            selected_route["declared_route_compliance"] = "PASS"
+            selected_route["experiment"] = matched_experiment(
+                label, pair_id, run_id, mix
+            )
+            runs.append(
+                {
+                    "run_id": run_id,
+                    "context_identity": f"context-{index}-{label.casefold()}",
+                    "task_class": task_class,
+                    "route": selected_route,
+                    "score": trial_score(quality, f"ledger:{pair_id}"),
+                }
+            )
+        pairs.append(
+            {
+                "pair_id": pair_id,
+                "task_mix": mix,
+                "exact_base": BASE,
+                "frozen_task_identity": f"sha256:frozen-{pair_id}",
+                "isolation_ref": f"isolation:{pair_id}",
+                "isolation_verified": True,
+                "ledger_ref": f"ledger:{pair_id}",
+                "runs": runs,
+            }
+        )
+    return {
+        "trial_id": "trial-synthetic",
+        "classification": "MATCHED_TRIAL",
+        "status": "COMPLETE",
+        "protocol_ref": "docs/workflow/procedures/model-route-and-experiment.md",
+        "eligible_for_default_route_decision": True,
+        "adjudication": {
+            "blinded": True,
+            "alias_seed": "seed:synthetic",
+            "adjudicator_ref": "adjudicator:synthetic",
+            "ledger_ref": "ledger:synthetic",
+            "formula_ref": "docs/workflow/procedures/model-route-and-experiment.md",
+        },
+        "pairs": pairs,
+        "aggregate": {
+            "report_ref": "report:synthetic",
+            "p1_p2_differences_ref": "findings:synthetic",
+            "mean_total_delta": 5,
+            "median_total_delta": 5,
+            "mean_quality_delta": 10,
+            "escaped_p1": False,
+            "outcome": "MATERIAL_QUALITY_BENEFIT",
+            "recommendation": "ADOPT_EXPERIMENTAL",
+        },
+    }
+
+
+def writer_exception_decision(value, key="task-one", writer_mode="subagent"):
+    registered = value["tasks"][key]
+    identity = registered["subject"]
+    reference = f"writer-exception:{key}:{writer_mode}"
+    return {
+        "kind": "decision",
+        "decision_type": "exceptional_writer",
+        "actor": "maintainer",
+        "approved": True,
+        "task_key": key,
+        "reference": reference,
+        "subject": identity,
+        "exception_scope": {
+            "task_key": key,
+            "subject": identity,
+            "exact_base": registered["exact_base"],
+            "owned_paths": registered["owned_paths"],
+            "writer_mode": writer_mode,
+            "reason": "Synthetic exceptional-writer test approval.",
+        },
+        "authoritative_provenance": {
+            "task_key": key,
+            "subject": identity,
+            "authority_reference": registered["maintainer_authorization"][
+                "authority_reference"
+            ],
+        },
+    }
+
+
+def subagent_advance_record(workflow, value, key="task-one", **extra):
+    reference = f"writer-exception:{key}:subagent"
+    if not any(item.get("reference") == reference for item in value["evidence"]):
+        workflow.record_evidence(value, writer_exception_decision(value, key))
+    return {
+        "task_key": key,
+        "writer_mode": "subagent",
+        "writer_exception_reference": reference,
+        **extra,
+    }
+
+
+def handoff(key="task-one", worker_reference=None, identity=IDENTITY, **extra):
+    worker_reference = worker_reference or f"root:{key}"
     value = {
         "task_key": key,
         "worker_reference": worker_reference,
         "changed_paths": ["scripts/example.py"],
         "identity": identity,
-        "route": {"selected_model": "terra-high", "selected_effort": "high"},
+        "route": route(),
         "acceptance_evidence": ["focused test"],
         "verification": ["unit test"],
         "applied_decisions": [
@@ -149,51 +399,46 @@ def dispatch_worker(workflow, value, key="task-one"):
     to_plan(workflow, value, key)
     paths = value["tasks"][key]["owned_paths"]
     workflow.acquire_ownership(value, {"task_key": key, "paths": paths})
-    workflow.advance(value, {"task_key": key})
+    result = workflow.advance(value, {"task_key": key})
+    assert result["next_action"] == "ROOT_IMPLEMENTATION_IN_PROGRESS"
+    return next(
+        worker for worker in value["workers"] if worker["reference"] == f"root:{key}"
+    )
+
+
+def dispatch_exceptional_worker(workflow, value, key="task-one"):
+    to_plan(workflow, value, key)
+    paths = value["tasks"][key]["owned_paths"]
+    workflow.acquire_ownership(value, {"task_key": key, "paths": paths})
+    workflow.advance(
+        value,
+        subagent_advance_record(workflow, value, key),
+    )
     return workflow.register_worker(value, {"reference": "writer-one", "task_key": key})
 
 
-def completed_candidate(workflow, value, key="task-one"):
+def assembled_candidate(workflow, value, key="task-one"):
     dispatch_worker(workflow, value, key)
     workflow.record_evidence(value, decision(key))
     workflow.ingest_handoff(value, handoff(key))
-    workflow.record_evidence(
-        value,
-        {
-            "kind": "verifier_registration",
-            "task_key": key,
-            "subject": IDENTITY,
-            **final_gate_request(),
-            "verifier_reference": "verifier:final",
-            "accepted": True,
-        },
-    )
     workflow.record_verification(value, verification_record(key=key))
-    workflow.record_verification(
-        value,
-        {
-            "task_key": key,
-            "reference": "verification:public",
-            "subject": IDENTITY,
-            "command": ["python", "scripts/public-safety.py"],
-            "scope": ["repository"],
-            "environment": {"lock": "committed"},
-            "side_effects": [],
-            "status": "PASS",
-            "verification_type": "public_safety",
-        },
-    )
-    workflow.record_verification(
-        value,
-        {
-            "task_key": key,
-            "reference": "verification:gate",
-            "subject": IDENTITY,
-            **final_gate_request(),
-            "status": "PASS",
-            "verifier_reference": "verifier:final",
-        },
-    )
+
+
+def completed_candidate(workflow, value, key="task-one"):
+    assembled_candidate(workflow, value, key)
+    if not workflow.review_required(value["tasks"][key])["required"]:
+        workflow.record_verification(
+            value,
+            {
+                "task_key": key,
+                "reference": "verification:gate",
+                "subject": IDENTITY,
+                **final_gate_request(),
+                "status": "PASS",
+                "executor": "root",
+            },
+        )
+        workflow.record_verification(value, public_safety_record(key=key))
 
 
 def test_canonical_cold_technical_review_class_is_routed():
@@ -233,7 +478,6 @@ def test_transition_cannot_walk_to_integration_or_grant_it_without_prerequisites
         value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
     )
     workflow.advance(value, {"task_key": "task-one"})
-    workflow.register_worker(value, {"reference": "writer-one", "task_key": "task-one"})
     workflow.record_evidence(value, decision())
     workflow.ingest_handoff(value, handoff())
     with pytest.raises(workflow.WorkflowError, match="integration transition requires"):
@@ -360,7 +604,7 @@ def test_integration_rejects_wrong_verification_identity_or_reference():
         workflow.authorize(value, bad)
 
 
-def test_protected_review_still_allows_one_repair_cycle():
+def test_protected_review_repairs_continue_without_an_arbitrary_cycle_limit():
     workflow = load_workflow_module()
     value = state(workflow)
     workflow.register_task(value, task(task_class="protected_boundary_implementation"))
@@ -368,9 +612,17 @@ def test_protected_review_still_allows_one_repair_cycle():
     record = {"task_key": "task-one", "verification_request": verification_request()}
     assert workflow.advance(value, record)["next_action"] == "AWAIT_COLD_REVIEW"
     result = workflow.advance(value, {**record, "review_status": "REPAIR_REQUIRED"})
-    assert result["next_action"] == "REPAIR_CYCLE_PERMITTED"
+    assert result["next_action"] == "REPAIR_IN_SCOPE"
     assert value["phase"] == "PLAN"
     assert value["authorization_state"] == "MAINTAINER_AUTHORIZED"
+    review = value["reviews"][0]
+    review["repair_cycles"] = 3
+    review["status"] = "REQUIRED"
+    value["phase"] = "VERIFY"
+    value["authorization_state"] = "VERIFIED"
+    result = workflow.advance(value, {**record, "review_status": "REPAIR_REQUIRED"})
+    assert result["next_action"] == "REPAIR_IN_SCOPE"
+    assert review["repair_cycles"] == 4
 
 
 def test_task_validation_rejects_recursive_delegation_and_unknown_selection():
@@ -480,7 +732,10 @@ def test_integration_requires_cold_review_final_gate_and_public_safety_evidence(
     completed_candidate(workflow, value)
     record = {"task_key": "task-one", "verification_request": verification_request()}
     workflow.advance(value, record)
-    workflow.advance(value, {**record, "review_status": "PASS"})
+    assert (
+        workflow.advance(value, {**record, "review_status": "PASS"})["next_action"]
+        == "RUN_ROOT_FINAL_GATE"
+    )
     request = {
         "actor": "maintainer",
         "authorization_state": "INTEGRATION_AUTHORIZED",
@@ -490,7 +745,8 @@ def test_integration_requires_cold_review_final_gate_and_public_safety_evidence(
         "verification_reference": "verification:unit",
         "verification_request": verification_request(),
     }
-    with pytest.raises(workflow.WorkflowError, match="registered-verifier"):
+    workflow.record_verification(value, public_safety_record())
+    with pytest.raises(workflow.WorkflowError, match="root-executed"):
         workflow.authorize(value, request)
     workflow.record_verification(
         value,
@@ -500,8 +756,32 @@ def test_integration_requires_cold_review_final_gate_and_public_safety_evidence(
             "subject": IDENTITY,
             **final_gate_request(),
             "status": "PASS",
-            "verifier_reference": "verifier:final",
+            "executor": "root",
         },
+    )
+    assert workflow.advance(value, record)["next_action"] == (
+        "RUN_ROOT_PUBLIC_SAFETY_AUDIT"
+    )
+    with pytest.raises(workflow.WorkflowError, match="public-safety"):
+        workflow.authorize(value, request)
+    generic_public_safety = public_safety_record(
+        reference="verification:generic-public"
+    )
+    del generic_public_safety["audit_result"]
+    with pytest.raises(workflow.WorkflowError, match="audit_result"):
+        workflow.record_verification(value, generic_public_safety)
+    false_pass = public_safety_record(reference="verification:false-public-pass")
+    false_pass["audit_result"] = public_safety_audit_result("FAIL")
+    with pytest.raises(workflow.WorkflowError, match="does not match"):
+        workflow.record_verification(value, false_pass)
+    workflow.record_verification(value, public_safety_record())
+    result = workflow.advance(value, {**record, "review_status": "PASS"})
+    assert result["next_action"] == "AWAIT_MAINTAINER_INTEGRATION_AUTHORIZATION"
+    assert result["integration_evidence"]["final_gate_reference"] == (
+        "verification:gate-after-review"
+    )
+    assert result["integration_evidence"]["public_safety_reference"] == (
+        "verification:public"
     )
     assert workflow.authorize(value, request)["phase"] == "INTEGRATE"
 
@@ -520,7 +800,127 @@ def test_registered_risk_trigger_cannot_be_omitted_from_advance():
     assert result["review_packet"]["subject"] == IDENTITY
 
 
-def test_final_and_public_safety_evidence_use_registered_verifier_and_latest_result():
+def test_final_gate_is_root_executed_once_per_immutable_candidate():
+    workflow = load_workflow_module()
+    value = state(workflow)
+    workflow.register_task(value, task())
+    completed_candidate(workflow, value)
+    with pytest.raises(workflow.WorkflowError, match="registrations are prohibited"):
+        workflow.record_evidence(
+            value,
+            {
+                "kind": "verifier_registration",
+                "task_key": "task-one",
+                "subject": IDENTITY,
+            },
+        )
+    with pytest.raises(workflow.WorkflowError, match="already recorded"):
+        workflow.record_verification(
+            value,
+            {
+                "task_key": "task-one",
+                "reference": "verification:duplicate-gate",
+                "subject": IDENTITY,
+                **final_gate_request(),
+                "status": "PASS",
+                "executor": "root",
+            },
+        )
+
+
+def test_failed_final_gate_returns_to_repair_without_requesting_a_duplicate():
+    workflow = load_workflow_module()
+    value = state(workflow)
+    workflow.register_task(value, task(task_class="protected_boundary_implementation"))
+    assembled_candidate(workflow, value)
+    record = {"task_key": "task-one", "verification_request": verification_request()}
+    workflow.advance(value, record)
+    assert (
+        workflow.advance(value, {**record, "review_status": "PASS"})["next_action"]
+        == "RUN_ROOT_FINAL_GATE"
+    )
+    failed_gate = {
+        "task_key": "task-one",
+        "reference": "verification:failed-gate",
+        "subject": IDENTITY,
+        **final_gate_request(),
+        "status": "FAIL",
+        "executor": "root",
+    }
+    workflow.record_verification(value, failed_gate)
+    with pytest.raises(workflow.WorkflowError, match="already recorded"):
+        workflow.record_verification(
+            value,
+            {
+                **failed_gate,
+                "reference": "verification:illegal-duplicate-gate",
+                "status": "PASS",
+            },
+        )
+    result = workflow.advance(value, record)
+    assert result["next_action"] == "REPAIR_IN_SCOPE"
+    assert result["failed_verification_type"] == "final_gate"
+    assert result["failed_verification_reference"] == "verification:failed-gate"
+    assert value["phase"] == "PLAN"
+    assert value["authorization_state"] == "MAINTAINER_AUTHORIZED"
+    assert value["reviews"][0]["status"] == "REPAIR_IN_PROGRESS"
+
+
+def test_unknown_final_gate_requires_evidence_reconciliation_not_a_rerun():
+    workflow = load_workflow_module()
+    value = state(workflow)
+    workflow.register_task(value, task())
+    assembled_candidate(workflow, value)
+    unknown_gate = {
+        "task_key": "task-one",
+        "reference": "verification:unknown-gate",
+        "subject": IDENTITY,
+        **final_gate_request(),
+        "status": "UNKNOWN",
+        "executor": "root",
+    }
+    workflow.record_verification(value, unknown_gate)
+    result = workflow.advance(
+        value,
+        {"task_key": "task-one", "verification_request": verification_request()},
+    )
+    assert result["next_action"] == "RECONCILE_FINAL_GATE_EVIDENCE"
+    assert result["verification_reference"] == "verification:unknown-gate"
+    assert result["verification_status"] == "UNKNOWN"
+    assert value["phase"] == "VERIFY"
+
+
+def test_failed_public_safety_audit_returns_to_repair():
+    workflow = load_workflow_module()
+    value = state(workflow)
+    workflow.register_task(value, task())
+    assembled_candidate(workflow, value)
+    workflow.record_verification(
+        value,
+        {
+            "task_key": "task-one",
+            "reference": "verification:gate",
+            "subject": IDENTITY,
+            **final_gate_request(),
+            "status": "PASS",
+            "executor": "root",
+        },
+    )
+    workflow.record_verification(
+        value,
+        public_safety_record(reference="verification:failed-public", status="FAIL"),
+    )
+    result = workflow.advance(
+        value,
+        {"task_key": "task-one", "verification_request": verification_request()},
+    )
+    assert result["next_action"] == "REPAIR_IN_SCOPE"
+    assert result["failed_verification_type"] == "public_safety"
+    assert result["failed_verification_reference"] == "verification:failed-public"
+    assert value["phase"] == "PLAN"
+
+
+def test_public_safety_requires_root_and_latest_pass():
     workflow = load_workflow_module()
     request = {
         "actor": "maintainer",
@@ -531,69 +931,290 @@ def test_final_and_public_safety_evidence_use_registered_verifier_and_latest_res
         "verification_reference": "verification:unit",
         "verification_request": verification_request(),
     }
-    arbitrary = state(workflow)
-    workflow.register_task(arbitrary, task())
-    completed_candidate(workflow, arbitrary)
-    with pytest.raises(workflow.WorkflowError, match="prior accepted"):
-        workflow.record_verification(
-            arbitrary,
-            {
-                "task_key": "task-one",
-                "reference": "verification:arbitrary-gate",
-                "subject": IDENTITY,
-                **final_gate_request(),
-                "status": "PASS",
-                "verifier_reference": "unregistered:label",
-            },
-        )
-
-    stale_gate = state(workflow)
-    workflow.register_task(stale_gate, task())
-    completed_candidate(workflow, stale_gate)
-    workflow.record_verification(
-        stale_gate,
-        {
-            "task_key": "task-one",
-            "reference": "verification:gate",
-            "subject": IDENTITY,
-            **final_gate_request(),
-            "status": "FAIL",
-        },
-    )
-    assert stale_gate["authorization_state"] == "VERIFIED"
-    with pytest.raises(workflow.WorkflowError, match="registered-verifier"):
-        workflow.authorize(stale_gate, request)
-
     stale_safety = state(workflow)
     workflow.register_task(stale_safety, task())
     completed_candidate(workflow, stale_safety)
     workflow.record_verification(
         stale_safety,
-        {
-            "task_key": "task-one",
-            "reference": "verification:public",
-            "subject": IDENTITY,
-            "command": ["python", "scripts/public-safety.py"],
-            "scope": ["repository"],
-            "environment": {"lock": "committed"},
-            "side_effects": [],
-            "status": "FAIL",
-        },
+        public_safety_record(status="FAIL"),
     )
     with pytest.raises(workflow.WorkflowError, match="public-safety"):
         workflow.authorize(stale_safety, request)
 
 
-def test_authority_provenance_and_observed_route_mismatch_fail_closed():
+def test_authority_provenance_and_route_observation_fail_closed():
     workflow = load_workflow_module()
     invalid = task()
     del invalid["maintainer_authorization"]["readiness_evidence"]
     with pytest.raises(workflow.WorkflowError, match="provenance"):
         workflow.validate_task(invalid, exact_base=BASE)
     invalid = task()
-    invalid["route"]["observed_model"] = "other-model"
-    with pytest.raises(workflow.WorkflowError, match="observed_model"):
+    invalid["route"]["runtime_observation"] = {
+        "availability": "OBSERVED",
+        "source": "host_task_metadata",
+        "model": "other-model",
+        "effort": "high",
+    }
+    with pytest.raises(workflow.WorkflowError, match="compliance"):
         workflow.validate_task(invalid, exact_base=BASE)
+
+    mismatch = task()
+    mismatch["route"]["runtime_observation"] = invalid["route"]["runtime_observation"]
+    mismatch["route"]["declared_route_compliance"] = "FAIL"
+    value = state(workflow)
+    workflow.register_task(value, mismatch)
+    to_plan(workflow, value)
+    workflow.acquire_ownership(
+        value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+    )
+    with pytest.raises(workflow.WorkflowError, match="route mismatch"):
+        workflow.advance(value, {"task_key": "task-one"})
+
+    unsupported = task()
+    unsupported["route"]["runtime_observation"] = {
+        "availability": "OBSERVED",
+        "source": "synthetic_telemetry",
+        "model": unsupported["route"]["declared_model"],
+        "effort": unsupported["route"]["declared_effort"],
+    }
+    unsupported["route"]["declared_route_compliance"] = "PASS"
+    with pytest.raises(workflow.WorkflowError, match="supported telemetry source"):
+        workflow.validate_task(unsupported, exact_base=BASE)
+
+
+def test_route_selection_rejects_prompt_or_unknown_mechanisms():
+    workflow = load_workflow_module()
+    prompt_only = task()
+    prompt_only["route"]["selection_mechanism"] = "prompt"
+    with pytest.raises(workflow.WorkflowError, match="JSON object"):
+        workflow.validate_task(prompt_only, exact_base=BASE)
+    unknown = task()
+    unknown["route"]["selection_mechanism"] = {
+        "kind": "invented",
+        "model_selector": "model",
+        "effort_selector": "effort",
+    }
+    with pytest.raises(workflow.WorkflowError, match="host_controls"):
+        workflow.validate_task(unknown, exact_base=BASE)
+    missing_selector = task()
+    del missing_selector["route"]["selection_mechanism"]["effort_selector"]
+    with pytest.raises(workflow.WorkflowError, match="executable"):
+        workflow.validate_task(missing_selector, exact_base=BASE)
+
+
+def test_matched_experiment_label_requires_predeclared_pair_metadata():
+    workflow = load_workflow_module()
+    control = task()
+    control["route"]["experiment"] = {"label": "CONTROL", "predeclared": True}
+    with pytest.raises(workflow.WorkflowError, match="predeclared matched pair"):
+        workflow.validate_task(control, exact_base=BASE)
+    control["route"]["experiment"] = matched_experiment(
+        "CONTROL",
+        "pair-synthetic",
+        "run-control",
+        "bounded_implementation_or_repair",
+    )
+    assert (
+        workflow.validate_task(control, exact_base=BASE)["route"]["experiment"]
+        == (control["route"]["experiment"])
+    )
+    experimental = task()
+    experimental["route"].update(
+        {
+            "declared_route": "sol-ultra",
+            "declared_model": "gpt-5.6-sol",
+            "declared_effort": "ultra",
+            "selected_model": "gpt-5.6-sol",
+            "selected_effort": "ultra",
+            "experiment": matched_experiment(
+                "EXPERIMENTAL",
+                "pair-synthetic",
+                "run-experimental",
+                "bounded_implementation_or_repair",
+            ),
+        }
+    )
+    assert (
+        workflow.validate_task(experimental, exact_base=BASE)["route"]["declared_route"]
+        == "sol-ultra"
+    )
+
+
+def test_route_trial_registry_requires_six_isolated_scored_pairs():
+    workflow = load_workflow_module()
+    complete = matched_trial()
+    assert workflow.validate_route_trial(complete)[
+        "eligible_for_default_route_decision"
+    ]
+    value = state(workflow)
+    result = workflow.record_route_trial(value, complete)
+    assert result == {
+        "recorded": "route_trial",
+        "trial_id": "trial-synthetic",
+        "eligible_for_default_route_decision": True,
+    }
+    with pytest.raises(workflow.WorkflowError, match="already registered"):
+        workflow.record_route_trial(value, complete)
+
+    missing_pair = copy.deepcopy(complete)
+    missing_pair["trial_id"] = "trial-missing-pair"
+    missing_pair["pairs"].pop()
+    with pytest.raises(workflow.WorkflowError, match="exactly six pairs"):
+        workflow.validate_route_trial(missing_pair)
+    reused_context = copy.deepcopy(complete)
+    reused_context["pairs"][0]["runs"][1]["context_identity"] = reused_context["pairs"][
+        0
+    ]["runs"][0]["context_identity"]
+    with pytest.raises(workflow.WorkflowError, match="unique run/context"):
+        workflow.validate_route_trial(reused_context)
+    reused_cross_pair_context = copy.deepcopy(complete)
+    reused_cross_pair_context["pairs"][1]["runs"][0]["context_identity"] = (
+        reused_cross_pair_context["pairs"][0]["runs"][0]["context_identity"]
+    )
+    with pytest.raises(workflow.WorkflowError, match="unique run/context"):
+        workflow.validate_route_trial(reused_cross_pair_context)
+    unscored = copy.deepcopy(complete)
+    del unscored["pairs"][0]["runs"][0]["score"]
+    with pytest.raises(workflow.WorkflowError, match="score must be a JSON object"):
+        workflow.validate_route_trial(unscored)
+    arbitrary_score = copy.deepcopy(complete)
+    arbitrary_score["pairs"][0]["runs"][0]["score"]["components"]["quality"] = 99
+    with pytest.raises(workflow.WorkflowError, match="raw scoring inputs"):
+        workflow.validate_route_trial(arbitrary_score)
+    different_ledgers = copy.deepcopy(complete)
+    different_ledgers["pairs"][0]["runs"][1]["score"]["ledger_ref"] = "ledger:different"
+    with pytest.raises(workflow.WorkflowError, match="share one ledger"):
+        workflow.validate_route_trial(different_ledgers)
+    mixed_zero_ledger = copy.deepcopy(complete)
+    zero_runs = mixed_zero_ledger["pairs"][0]["runs"]
+    for run in zero_runs:
+        raw = run["score"]["raw"]
+        raw["credited_ledger_weight"] = 0
+        raw["total_ledger_weight"] = 0
+        run["score"]["components"]["quality"] = 100
+        run["score"]["components"]["total"] = 100
+    zero_runs[1]["score"]["raw"]["acceptance_complete"] = False
+    with pytest.raises(workflow.WorkflowError, match="both runs' acceptance"):
+        workflow.validate_route_trial(mixed_zero_ledger)
+    mismatched_task_mix_class = copy.deepcopy(complete)
+    for run in mismatched_task_mix_class["pairs"][0]["runs"]:
+        run["task_class"] = "normal_implementation"
+    with pytest.raises(workflow.WorkflowError, match="task_mix"):
+        workflow.validate_route_trial(mismatched_task_mix_class)
+    mechanical_pair = complete["pairs"][-1]
+    mechanical_control = next(
+        run
+        for run in mechanical_pair["runs"]
+        if run["route"]["experiment"]["label"] == "CONTROL"
+    )
+    assert mechanical_control["task_class"] == "mechanical_change"
+    assert mechanical_control["route"]["declared_route"] == "terra-medium"
+    mechanical_sol_high = copy.deepcopy(complete)
+    mechanical_sol_high_control = next(
+        run
+        for run in mechanical_sol_high["pairs"][-1]["runs"]
+        if run["route"]["experiment"]["label"] == "CONTROL"
+    )
+    mechanical_sol_high_route = mechanical_sol_high_control["route"]
+    mechanical_sol_high_route.update(
+        {
+            "declared_route": "sol-high",
+            "declared_model": "gpt-5.6-sol",
+            "declared_effort": "high",
+            "selected_model": "gpt-5.6-sol",
+            "selected_effort": "high",
+            "runtime_observation": {
+                "availability": "OBSERVED",
+                "source": "host_task_metadata",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+            },
+        }
+    )
+    with pytest.raises(workflow.WorkflowError, match="not permitted"):
+        workflow.validate_route_trial(mechanical_sol_high)
+    unobserved = copy.deepcopy(complete)
+    unobserved_route = unobserved["pairs"][0]["runs"][0]["route"]
+    unobserved_route["runtime_observation"] = {
+        "availability": "UNAVAILABLE",
+        "source": "host_without_route_telemetry",
+        "model": "UNVERIFIED",
+        "effort": "UNVERIFIED",
+    }
+    unobserved_route["declared_route_compliance"] = "UNVERIFIED"
+    with pytest.raises(workflow.WorkflowError, match="supported observed telemetry"):
+        workflow.validate_route_trial(unobserved)
+
+    negative = copy.deepcopy(complete)
+    for pair in negative["pairs"]:
+        by_label = {run["route"]["experiment"]["label"]: run for run in pair["runs"]}
+        control_score = by_label["CONTROL"]["score"]
+        experimental_score = by_label["EXPERIMENTAL"]["score"]
+        by_label["CONTROL"]["score"] = experimental_score
+        by_label["EXPERIMENTAL"]["score"] = control_score
+    negative["aggregate"].update(
+        {
+            "mean_total_delta": -5,
+            "median_total_delta": -5,
+            "mean_quality_delta": -10,
+        }
+    )
+    with pytest.raises(workflow.WorkflowError, match="derived decision rule"):
+        workflow.validate_route_trial(negative)
+    negative["aggregate"].update(
+        {
+            "outcome": "NO_MATERIAL_BENEFIT",
+            "recommendation": "KEEP_CONTROL",
+        }
+    )
+    assert workflow.validate_route_trial(negative)["aggregate"]["recommendation"] == (
+        "KEEP_CONTROL"
+    )
+
+    escaped_p1 = copy.deepcopy(complete)
+    escaped_p1["aggregate"]["escaped_p1"] = True
+    with pytest.raises(workflow.WorkflowError, match="derived decision rule"):
+        workflow.validate_route_trial(escaped_p1)
+    escaped_p1["aggregate"]["recommendation"] = "KEEP_CONTROL"
+    assert workflow.validate_route_trial(escaped_p1)["aggregate"]["recommendation"] == (
+        "KEEP_CONTROL"
+    )
+
+    tie = copy.deepcopy(complete)
+    for pair in tie["pairs"]:
+        by_label = {run["route"]["experiment"]["label"]: run for run in pair["runs"]}
+        control_score = trial_score(80, pair["ledger_ref"])
+        control_score["raw"]["handoff_passed_items"] = 9
+        control_score["components"]["handoff"] = 90
+        control_score["components"]["total"] = 89
+        by_label["CONTROL"]["score"] = control_score
+        by_label["EXPERIMENTAL"]["score"] = trial_score(80, pair["ledger_ref"])
+    tie["aggregate"].update(
+        {
+            "mean_total_delta": 1,
+            "median_total_delta": 1,
+            "mean_quality_delta": 0,
+            "outcome": "TIE",
+            "recommendation": "KEEP_CONTROL",
+        }
+    )
+    assert workflow.validate_route_trial(tie)["aggregate"]["outcome"] == "TIE"
+    tie["aggregate"]["recommendation"] = "ADOPT_EXPERIMENTAL"
+    with pytest.raises(workflow.WorkflowError, match="derived decision rule"):
+        workflow.validate_route_trial(tie)
+
+    observational = {
+        "trial_id": "trial-observational",
+        "classification": "OBSERVATIONAL",
+        "eligible_for_default_route_decision": False,
+        "reason": "The tasks or isolated contexts were not matched.",
+    }
+    assert not workflow.validate_route_trial(observational)[
+        "eligible_for_default_route_decision"
+    ]
+    observational["eligible_for_default_route_decision"] = True
+    with pytest.raises(workflow.WorkflowError, match="cannot support"):
+        workflow.validate_route_trial(observational)
 
 
 def test_decision_authority_must_match_registered_task_authority():
@@ -633,15 +1254,9 @@ def test_read_only_tasks_and_windows_absolute_paths_cannot_be_written():
         )
 
 
-def test_routine_task_policy_cannot_be_overridden_by_worker_flags_or_routes():
+def test_root_writer_is_default_and_subagent_dispatch_requires_exception():
     workflow = load_workflow_module()
     routine = task(task_class="routine_administration")
-    routine["route"] = {
-        "selected_model": "luna_or_cheapest",
-        "selected_effort": "low",
-        "observed_model": "UNVERIFIED",
-        "observed_effort": "UNVERIFIED",
-    }
     value = state(workflow)
     workflow.register_task(value, routine)
     to_plan(workflow, value)
@@ -650,27 +1265,76 @@ def test_routine_task_policy_cannot_be_overridden_by_worker_flags_or_routes():
             value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
         )
 
+    root_candidate = state(workflow)
+    workflow.register_task(root_candidate, task())
+    to_plan(workflow, root_candidate)
+    workflow.acquire_ownership(
+        root_candidate, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+    )
+    result = workflow.advance(root_candidate, {"task_key": "task-one"})
+    assert result["root_writer"] == {"reference": "root:task-one", "attempt": 1}
+    assert "context" not in result
+    assert root_candidate["workers"][0]["execution_mode"] == "root"
+
     candidate = state(workflow)
-    implementation = task()
-    implementation["route"]["observed_model"] = "terra-high"
-    implementation["route"]["observed_effort"] = "high"
-    workflow.register_task(candidate, implementation)
+    workflow.register_task(candidate, task())
     to_plan(workflow, candidate)
     workflow.acquire_ownership(
         candidate, {"task_key": "task-one", "paths": ["scripts/example.py"]}
     )
-    workflow.advance(candidate, {"task_key": "task-one"})
+    with pytest.raises(workflow.WorkflowError, match="maintainer exception"):
+        workflow.advance(candidate, {"task_key": "task-one", "writer_mode": "subagent"})
+    with pytest.raises(workflow.WorkflowError, match="durable maintainer exception"):
+        workflow.advance(
+            candidate,
+            {
+                "task_key": "task-one",
+                "writer_mode": "subagent",
+                "maintainer_writer_exception": True,
+            },
+        )
+    workflow.advance(
+        candidate,
+        subagent_advance_record(workflow, candidate),
+    )
     with pytest.raises(workflow.WorkflowError, match="derived"):
         workflow.register_worker(
             candidate,
             {"reference": "writer-one", "task_key": "task-one", "writer": False},
         )
-    mismatched = task()["route"]
+    mismatched = route()
+    mismatched["selection_mechanism"]["control_surface"] = "different_host_control"
     with pytest.raises(workflow.WorkflowError, match="supplied route"):
         workflow.register_worker(
             candidate,
             {"reference": "writer-one", "task_key": "task-one", "route": mismatched},
         )
+
+
+def test_second_root_writer_requires_a_durable_maintainer_exception():
+    workflow = load_workflow_module()
+    value = state(workflow)
+    workflow.register_task(value, task("task-one", ["scripts/one.py"]))
+    workflow.register_task(value, task("task-two", ["scripts/two.py"]))
+    to_plan(workflow, value)
+    for key in ("task-one", "task-two"):
+        workflow.acquire_ownership(
+            value, {"task_key": key, "paths": value["tasks"][key]["owned_paths"]}
+        )
+    workflow.advance(value, {"task_key": "task-one"})
+    guards = {name: True for name in workflow.REQUIRED_SECOND_WRITER_GUARDS}
+    record = {"task_key": "task-two", "independence_guards": guards}
+    with pytest.raises(workflow.WorkflowError, match="durable maintainer exception"):
+        workflow._activate_root_writer(value, value["tasks"]["task-two"], record)
+    exception = writer_exception_decision(value, "task-two", "root")
+    workflow.record_evidence(value, exception)
+    record["writer_exception_reference"] = exception["reference"]
+    second = workflow._activate_root_writer(value, value["tasks"]["task-two"], record)
+    assert second["writer_exception_reference"] == exception["reference"]
+    assert workflow.validate_state(value) is value
+    del second["writer_exception_reference"]
+    with pytest.raises(workflow.WorkflowError, match="durable maintainer exception"):
+        workflow.validate_state(value)
 
 
 def test_guarded_second_writer_is_reachable_and_third_or_unguarded_writer_is_rejected():
@@ -685,17 +1349,22 @@ def test_guarded_second_writer_is_reachable_and_third_or_unguarded_writer_is_rej
             value, {"task_key": key, "paths": value["tasks"][key]["owned_paths"]}
         )
     workflow.advance(value, {"task_key": "task-one"})
-    workflow.register_worker(value, {"reference": "writer-one", "task_key": "task-one"})
     with pytest.raises(workflow.WorkflowError, match="durable task-specific"):
         workflow.register_worker(
             value, {"reference": "writer-two", "task_key": "task-two"}
         )
     with pytest.raises(workflow.WorkflowError, match="independence guard"):
-        workflow.advance(value, {"task_key": "task-two"})
+        workflow.advance(
+            value,
+            subagent_advance_record(workflow, value, "task-two"),
+        )
     guards = {name: True for name in workflow.REQUIRED_SECOND_WRITER_GUARDS}
     assert (
         workflow.advance(
-            value, {"task_key": "task-two", "independence_guards": guards}
+            value,
+            subagent_advance_record(
+                workflow, value, "task-two", independence_guards=guards
+            ),
         )["advanced"]
         is True
     )
@@ -714,7 +1383,10 @@ def test_guarded_second_writer_is_reachable_and_third_or_unguarded_writer_is_rej
     value["workers"][1]["independence_guards"] = guards
     with pytest.raises(workflow.WorkflowError, match="third"):
         workflow.advance(
-            value, {"task_key": "task-three", "independence_guards": guards}
+            value,
+            subagent_advance_record(
+                workflow, value, "task-three", independence_guards=guards
+            ),
         )
 
 
@@ -726,7 +1398,10 @@ def test_duplicate_task_and_ambiguous_spawn_are_rejected_or_durable():
     workflow.acquire_ownership(
         value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
     )
-    workflow.advance(value, {"task_key": "task-one"})
+    workflow.advance(
+        value,
+        subagent_advance_record(workflow, value),
+    )
     value["workers"].append(
         {
             "reference": "duplicate",
@@ -762,35 +1437,36 @@ def test_duplicate_task_and_ambiguous_spawn_are_rejected_or_durable():
         workflow.validate_state(value)
 
 
-def test_late_verifier_registration_cannot_authorize_a_persisted_gate_result():
+def test_persisted_verifier_and_duplicate_gate_records_fail_validation():
     workflow = load_workflow_module()
     value = state(workflow)
     workflow.register_task(value, task())
     completed_candidate(workflow, value)
-    registration = next(
-        item for item in value["evidence"] if item["kind"] == "verifier_registration"
+    value["evidence"].append(
+        {
+            "kind": "verifier_registration",
+            "task_key": "task-one",
+            "subject": IDENTITY,
+        }
     )
-    registration["sequence"] = value["verification"][-1]["sequence"] + 1
-    request = {
-        "actor": "maintainer",
-        "authorization_state": "INTEGRATION_AUTHORIZED",
-        "task_key": "task-one",
-        "identity": IDENTITY,
-        "applied_decision": handoff()["applied_decisions"][0],
-        "verification_reference": "verification:unit",
-        "verification_request": verification_request(),
-    }
-    with pytest.raises(workflow.WorkflowError, match="prior accepted"):
-        workflow.authorize(value, request)
+    with pytest.raises(workflow.WorkflowError, match="registrations are prohibited"):
+        workflow.validate_state(value)
 
-    missing_sequence = state(workflow)
-    workflow.register_task(missing_sequence, task())
-    completed_candidate(workflow, missing_sequence)
-    del missing_sequence["verification"][-1]["sequence"]
-    with pytest.raises(workflow.WorkflowError, match="positive integer sequence"):
-        workflow.validate_state(missing_sequence)
-    with pytest.raises(workflow.WorkflowError, match="positive integer sequence"):
-        workflow.authorize(missing_sequence, request)
+    duplicate = state(workflow)
+    workflow.register_task(duplicate, task())
+    completed_candidate(workflow, duplicate)
+    second_gate = dict(
+        next(
+            item
+            for item in duplicate["verification"]
+            if item["command"] == workflow.FINAL_GATE_COMMAND
+        )
+    )
+    second_gate["reference"] = "verification:duplicate-gate"
+    second_gate["sequence"] += 1
+    duplicate["verification"].append(second_gate)
+    with pytest.raises(workflow.WorkflowError, match="duplicate full gate"):
+        workflow.validate_state(duplicate)
 
 
 def test_newer_fail_invalidates_only_its_task_verification_pass():
@@ -860,7 +1536,10 @@ def test_worker_heartbeat_backs_off_without_replaying_context_or_spawning_duplic
     workflow.acquire_ownership(
         value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
     )
-    workflow.advance(value, {"task_key": "task-one"})
+    workflow.advance(
+        value,
+        subagent_advance_record(workflow, value),
+    )
     first = workflow.monitor_worker(value, {"reference": "manual:task-one", "now": 100})
     assert first == {
         "action": "WAIT_UNTIL_HEARTBEAT",
@@ -887,7 +1566,7 @@ def test_worker_heartbeat_resets_on_change_and_wakes_immediately_for_terminal_ev
     workflow = load_workflow_module()
     value = state(workflow)
     workflow.register_task(value, task())
-    dispatch_worker(workflow, value)
+    dispatch_exceptional_worker(workflow, value)
     workflow.monitor_worker(value, {"reference": "writer-one", "now": 0})
     workflow.monitor_worker(value, {"reference": "writer-one", "now": 120})
     changed = workflow.monitor_worker(
@@ -926,7 +1605,10 @@ def test_worker_heartbeat_requires_durable_ambiguous_spawn_reconciliation():
     workflow.acquire_ownership(
         value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
     )
-    workflow.advance(value, {"task_key": "task-one"})
+    workflow.advance(
+        value,
+        subagent_advance_record(workflow, value),
+    )
     with pytest.raises(workflow.WorkflowError, match="ambiguity_reference"):
         workflow.monitor_worker(
             value, {"reference": "manual:task-one", "now": 0, "status": "SPAWN_UNKNOWN"}
@@ -947,3 +1629,52 @@ def test_worker_heartbeat_requires_durable_ambiguous_spawn_reconciliation():
         ]
         == "AMBIGUOUS_SPAWN_RECONCILIATION"
     )
+
+
+def test_ci_runs_prs_once_and_keeps_main_and_two_os_coverage():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    workflow_text = (root / ".github" / "workflows" / "temper-gate.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "push:\n    branches: [main]" in workflow_text
+    assert "pull_request:" in workflow_text
+    assert (
+        "group: temper-gate-${{ github.workflow }}-${{ github.ref }}" in workflow_text
+    )
+    assert "cancel-in-progress: true" in workflow_text
+    assert "os: [ubuntu-latest, windows-latest]" in workflow_text
+
+
+def test_route_trial_policy_is_explicit_and_matched():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    policy = (
+        root / "docs" / "workflow" / "policies" / "model-routing-policy.yaml"
+    ).read_text(encoding="utf-8")
+    procedure = (
+        root / "docs" / "workflow" / "procedures" / "model-route-and-experiment.md"
+    ).read_text(encoding="utf-8")
+    verification_procedure = (
+        root / "docs" / "workflow" / "procedures" / "verification-review-and-handoff.md"
+    ).read_text(encoding="utf-8")
+    assert "matched_pairs: 6" in policy
+    assert "runs_per_pair: 2" in policy
+    assert "total_runs: 12" in policy
+    assert (
+        "supported_sources: [host_task_metadata, codex.conversation_starts]" in policy
+    )
+    assert "abs(mean_total_delta) <= 1.0" in policy
+    assert "fixed_snapshot_cold_review: cold_technical_review" in policy
+    assert "mechanical_negative_control: mechanical_change" in policy
+    assert "isolated worktrees" in procedure
+    assert "label the comparison `OBSERVATIONAL`" in procedure
+    assert "globally unique run and context identities" in procedure
+    assert "total = 0.50 * quality" in procedure
+    assert "RUN_ROOT_FINAL_GATE" in verification_procedure
+    assert "RUN_ROOT_PUBLIC_SAFETY_AUDIT" in verification_procedure
+    assert "RECONCILE_FINAL_GATE_EVIDENCE" in verification_procedure
+    assert "RECONCILE_PUBLIC_SAFETY_EVIDENCE" in verification_procedure
+    assert "temper-public-safety-audit-v1" in verification_procedure
