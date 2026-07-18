@@ -71,7 +71,14 @@ class TemperUiHandler(BaseHTTPRequestHandler):
             self._bytes(HTTPStatus.OK, data, content_type, cache=True)
             return
         if path == "/api/v1/workspace":
-            self._success(self.server.journey.workspace())
+            try:
+                self._success(self.server.journey.workspace())
+            except ApplicationServiceError as exc:
+                self._error(HTTPStatus.CONFLICT, exc.code)
+            except (OSError, UnicodeError):
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "filesystem_error")
+            except Exception:
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error")
             return
         self._error(HTTPStatus.NOT_FOUND, "route_not_found")
 

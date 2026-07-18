@@ -1,4 +1,5 @@
 from http.client import HTTPConnection
+import json
 from pathlib import Path
 import threading
 import time
@@ -135,6 +136,40 @@ def test_ui_routes_call_services_and_get_remains_read_only(ui_server) -> None:
     status, _, after = _request(ui_server, "GET", "/api/v1/workspace", origin=False)
     assert status == 200
     assert after != before
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_code"),
+    [
+        (
+            ApplicationServiceError("workspace_projection_failed"),
+            409,
+            "workspace_projection_failed",
+        ),
+        (OSError("private store location"), 500, "filesystem_error"),
+        (RuntimeError("private projection detail"), 500, "internal_error"),
+    ],
+)
+def test_workspace_get_failures_use_stable_json_errors(
+    ui_server,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    def fail_workspace() -> dict[str, object]:
+        raise error
+
+    monkeypatch.setattr(ui_server.journey, "workspace", fail_workspace)
+
+    status, headers, payload = _request(
+        ui_server, "GET", "/api/v1/workspace", origin=False
+    )
+
+    assert status == expected_status
+    assert headers["Content-Type"] == "application/json"
+    assert json.loads(payload) == {"ok": False, "error": {"code": expected_code}}
+    assert b"private" not in payload
 
 
 def test_ui_package_has_no_store_import() -> None:
