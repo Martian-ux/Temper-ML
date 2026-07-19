@@ -37,7 +37,8 @@ def test_every_slice8_backend_implements_one_narrow_runtime_port(tmp_path) -> No
                 "Ubuntu-ROCm", PurePosixPath("/usr/bin/python3")
             ),
             path_map=WindowsWslPathMap(
-                PureWindowsPath(str(tmp_path)), PurePosixPath("/temper-staging")
+                PureWindowsPath("C:/synthetic-temper-staging"),
+                PurePosixPath("/temper-staging"),
             ),
             host_model_source=(tmp_path / "model").resolve(),
             host_tokenizer_source=(tmp_path / "tokenizer").resolve(),
