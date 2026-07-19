@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
@@ -11,6 +12,7 @@ from temper_ml.app_services.experiments import ReplayMode, ReplayPlan
 from temper_ml.app_services.runs import (
     RunExecutionResult,
     RunLaunchRequest,
+    RunLifecycleStatus,
     RunService,
 )
 from temper_ml.domain.experiments import ReproductionMode
@@ -18,7 +20,7 @@ from temper_ml.domain.records import record_reference
 from temper_ml.runtime.fixture_adapter import FixtureAdapter, FixtureControl
 from temper_ml.runtime.preflight import PreflightError, preflight
 from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
-from temper_ml.store.event_stream import EventRequest
+from temper_ml.store.event_stream import EventRequest, StoredEvent
 
 
 @dataclass(frozen=True)
@@ -134,38 +136,73 @@ class ReproductionService:
         ).hexdigest()[:24]
         stream_id = f"replay-{execution_key}"
         event_prefix = stream_id
-        try:
-            self.store.append_event(
+        started_payload = {
+            "mode": plan.mode.value,
+            "run_id": launch.run_id,
+            "source_manifest_identity": {
+                "algorithm": plan.source_experiment.manifest_identity.algorithm,
+                "value": plan.source_experiment.manifest_identity.value,
+            },
+            "planned_manifest_identity": {
+                "algorithm": plan.planned_experiment.manifest_identity.algorithm,
+                "value": plan.planned_experiment.manifest_identity.value,
+            },
+        }
+        completed_payload = {
+            "mode": plan.mode.value,
+            "run_id": launch.run_id,
+            "exact_reproduction": plan.mode is ReplayMode.STRICT,
+            "adapted_reproduction": plan.mode is ReplayMode.ADAPTED,
+        }
+        existing_events = self._replay_events(stream_id)
+        self._validate_replay_events(
+            existing_events,
+            started_payload=started_payload,
+            completed_payload=completed_payload,
+        )
+        if not existing_events:
+            self._append_replay_event(
                 stream_id,
                 EventRequest(
                     f"{event_prefix}-started",
                     "replay_execution_started",
-                    {
-                        "mode": plan.mode.value,
-                        "run_id": launch.run_id,
-                        "source_manifest_identity": {
-                            "algorithm": (
-                                plan.source_experiment.manifest_identity.algorithm
-                            ),
-                            "value": plan.source_experiment.manifest_identity.value,
-                        },
-                        "planned_manifest_identity": {
-                            "algorithm": (
-                                plan.planned_experiment.manifest_identity.algorithm
-                            ),
-                            "value": plan.planned_experiment.manifest_identity.value,
-                        },
-                    },
+                    started_payload,
                 ),
             )
-        except EvidenceError as exc:
-            raise ApplicationServiceError(exc.code) from None
         run_service = RunService(self.project_root, adapter=self.adapter)
+        if existing_events:
+            existing_status = self._run_status_or_none(run_service, launch.run_id)
+            if existing_status is RunLifecycleStatus.COMPLETED:
+                result = run_service.reopen_completed(launch)
+                self._complete_replay(
+                    stream_id,
+                    event_prefix,
+                    completed_payload,
+                )
+                return ReplayExecutionResult(plan, result)
+            if existing_status is not None:
+                raise ApplicationServiceError("replay_reconciliation_required")
+            if any(
+                event.event_type == "replay_execution_failed"
+                for event in existing_events
+            ):
+                raise ApplicationServiceError("replay_execution_already_failed")
         try:
             result = run_service.launch(launch, control=control)
         except ApplicationServiceError as exc:
+            if (
+                self._run_status_or_none(run_service, launch.run_id)
+                is RunLifecycleStatus.COMPLETED
+            ):
+                result = run_service.reopen_completed(launch)
+                self._complete_replay(
+                    stream_id,
+                    event_prefix,
+                    completed_payload,
+                )
+                return ReplayExecutionResult(plan, result)
             try:
-                self.store.append_event(
+                self._append_replay_event(
                     stream_id,
                     EventRequest(
                         f"{event_prefix}-failed",
@@ -173,24 +210,99 @@ class ReproductionService:
                         {"failure_code": exc.code},
                     ),
                 )
-            except EvidenceError:
+            except ApplicationServiceError:
                 pass
             raise
+        if result.run.run_id != launch.run_id:
+            raise ApplicationServiceError("replay_run_identity_mismatch")
+        self._complete_replay(stream_id, event_prefix, completed_payload)
+        return ReplayExecutionResult(plan, result)
+
+    def _run_status_or_none(
+        self, run_service: RunService, run_id: str
+    ) -> RunLifecycleStatus | None:
         try:
-            self.store.append_event(
-                stream_id,
-                EventRequest(
-                    f"{event_prefix}-completed",
-                    "replay_execution_completed",
-                    {
-                        "mode": plan.mode.value,
-                        "run_id": result.run.run_id,
-                        "exact_reproduction": plan.mode is ReplayMode.STRICT,
-                        "adapted_reproduction": plan.mode is ReplayMode.ADAPTED,
-                    },
+            return run_service.status(run_id)
+        except ApplicationServiceError as exc:
+            if exc.code == "run_not_found":
+                return None
+            raise
+
+    def _replay_events(self, stream_id: str) -> tuple[StoredEvent, ...]:
+        try:
+            return next(
+                (
+                    snapshot.events
+                    for snapshot in self.store.iter_streams()
+                    if snapshot.stream_id == stream_id
                 ),
+                (),
             )
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+
+    def _validate_replay_events(
+        self,
+        events: tuple[StoredEvent, ...],
+        *,
+        started_payload: Mapping[str, object],
+        completed_payload: Mapping[str, object],
+    ) -> None:
+        if not events:
+            return
+        event_types = tuple(getattr(event, "event_type", None) for event in events)
+        if (
+            event_types[0] != "replay_execution_started"
+            or event_types.count("replay_execution_started") != 1
+            or any(
+                event_type
+                not in {
+                    "replay_execution_started",
+                    "replay_execution_completed",
+                    "replay_execution_failed",
+                }
+                for event_type in event_types
+            )
+            or sum(
+                event_type in {"replay_execution_completed", "replay_execution_failed"}
+                for event_type in event_types
+            )
+            > 1
+        ):
+            raise ApplicationServiceError("replay_execution_evidence_conflict")
+        started = events[0]
+        if dict(getattr(started, "payload", {})) != started_payload:
+            raise ApplicationServiceError("replay_execution_evidence_conflict")
+        for event in events[1:]:
+            event_type = getattr(event, "event_type", None)
+            payload = dict(getattr(event, "payload", {}))
+            if event_type == "replay_execution_completed":
+                if payload != completed_payload:
+                    raise ApplicationServiceError("replay_execution_evidence_conflict")
+            elif not isinstance(payload.get("failure_code"), str):
+                raise ApplicationServiceError("replay_execution_evidence_conflict")
+
+    def _append_replay_event(self, stream_id: str, request: EventRequest) -> None:
+        try:
+            self.store.append_event(stream_id, request)
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+
+    def _complete_replay(
+        self,
+        stream_id: str,
+        event_prefix: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        self._append_replay_event(
+            stream_id,
+            EventRequest(
+                f"{event_prefix}-completed",
+                "replay_execution_completed",
+                payload,
+            ),
+        )
+        try:
             self.store.verify()
         except EvidenceError as exc:
             raise ApplicationServiceError(exc.code) from None
-        return ReplayExecutionResult(plan, result)

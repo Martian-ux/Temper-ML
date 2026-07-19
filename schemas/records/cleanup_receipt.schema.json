@@ -58,7 +58,7 @@
                   "byte_class": {"enum": ["checkpoint", "debugging_evidence", "export_bundle", "final_adapter", "runtime_control", "staging_cache", "unknown"]},
                   "byte_count": {"type": "integer", "minimum": 0},
                   "content_identity": {"$ref": "common.schema.json#/$defs/identity"},
-                  "status": {"enum": ["removed", "failed", "not_attempted"]},
+                  "status": {"enum": ["removed", "retained", "ambiguous", "failed", "not_attempted"]},
                   "physical_bytes_freed": {"type": "boolean"},
                   "subjects": {
                     "type": "array",

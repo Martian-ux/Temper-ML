@@ -242,12 +242,19 @@ class TemperUiHandler(BaseHTTPRequestHandler):
                 raise ValueError("entry_ids")
             return journey.preview_cleanup(tuple(entry_ids))
         if path == "/api/v1/storage/cleanup/execute":
-            _require_fields(body, ("plan_id", "confirm"))
+            _require_fields(body, ("plan_id", "entry_ids", "confirm"))
+            entry_ids = body.get("entry_ids")
+            if not isinstance(entry_ids, list) or any(
+                not isinstance(entry_id, str) or not entry_id for entry_id in entry_ids
+            ):
+                raise ValueError("entry_ids")
             confirm = body.get("confirm")
             if not isinstance(confirm, bool):
                 raise ValueError("confirm")
             return journey.execute_cleanup(
-                _required_text(body, "plan_id"), confirm=confirm
+                _required_text(body, "plan_id"),
+                confirm=confirm,
+                entry_ids=tuple(entry_ids),
             )
         if path == "/api/v1/replays/plan":
             _require_fields(body, ("candidate_key", "mode"))
@@ -256,8 +263,12 @@ class TemperUiHandler(BaseHTTPRequestHandler):
                 _required_text(body, "mode"),
             )
         if path == "/api/v1/replays/execute":
-            _require_fields(body, ("plan_id",))
-            return journey.execute_replay(_required_text(body, "plan_id"))
+            _require_fields(body, ("plan_id", "candidate_key", "mode"))
+            return journey.execute_replay(
+                _required_text(body, "plan_id"),
+                candidate_key=_required_text(body, "candidate_key"),
+                mode=_required_text(body, "mode"),
+            )
         raise ApplicationServiceError("route_not_found")
 
     def _content_length(self) -> int | None:

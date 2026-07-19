@@ -50,6 +50,7 @@ from temper_ml.domain.retention import (
     CleanupObjectStatus,
     CleanupOutcome,
     CleanupReceipt,
+    require_cleanup_logical_key,
 )
 from temper_ml.domain.runs import Run
 from temper_ml.filesystem import (
@@ -63,7 +64,7 @@ from temper_ml.filesystem import (
 )
 from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
 from temper_ml.store.event_stream import EventRequest
-from temper_ml.store.safe_io import SafeIoError, read_stable_bytes
+from temper_ml.store.safe_io import SafeIoError
 from temper_ml.runtime.artifact_integrity import (
     EXPORT_BUNDLE_PREFIX,
     EXPORT_MANIFEST_MEMBER,
@@ -78,6 +79,7 @@ ENTRY_PROJECTION = HashProjection("retention.inventory_entry", "v1")
 PHYSICAL_GROUP_PROJECTION = HashProjection("retention.physical_group", "v1")
 CLEANUP_PLAN_PROJECTION = HashProjection("retention.cleanup_plan", "v1")
 _EXECUTION_ID = re.compile(r"^cleanup-execution-[0-9a-f]{32}$")
+_HASH_CHUNK_BYTES = 1024 * 1024
 
 
 class RetentionDefault(str, Enum):
@@ -277,6 +279,21 @@ class _ObservedFile:
 
 
 @dataclass(frozen=True)
+class _StableFileSnapshot:
+    content_identity: ContentIdentity
+    byte_count: int
+    signature: tuple[int, int, int, int, int]
+
+
+class _RemovalError(ApplicationServiceError):
+    """Removal failure with an evidence-safe object disposition."""
+
+    def __init__(self, code: str, status: CleanupObjectStatus) -> None:
+        self.status = status
+        super().__init__(code)
+
+
+@dataclass(frozen=True)
 class _CleanupIntentObject:
     entry_id: str
     logical_key: str
@@ -348,6 +365,7 @@ class RetentionService:
         *,
         _remove_file: Callable[[Path], None] | None = None,
         _execution_id_factory: Callable[[], str] | None = None,
+        _hash_chunk_size: int = _HASH_CHUNK_BYTES,
     ) -> None:
         self.project_root = Path(project_root)
         self.store = TypedEvidenceStore(self.project_root)
@@ -358,10 +376,17 @@ class RetentionService:
             if _execution_id_factory is not None
             else lambda: f"cleanup-execution-{uuid.uuid4().hex}"
         )
+        self._hash_chunk_size = _hash_chunk_size
         if not callable(self._remove_file):
             raise ApplicationServiceError("cleanup_remove_strategy_invalid")
         if not callable(self._execution_id_factory):
             raise ApplicationServiceError("cleanup_execution_id_factory_invalid")
+        if (
+            isinstance(self._hash_chunk_size, bool)
+            or not isinstance(self._hash_chunk_size, int)
+            or self._hash_chunk_size <= 0
+        ):
+            raise ApplicationServiceError("storage_hash_chunk_size_invalid")
 
     @contextmanager
     def _claim_cleanup_execution(self) -> Iterator[None]:
@@ -676,6 +701,16 @@ class RetentionService:
         statuses: dict[str, CleanupObjectStatus] = {
             entry.entry_id: CleanupObjectStatus.NOT_ATTEMPTED for entry in selected
         }
+        groups: dict[str, tuple[InventoryEntry, ...]] = {
+            group_id: tuple(
+                entry
+                for entry in current.entries
+                if entry.physical_group_id == group_id
+            )
+            for group_id in {entry.physical_group_id for entry in selected}
+        }
+        verified_groups: set[str] = set()
+        removed_by_group: dict[str, int] = defaultdict(int)
         failure_code: str | None = None
         removal_ambiguous = False
         try:
@@ -691,6 +726,15 @@ class RetentionService:
             self._record_failure(intent, failure_code)
         if failure_code is None:
             for entry in selected:
+                if entry.physical_group_id not in verified_groups:
+                    try:
+                        self._verify_group_unchanged(groups[entry.physical_group_id])
+                    except ApplicationServiceError as exc:
+                        statuses[entry.entry_id] = CleanupObjectStatus.FAILED
+                        failure_code = exc.code
+                        self._record_failure(intent, failure_code, entry.entry_id)
+                        break
+                    verified_groups.add(entry.physical_group_id)
                 try:
                     self._append_cleanup(
                         intent.stream_id,
@@ -707,12 +751,19 @@ class RetentionService:
                     self._record_failure(intent, failure_code, entry.entry_id)
                     break
                 try:
-                    self._unlink_verified(entry)
+                    self._unlink_verified(
+                        entry,
+                        expected_link_count=(
+                            entry._signature[-1]
+                            - removed_by_group[entry.physical_group_id]
+                        ),
+                    )
                     statuses[entry.entry_id] = CleanupObjectStatus.REMOVED
-                except ApplicationServiceError as exc:
-                    statuses[entry.entry_id] = CleanupObjectStatus.FAILED
+                    removed_by_group[entry.physical_group_id] += 1
+                except _RemovalError as exc:
+                    statuses[entry.entry_id] = exc.status
                     failure_code = exc.code
-                    removal_ambiguous = exc.code == "cleanup_object_removal_ambiguous"
+                    removal_ambiguous = exc.status is CleanupObjectStatus.AMBIGUOUS
                     self._record_failure(intent, failure_code, entry.entry_id)
                     break
                 try:
@@ -745,76 +796,123 @@ class RetentionService:
         manifests: tuple[BundleManifest, ...],
     ) -> _ObservedFile:
         try:
-            before = require_safe_regular_file(path)
-            payload = read_stable_bytes(path)
-            after = require_safe_regular_file(path)
+            snapshot = _stream_file_snapshot(path, chunk_size=self._hash_chunk_size)
         except (OSError, SafeIoError, UnsafeFilesystemPath):
             raise ApplicationServiceError("storage_inventory_unstable") from None
-        if not same_file_object(before, after) or len(payload) != after.st_size:
-            raise ApplicationServiceError("storage_inventory_unstable")
         logical_key = path.relative_to(root).as_posix()
-        classification = _classify(logical_key, records, streams, manifests, payload)
+        classification = _classify(
+            logical_key,
+            records,
+            streams,
+            manifests,
+            snapshot.content_identity,
+        )
+        try:
+            require_cleanup_logical_key(logical_key)
+        except RecordValidationError:
+            classification = _protected_unknown(classification[1])
         return _ObservedFile(
             path=path,
             logical_key=logical_key,
             byte_class=classification[0],
-            byte_count=len(payload),
-            content_identity=ContentIdentity(
-                "sha256", hashlib.sha256(payload).hexdigest()
-            ),
+            byte_count=snapshot.byte_count,
+            content_identity=snapshot.content_identity,
             subjects=classification[1],
             impacts=classification[2],
             deletable=classification[3],
-            signature=_signature(after),
-            link_count=max(1, after.st_nlink),
+            signature=snapshot.signature,
+            link_count=max(1, snapshot.signature[-1]),
         )
 
-    def _unlink_verified(self, entry: InventoryEntry) -> None:
-        try:
-            before = require_safe_regular_file(entry._path)
-            if _signature(before) != entry._signature:
-                raise ApplicationServiceError("cleanup_object_changed")
-            payload = read_stable_bytes(entry._path)
-            after = require_safe_regular_file(entry._path)
+    def _verify_group_unchanged(self, entries: tuple[InventoryEntry, ...]) -> None:
+        """Revalidate every local link before removing any member of its group."""
+
+        for entry in entries:
+            try:
+                snapshot = _stream_file_snapshot(
+                    entry._path, chunk_size=self._hash_chunk_size
+                )
+            except (FileNotFoundError, SafeIoError, UnsafeFilesystemPath):
+                raise ApplicationServiceError("cleanup_object_changed") from None
             if (
-                _signature(after) != entry._signature
-                or not same_file_object(before, after)
-                or len(payload) != entry.byte_count
-                or hashlib.sha256(payload).hexdigest() != entry.content_identity.value
+                snapshot.signature != entry._signature
+                or snapshot.byte_count != entry.byte_count
+                or snapshot.content_identity != entry.content_identity
             ):
                 raise ApplicationServiceError("cleanup_object_changed")
-        except ApplicationServiceError:
-            raise
+
+    def _unlink_verified(
+        self,
+        entry: InventoryEntry,
+        *,
+        expected_link_count: int,
+    ) -> None:
+        expected_signature = (*entry._signature[:-1], expected_link_count)
+        try:
+            snapshot = _stream_file_snapshot(
+                entry._path, chunk_size=self._hash_chunk_size
+            )
+            if (
+                snapshot.signature != expected_signature
+                or snapshot.byte_count != entry.byte_count
+                or snapshot.content_identity != entry.content_identity
+            ):
+                raise _RemovalError(
+                    "cleanup_object_changed", CleanupObjectStatus.AMBIGUOUS
+                )
         except FileNotFoundError:
-            raise ApplicationServiceError("cleanup_object_removal_ambiguous") from None
+            raise _RemovalError(
+                "cleanup_object_removal_ambiguous", CleanupObjectStatus.AMBIGUOUS
+            ) from None
         except (OSError, SafeIoError, UnsafeFilesystemPath):
-            raise ApplicationServiceError("cleanup_object_remove_failed") from None
+            raise _RemovalError(
+                "cleanup_object_removal_ambiguous", CleanupObjectStatus.AMBIGUOUS
+            ) from None
         try:
             self._remove_file(entry._path)
         except OSError:
-            if self._entry_still_matches(entry):
-                raise ApplicationServiceError("cleanup_object_remove_failed") from None
-            raise ApplicationServiceError("cleanup_object_removal_ambiguous") from None
+            if self._entry_still_matches(
+                entry, expected_link_count=expected_link_count
+            ):
+                raise _RemovalError(
+                    "cleanup_object_remove_failed", CleanupObjectStatus.RETAINED
+                ) from None
+            raise _RemovalError(
+                "cleanup_object_removal_ambiguous", CleanupObjectStatus.AMBIGUOUS
+            ) from None
         try:
             remaining = safe_path_stat(entry._path, allow_missing=True)
         except (OSError, UnsafeFilesystemPath):
-            raise ApplicationServiceError("cleanup_object_removal_ambiguous") from None
+            raise _RemovalError(
+                "cleanup_object_removal_ambiguous", CleanupObjectStatus.AMBIGUOUS
+            ) from None
         if remaining is not None:
-            raise ApplicationServiceError("cleanup_object_remove_failed")
+            if self._entry_still_matches(
+                entry, expected_link_count=expected_link_count
+            ):
+                raise _RemovalError(
+                    "cleanup_object_remove_failed", CleanupObjectStatus.RETAINED
+                )
+            raise _RemovalError(
+                "cleanup_object_removal_ambiguous", CleanupObjectStatus.AMBIGUOUS
+            )
 
-    def _entry_still_matches(self, entry: InventoryEntry) -> bool:
+    def _entry_still_matches(
+        self,
+        entry: InventoryEntry,
+        *,
+        expected_link_count: int,
+    ) -> bool:
         try:
-            before = require_safe_regular_file(entry._path)
-            payload = read_stable_bytes(entry._path)
-            after = require_safe_regular_file(entry._path)
-        except (OSError, SafeIoError, UnsafeFilesystemPath):
+            snapshot = _stream_file_snapshot(
+                entry._path, chunk_size=self._hash_chunk_size
+            )
+        except (FileNotFoundError, OSError, SafeIoError, UnsafeFilesystemPath):
             return False
         return (
-            _signature(before) == entry._signature
-            and _signature(after) == entry._signature
-            and same_file_object(before, after)
-            and len(payload) == entry.byte_count
-            and hashlib.sha256(payload).hexdigest() == entry.content_identity.value
+            snapshot.signature == (*entry._signature[:-1], expected_link_count)
+            and snapshot.byte_count == entry.byte_count
+            and snapshot.content_identity == entry.content_identity
         )
 
     def _intent_from_plan(
@@ -822,7 +920,7 @@ class RetentionService:
         plan: CleanupPlan,
         selected: tuple[InventoryEntry, ...],
     ) -> _CleanupIntent:
-        return _CleanupIntent(
+        intent = _CleanupIntent(
             execution_id=plan.execution_id,
             receipt_id=_receipt_id(plan.execution_id),
             project=record_reference(self._project()),
@@ -846,6 +944,13 @@ class RetentionService:
             impact_categories=plan.impact_categories,
             affected_subjects=plan.affected_subjects,
         )
+        try:
+            validated = _intent_from_payload(intent.to_payload())
+        except (RecordValidationError, TypeError, ValueError):
+            raise ApplicationServiceError("cleanup_plan_unrepresentable") from None
+        if validated != intent:
+            raise ApplicationServiceError("cleanup_plan_unrepresentable")
+        return validated
 
     def _prepare_safety_fences(self, intent: _CleanupIntent) -> None:
         for _, artifact in self._intent_artifacts(intent):
@@ -1022,7 +1127,6 @@ class RetentionService:
         statuses: Mapping[str, CleanupObjectStatus],
     ) -> tuple[tuple[ArtifactAvailability, ...], str | None]:
         first_failure: str | None = None
-        deletion_intents = self._deletion_intent_ids(intent)
         availability_updates: list[ArtifactAvailability] = []
         for reference, artifact in self._intent_artifacts(intent):
             removed = any(
@@ -1034,7 +1138,7 @@ class RetentionService:
             uncertain = not removed and any(
                 item.byte_class is ByteClass.FINAL_ADAPTER
                 and reference in item.subjects
-                and item.entry_id in deletion_intents
+                and statuses[item.entry_id] is CleanupObjectStatus.AMBIGUOUS
                 for item in intent.objects
             )
             if uncertain:
@@ -1060,7 +1164,7 @@ class RetentionService:
             if item.byte_class is not ByteClass.CHECKPOINT:
                 continue
             removed = statuses[item.entry_id] is CleanupObjectStatus.REMOVED
-            if not removed and item.entry_id in deletion_intents:
+            if statuses[item.entry_id] is CleanupObjectStatus.AMBIGUOUS:
                 first_failure = first_failure or "cleanup_removal_ambiguous"
                 continue
             for subject in item.subjects:
@@ -1096,22 +1200,6 @@ class RetentionService:
                 except EvidenceError as exc:
                     first_failure = first_failure or exc.code
         return tuple(availability_updates), first_failure
-
-    def _deletion_intent_ids(self, intent: _CleanupIntent) -> frozenset[str]:
-        events = next(
-            (
-                snapshot.events
-                for snapshot in self.store.iter_streams()
-                if snapshot.stream_id == intent.stream_id
-            ),
-            (),
-        )
-        return frozenset(
-            entry_id
-            for event in events
-            if event.event_type == "cleanup_object_deletion_intent"
-            and isinstance((entry_id := event.payload.get("entry_id")), str)
-        )
 
     def _build_receipt(
         self,
@@ -1375,8 +1463,19 @@ class RetentionService:
             if event.event_type == "cleanup_object_removed"
             and isinstance((entry_id := event.payload.get("entry_id")), str)
         }
+        definitely_retained = {
+            entry_id
+            for event in events
+            if event.event_type == "cleanup_failure_observed"
+            and event.payload.get("failure_code") == "cleanup_object_remove_failed"
+            and isinstance((entry_id := event.payload.get("entry_id")), str)
+        }
         known_ids = set(intent.selected_entry_ids)
-        if not deletion_intents <= known_ids or not recorded_removed <= known_ids:
+        if (
+            not deletion_intents <= known_ids
+            or not recorded_removed <= known_ids
+            or not definitely_retained <= known_ids
+        ):
             raise ApplicationServiceError("cleanup_intent_invalid")
         statuses: dict[str, CleanupObjectStatus] = {}
         for item in intent.objects:
@@ -1392,9 +1491,17 @@ class RetentionService:
                 if info is None:
                     statuses[item.entry_id] = CleanupObjectStatus.REMOVED
                 else:
-                    require_safe_regular_file(path)
-                    statuses[item.entry_id] = CleanupObjectStatus.FAILED
-            except (OSError, UnsafeFilesystemPath):
+                    snapshot = _stream_file_snapshot(
+                        path, chunk_size=self._hash_chunk_size
+                    )
+                    statuses[item.entry_id] = (
+                        CleanupObjectStatus.RETAINED
+                        if item.entry_id in definitely_retained
+                        and snapshot.byte_count == item.byte_count
+                        and snapshot.content_identity == item.content_identity
+                        else CleanupObjectStatus.AMBIGUOUS
+                    )
+            except (OSError, SafeIoError, UnsafeFilesystemPath):
                 raise ApplicationServiceError("cleanup_reconciliation_unsafe") from None
         return statuses
 
@@ -1706,14 +1813,13 @@ def _classify(
     records: tuple[TypedRecord, ...],
     streams: tuple[Any, ...],
     manifests: tuple[BundleManifest, ...],
-    payload: bytes,
+    observed_identity: ContentIdentity,
 ) -> tuple[
     ByteClass,
     tuple[RecordReference, ...],
     tuple[CleanupImpact, ...],
     bool,
 ]:
-    del payload
     parts = PurePosixPath(logical_key).parts
     if len(parts) >= 3 and parts[0] == "artifacts":
         subjects = _records_by_id(records, Artifact, parts[1])
@@ -1742,7 +1848,12 @@ def _classify(
         )
     if len(parts) >= 3 and parts[0] == "checkpoints":
         subjects = _records_by_id(records, Run, parts[1])
-        if not subjects or not _checkpoint_known(parts[1], logical_key, streams):
+        checkpoint_identity = _checkpoint_identity(parts[1], logical_key, streams)
+        if (
+            not subjects
+            or checkpoint_identity is None
+            or checkpoint_identity != observed_identity
+        ):
             return _protected_unknown(subjects)
         impacts = {CleanupImpact.INSPECTABILITY, CleanupImpact.DEBUGGING_EVIDENCE}
         if _checkpoint_resumable(parts[1], logical_key, streams):
@@ -1828,11 +1939,11 @@ def _logical_id_field(record: TypedRecord) -> str:
     }.get(record.RECORD_TYPE, "")
 
 
-def _checkpoint_known(
+def _checkpoint_identity(
     run_id: str,
     logical_key: str,
     streams: tuple[Any, ...],
-) -> bool:
+) -> ContentIdentity | None:
     name = PurePosixPath(logical_key).name
     for snapshot in streams:
         if getattr(snapshot, "stream_id", None) != f"run-{run_id}":
@@ -1850,9 +1961,12 @@ def _checkpoint_known(
                 and isinstance(identity.get("value"), str)
                 and name == f"{step:08d}-{identity['value']}.json"
             ):
-                return True
-        return False
-    return False
+                try:
+                    return parse_identity(identity, field="checkpoint identity")
+                except RecordValidationError:
+                    return None
+        return None
+    return None
 
 
 def _checkpoint_resumable(
@@ -1918,6 +2032,54 @@ def _sorted_references(
             set(values),
             key=lambda item: (item.record_type, item.logical_id, item.identity.value),
         )
+    )
+
+
+def _stream_file_snapshot(
+    path: Path,
+    *,
+    chunk_size: int = _HASH_CHUNK_BYTES,
+) -> _StableFileSnapshot:
+    """Hash one stable regular-file snapshot without loading heavy bytes at once."""
+
+    if chunk_size <= 0:
+        raise SafeIoError("storage snapshot chunk size is invalid")
+    try:
+        before = require_safe_regular_file(path)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        digest = hashlib.sha256()
+        bytes_read = 0
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (
+                is_link_or_reparse(opened)
+                or not stat.S_ISREG(opened.st_mode)
+                or not same_file_object(before, opened)
+            ):
+                raise SafeIoError("storage file changed while opening")
+            while chunk := handle.read(chunk_size):
+                bytes_read += len(chunk)
+                digest.update(chunk)
+            after = os.fstat(handle.fileno())
+        current = require_safe_regular_file(path)
+    except FileNotFoundError:
+        raise
+    except SafeIoError:
+        raise
+    except (OSError, UnsafeFilesystemPath) as exc:
+        raise SafeIoError("unable to hash a stable storage file") from exc
+    if (
+        _signature(opened) != _signature(after)
+        or _signature(after) != _signature(current)
+        or not same_file_object(after, current)
+        or bytes_read != after.st_size
+    ):
+        raise SafeIoError("storage file changed while hashing")
+    return _StableFileSnapshot(
+        ContentIdentity("sha256", digest.hexdigest()),
+        bytes_read,
+        _signature(after),
     )
 
 

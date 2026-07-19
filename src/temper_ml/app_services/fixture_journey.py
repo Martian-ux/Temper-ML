@@ -202,6 +202,10 @@ class _JourneyState:
 class _FixtureReplayDraft:
     plan: ReplayPlan
     launch: RunLaunchRequest
+    candidate_key: str
+
+    def to_view(self) -> dict[str, object]:
+        return {**self.plan.to_view(), "candidate_key": self.candidate_key}
 
 
 class FixtureJourneyService:
@@ -934,9 +938,7 @@ class FixtureJourneyService:
                 self._cleanup_plan.to_view() if self._cleanup_plan is not None else None
             ),
             active_replay_plan=(
-                self._replay_draft.plan.to_view()
-                if self._replay_draft is not None
-                else None
+                self._replay_draft.to_view() if self._replay_draft is not None else None
             ),
         )
 
@@ -952,7 +954,13 @@ class FixtureJourneyService:
         self._cleanup_plan = plan
         return plan.to_view()
 
-    def execute_cleanup(self, plan_id: str, *, confirm: bool) -> dict[str, object]:
+    def execute_cleanup(
+        self,
+        plan_id: str,
+        *,
+        confirm: bool,
+        entry_ids: tuple[str, ...] | None = None,
+    ) -> dict[str, object]:
         """Execute only the currently displayed, exactly identified cleanup plan."""
 
         plan = self._cleanup_plan
@@ -960,6 +968,11 @@ class FixtureJourneyService:
             raise ApplicationServiceError("cleanup_plan_required")
         if not isinstance(plan_id, str) or plan_id != plan.plan_id:
             raise ApplicationServiceError("cleanup_plan_mismatch")
+        if entry_ids is not None and (
+            not isinstance(entry_ids, tuple)
+            or tuple(sorted(entry_ids)) != plan.selected_entry_ids
+        ):
+            raise ApplicationServiceError("cleanup_selection_plan_mismatch")
         receipt = RetentionService(self.project_root).execute(plan, confirm=confirm)
         self._cleanup_plan = None
         return _cleanup_receipt_view(receipt)
@@ -1090,10 +1103,16 @@ class FixtureJourneyService:
             )
         else:
             raise ApplicationServiceError("replay_mode_invalid")
-        self._replay_draft = _FixtureReplayDraft(plan, launch)
-        return plan.to_view()
+        self._replay_draft = _FixtureReplayDraft(plan, launch, candidate_key)
+        return self._replay_draft.to_view()
 
-    def execute_replay(self, plan_id: str) -> dict[str, object]:
+    def execute_replay(
+        self,
+        plan_id: str,
+        *,
+        candidate_key: str | None = None,
+        mode: str | None = None,
+    ) -> dict[str, object]:
         """Execute only the currently displayed ready replay plan as a new run."""
 
         draft = self._replay_draft
@@ -1101,6 +1120,10 @@ class FixtureJourneyService:
             raise ApplicationServiceError("replay_plan_required")
         if not isinstance(plan_id, str) or plan_id != draft.plan.plan_id:
             raise ApplicationServiceError("replay_plan_mismatch")
+        if candidate_key is not None and candidate_key != draft.candidate_key:
+            raise ApplicationServiceError("replay_candidate_plan_mismatch")
+        if mode is not None and mode != draft.plan.mode.value:
+            raise ApplicationServiceError("replay_mode_plan_mismatch")
         result = ReproductionService(self.project_root).execute(
             ReplayExecutionRequest(draft.plan, draft.launch)
         )
@@ -1298,6 +1321,7 @@ class WorkspaceQueryService:
         try:
             store.verify()
             inventory = RetentionService(self.project_root).inventory().to_view()
+            checkpoint_identities = _verified_checkpoint_identities(inventory)
             verification = store.verify()
             stored = store.iter_records()
             streams = store.iter_streams()
@@ -1383,7 +1407,12 @@ class WorkspaceQueryService:
                 for resolution in resolutions
             ],
             "runs": [
-                _run_view(run, run_streams.get(f"run-{run.run_id}", ())) for run in runs
+                _run_view(
+                    run,
+                    run_streams.get(f"run-{run.run_id}", ()),
+                    checkpoint_identities.get(run.run_id, frozenset()),
+                )
+                for run in runs
             ],
             "artifacts": [
                 self._artifact_view(
@@ -1792,7 +1821,41 @@ def _current_reviews(reviews: tuple[Review, ...]) -> tuple[Review, ...]:
     return tuple(review for review in reviews if review.identity not in superseded)
 
 
-def _run_view(run: Run, events: tuple[Any, ...]) -> dict[str, object]:
+def _verified_checkpoint_identities(
+    inventory: Mapping[str, object],
+) -> dict[str, frozenset[str]]:
+    """Index only checkpoint bytes whose observed identity matches run evidence."""
+
+    values: dict[str, set[str]] = {}
+    entries = inventory.get("entries")
+    if not isinstance(entries, list):
+        return {}
+    for entry in entries:
+        if not isinstance(entry, Mapping) or entry.get("byte_class") != "checkpoint":
+            continue
+        identity = entry.get("content_identity")
+        subjects = entry.get("subjects")
+        if (
+            not isinstance(identity, Mapping)
+            or not isinstance((identity_value := identity.get("value")), str)
+            or not isinstance(subjects, list)
+        ):
+            continue
+        for subject in subjects:
+            if (
+                isinstance(subject, Mapping)
+                and subject.get("record_type") == "run"
+                and isinstance((run_id := subject.get("logical_id")), str)
+            ):
+                values.setdefault(run_id, set()).add(identity_value)
+    return {run_id: frozenset(items) for run_id, items in values.items()}
+
+
+def _run_view(
+    run: Run,
+    events: tuple[Any, ...],
+    verified_checkpoint_identities: frozenset[str],
+) -> dict[str, object]:
     checkpoint_availability: dict[str, bool] = {}
     for event in events:
         if event.event_type == "run_checkpoint":
@@ -1800,6 +1863,7 @@ def _run_view(run: Run, events: tuple[Any, ...]) -> dict[str, object]:
             if isinstance(identity, Mapping) and isinstance(identity.get("value"), str):
                 checkpoint_availability[identity["value"]] = (
                     event.payload.get("resume_compatible") is True
+                    and identity["value"] in verified_checkpoint_identities
                 )
         elif event.event_type in {
             "run_checkpoint_cleanup_pending",
@@ -1811,6 +1875,7 @@ def _run_view(run: Run, events: tuple[Any, ...]) -> dict[str, object]:
                 checkpoint_availability[identity["value"]] = (
                     event.event_type == "run_checkpoint_cleanup_cancelled"
                     and event.payload.get("resume_available") is True
+                    and identity["value"] in verified_checkpoint_identities
                 )
     terminal = next(
         (

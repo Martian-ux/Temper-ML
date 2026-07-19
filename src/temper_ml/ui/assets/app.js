@@ -8,6 +8,7 @@ let activeStage = "setup";
 let latestComparison = null;
 let blindAliases = [];
 let preferredReviewIdentity = null;
+let renderedCleanupPlanKey = null;
 
 const viewMeta = {
   setup: ["Workspace / 01", "Overview", "Project state, evidence, and the next bounded action."],
@@ -76,26 +77,48 @@ const actions = {
     candidate_key: value("candidate-selection"),
   }),
   "cleanup-preview": () => {
+    if (workspace?.retention?.active_plan) throw new Error("cleanup_plan_active");
     const entryIds = selectedStorageEntryIds();
     if (!entryIds.length) throw new Error("cleanup_selection_required");
     return post("/api/v1/storage/cleanup/preview", { entry_ids: entryIds });
   },
   "cleanup-execute": () => {
-    const planId = workspace?.retention?.active_plan?.plan_id;
-    if (!planId) throw new Error("cleanup_plan_required");
+    const plan = workspace?.retention?.active_plan;
+    if (!plan?.plan_id) throw new Error("cleanup_plan_required");
+    const entryIds = selectedStorageEntryIds().sort();
+    const plannedEntryIds = [...(plan.selected_entry_ids || [])].sort();
+    if (!sameStrings(entryIds, plannedEntryIds)) {
+      throw new Error("cleanup_selection_plan_mismatch");
+    }
     if (!document.querySelector("#cleanup-confirmation").checked) {
       throw new Error("cleanup_confirmation_required");
     }
-    return post("/api/v1/storage/cleanup/execute", { plan_id: planId, confirm: true });
+    return post("/api/v1/storage/cleanup/execute", {
+      plan_id: plan.plan_id,
+      entry_ids: entryIds,
+      confirm: true,
+    });
   },
-  "replay-plan": () => post("/api/v1/replays/plan", {
-    candidate_key: value("replay-candidate"),
-    mode: value("replay-mode"),
-  }),
+  "replay-plan": () => {
+    if (workspace?.reproduction?.active_plan) throw new Error("replay_plan_active");
+    return post("/api/v1/replays/plan", {
+      candidate_key: value("replay-candidate"),
+      mode: value("replay-mode"),
+    });
+  },
   "replay-execute": () => {
-    const planId = workspace?.reproduction?.active_plan?.plan_id;
-    if (!planId) throw new Error("replay_plan_required");
-    return post("/api/v1/replays/execute", { plan_id: planId });
+    const plan = workspace?.reproduction?.active_plan;
+    if (!plan?.plan_id) throw new Error("replay_plan_required");
+    const candidateKey = value("replay-candidate");
+    const mode = value("replay-mode");
+    if (candidateKey !== plan.candidate_key || mode !== plan.mode) {
+      throw new Error("replay_controls_plan_mismatch");
+    }
+    return post("/api/v1/replays/execute", {
+      plan_id: plan.plan_id,
+      candidate_key: candidateKey,
+      mode,
+    });
   },
 };
 
@@ -517,10 +540,11 @@ function renderStorage() {
           value: entry.entry_id,
           "aria-label": `Select ${entry.logical_key}`,
         };
-        if (!entry.deletable) attributes.disabled = "";
+        attributes["data-deletable"] = String(entry.deletable);
+        if (!entry.deletable || retention.active_plan) attributes.disabled = "";
         if (selected.has(entry.entry_id)) attributes.checked = "";
         const checkbox = element("input", "storage-entry-select", [], attributes);
-        checkbox.addEventListener("change", updateStorageSelectionSummary);
+        checkbox.addEventListener("change", handleStorageSelectionChange);
         return element("tr", entry.deletable ? "" : "is-protected", [
           element("td", "storage-select", checkbox),
           element("td", "storage-object", [
@@ -537,6 +561,16 @@ function renderStorage() {
   updateStorageSelectionSummary();
   renderCleanupPlan(retention.active_plan, retention.receipts || []);
   renderReplayPlan(workspace.reproduction || {});
+  syncStorageControlState();
+}
+
+function handleStorageSelectionChange() {
+  if (workspace?.retention?.active_plan) {
+    workspace.retention.active_plan = null;
+    renderCleanupPlan(null, workspace.retention.receipts || []);
+  }
+  updateStorageSelectionSummary();
+  syncStorageControlState();
 }
 
 function updateStorageSelectionSummary() {
@@ -560,6 +594,9 @@ function renderCleanupPlan(plan, receipts) {
   const title = document.querySelector("#cleanup-plan-title");
   const target = document.querySelector("#cleanup-plan-view");
   const confirmation = document.querySelector("#cleanup-confirmation");
+  const planKey = plan ? `${plan.plan_id}:${plan.execution_id || ""}` : null;
+  if (planKey !== renderedCleanupPlanKey) confirmation.checked = false;
+  renderedCleanupPlanKey = planKey;
   if (plan) {
     title.textContent = `${formatBytes(plan.physical_bytes_freed)} physically reclaimable`;
     const warnings = plan.warnings || [];
@@ -579,7 +616,6 @@ function renderCleanupPlan(plan, receipts) {
     );
     return;
   }
-  confirmation.checked = false;
   const latest = receipts.at(-1);
   if (latest) {
     title.textContent = `Recorded cleanup ${latest.outcome}`;
@@ -694,10 +730,46 @@ function showNotice(message, isError) {
 }
 
 function setBusy(busy) {
-  document.querySelectorAll("button").forEach((button) => {
-    button.disabled = busy;
+  document.querySelectorAll("button, input, select, textarea").forEach((control) => {
+    if (busy) {
+      if (control.dataset.disabledBeforeBusy === undefined) {
+        control.dataset.disabledBeforeBusy = String(control.disabled);
+      }
+      control.disabled = true;
+    } else if (control.dataset.disabledBeforeBusy !== undefined) {
+      control.disabled = control.dataset.disabledBeforeBusy === "true";
+      delete control.dataset.disabledBeforeBusy;
+    }
   });
   document.body.setAttribute("aria-busy", String(busy));
+  if (!busy) syncStorageControlState();
+}
+
+function syncStorageControlState() {
+  const cleanupPlan = workspace?.retention?.active_plan;
+  document.querySelectorAll(".storage-entry-select").forEach((checkbox) => {
+    checkbox.disabled = Boolean(cleanupPlan) || checkbox.dataset.deletable !== "true";
+  });
+  const preview = document.querySelector('[data-action="cleanup-preview"]');
+  const execute = document.querySelector('[data-action="cleanup-execute"]');
+  const confirmation = document.querySelector("#cleanup-confirmation");
+  if (preview) preview.disabled = Boolean(cleanupPlan) || !selectedStorageEntryIds().length;
+  if (execute) execute.disabled = !cleanupPlan;
+  if (confirmation) confirmation.disabled = !cleanupPlan;
+
+  const replayPlan = workspace?.reproduction?.active_plan;
+  const replayCandidate = document.querySelector("#replay-candidate");
+  const replayMode = document.querySelector("#replay-mode");
+  const replayPreview = document.querySelector('[data-action="replay-plan"]');
+  const replayExecute = document.querySelector('[data-action="replay-execute"]');
+  if (replayCandidate) replayCandidate.disabled = Boolean(replayPlan);
+  if (replayMode) replayMode.disabled = Boolean(replayPlan);
+  if (replayPreview) replayPreview.disabled = Boolean(replayPlan);
+  if (replayExecute) replayExecute.disabled = !replayPlan || replayPlan.status !== "ready";
+}
+
+function sameStrings(left, right) {
+  return left.length === right.length && left.every((item, index) => item === right[index]);
 }
 
 function reviewBody() {

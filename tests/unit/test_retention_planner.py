@@ -100,6 +100,31 @@ def test_shared_reference_accounting_counts_only_bytes_that_can_be_freed(
     assert CleanupImpact.SHARED_REFERENCE in both.impact_categories
 
 
+def test_complete_internal_hardlink_group_is_removed_as_one_physical_object(
+    tmp_path: Path,
+) -> None:
+    _project(tmp_path)
+    first = _write_debug_file(tmp_path, "linked-a.bin", b"one physical object")
+    second = first.with_name("linked-b.bin")
+    os.link(first, second)
+    service = RetentionService(tmp_path)
+    entries = tuple(
+        entry
+        for entry in service.inventory().entries
+        if entry.byte_class is ByteClass.DEBUG_EVIDENCE
+    )
+    plan = service.plan(tuple(entry.entry_id for entry in entries))
+
+    receipt = service.execute(plan, confirm=True)
+
+    assert receipt.outcome is CleanupOutcome.COMPLETED
+    assert not first.exists()
+    assert not second.exists()
+    assert receipt.logical_bytes_removed == 2 * len(b"one physical object")
+    assert receipt.physical_bytes_freed == len(b"one physical object")
+    assert all(item.status is CleanupObjectStatus.REMOVED for item in receipt.objects)
+
+
 def test_only_terminal_run_staging_is_cleanup_eligible_and_warns_about_cache_loss(
     tmp_path: Path,
 ) -> None:
@@ -252,13 +277,167 @@ def test_partial_cleanup_records_removed_failed_and_unattempted_objects(
     assert receipt.failure_code == "cleanup_object_remove_failed"
     assert [item.status for item in receipt.objects] == [
         CleanupObjectStatus.REMOVED,
-        CleanupObjectStatus.FAILED,
+        CleanupObjectStatus.RETAINED,
         CleanupObjectStatus.NOT_ATTEMPTED,
     ]
     assert isinstance(
         TypedEvidenceStore(tmp_path).read_record(record_reference(receipt)).record,
         CleanupReceipt,
     )
+
+
+def test_failed_artifact_unlink_restores_verified_availability(
+    tmp_path: Path,
+) -> None:
+    _project(tmp_path, launch=True)
+
+    def retain_file(path: Path) -> None:
+        raise PermissionError(path.name)
+
+    service = RetentionService(tmp_path, _remove_file=retain_file)
+    artifact = next(
+        stored.record
+        for stored in service.store.iter_records()
+        if isinstance(stored.record, Artifact)
+        and stored.record.artifact_id == "artifact-fixture-runtime"
+    )
+    before = _current_artifact_availability(service.store, artifact)
+    selected = tuple(
+        entry.entry_id
+        for entry in service.inventory().entries
+        if entry.byte_class is ByteClass.FINAL_ADAPTER
+        and record_reference(artifact) in entry.subjects
+    )
+    plan = service.plan(selected)
+
+    receipt = service.execute(plan, confirm=True)
+
+    assert receipt.outcome is CleanupOutcome.FAILED
+    assert receipt.failure_code == "cleanup_object_remove_failed"
+    assert receipt.objects[0].status is CleanupObjectStatus.RETAINED
+    assert all(entry._path.exists() for entry in plan.selected_entries)
+    current = _current_artifact_availability(service.store, artifact)
+    assert current.state is before.state
+    assert current.available_byte_classes == before.available_byte_classes
+    assert current.storage_references == before.storage_references
+    assert current.checkpoint_resumable == before.checkpoint_resumable
+
+
+def test_failed_checkpoint_unlink_restores_resume_availability(
+    tmp_path: Path,
+) -> None:
+    journey = _project(tmp_path, launch=True)
+
+    def retain_file(path: Path) -> None:
+        raise PermissionError(path.name)
+
+    service = RetentionService(tmp_path, _remove_file=retain_file)
+    entry = next(
+        item
+        for item in service.inventory().entries
+        if item.byte_class is ByteClass.CHECKPOINT
+        and CleanupImpact.RESUMABILITY in item.impacts
+    )
+    run_id = next(
+        subject.logical_id for subject in entry.subjects if subject.record_type == "run"
+    )
+    before = next(
+        item for item in journey.workspace()["runs"] if item["run_id"] == run_id
+    )
+    plan = service.plan((entry.entry_id,))
+
+    receipt = service.execute(plan, confirm=True)
+
+    assert receipt.outcome is CleanupOutcome.FAILED
+    assert receipt.objects[0].status is CleanupObjectStatus.RETAINED
+    assert entry._path.exists()
+    after = next(
+        item
+        for item in FixtureJourneyService(tmp_path).workspace()["runs"]
+        if item["run_id"] == run_id
+    )
+    assert (
+        after["resume_available_checkpoint_count"]
+        == before["resume_available_checkpoint_count"]
+    )
+    assert any(
+        event["type"] == "run_checkpoint_cleanup_cancelled"
+        and event["resume_available"] is True
+        for event in after["events"]
+    )
+
+
+def test_corrupted_checkpoint_is_protected_and_not_advertised_as_resumable(
+    tmp_path: Path,
+) -> None:
+    journey = _project(tmp_path, launch=True)
+    service = RetentionService(tmp_path)
+    checkpoint = next(
+        item
+        for item in service.inventory().entries
+        if item.byte_class is ByteClass.CHECKPOINT
+        and CleanupImpact.RESUMABILITY in item.impacts
+    )
+    run_id = next(
+        subject.logical_id
+        for subject in checkpoint.subjects
+        if subject.record_type == "run"
+    )
+    before = next(
+        item for item in journey.workspace()["runs"] if item["run_id"] == run_id
+    )
+    checkpoint._path.write_bytes(b"corrupted synthetic checkpoint")
+
+    corrupted = next(
+        item
+        for item in service.inventory().entries
+        if item.logical_key == checkpoint.logical_key
+    )
+
+    assert corrupted.byte_class is ByteClass.UNKNOWN
+    assert corrupted.deletable is False
+    with pytest.raises(ApplicationServiceError, match="^cleanup_selection_protected$"):
+        service.plan((corrupted.entry_id,))
+    after = next(
+        item
+        for item in FixtureJourneyService(tmp_path).workspace()["runs"]
+        if item["run_id"] == run_id
+    )
+    assert (
+        after["resume_available_checkpoint_count"]
+        == before["resume_available_checkpoint_count"] - 1
+    )
+    assert checkpoint._path.exists()
+
+
+def test_inventory_and_removal_use_bounded_streaming_hashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project(tmp_path)
+    path = _write_debug_file(tmp_path, "streamed.log", b"streamed-heavy-bytes")
+    observed_chunks: list[int] = []
+    original_snapshot = retention_module._stream_file_snapshot
+
+    def observe_snapshot(path: Path, *, chunk_size: int):
+        observed_chunks.append(chunk_size)
+        return original_snapshot(path, chunk_size=chunk_size)
+
+    monkeypatch.setattr(retention_module, "_stream_file_snapshot", observe_snapshot)
+    service = RetentionService(tmp_path, _hash_chunk_size=3)
+    entry = next(
+        item
+        for item in service.inventory().entries
+        if item.logical_key == "logs/streamed.log"
+    )
+    plan = service.plan((entry.entry_id,))
+
+    receipt = service.execute(plan, confirm=True)
+
+    assert receipt.outcome is CleanupOutcome.COMPLETED
+    assert not path.exists()
+    assert len(observed_chunks) >= 4
+    assert set(observed_chunks) == {3}
 
 
 def test_checkpoint_event_failure_stays_fenced_and_reconciles_after_restart(

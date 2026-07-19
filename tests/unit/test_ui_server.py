@@ -158,8 +158,9 @@ def test_retention_and_replay_routes_validate_and_delegate(
     monkeypatch.setattr(
         ui_server.journey,
         "execute_cleanup",
-        lambda plan_id, *, confirm: (
-            observed.append(("cleanup", (plan_id, confirm))) or {"outcome": "completed"}
+        lambda plan_id, *, confirm, entry_ids: (
+            observed.append(("cleanup", (plan_id, entry_ids, confirm)))
+            or {"outcome": "completed"}
         ),
     )
     monkeypatch.setattr(
@@ -173,8 +174,9 @@ def test_retention_and_replay_routes_validate_and_delegate(
     monkeypatch.setattr(
         ui_server.journey,
         "execute_replay",
-        lambda plan_id: (
-            observed.append(("execute_replay", plan_id)) or {"status": "completed"}
+        lambda plan_id, *, candidate_key, mode: (
+            observed.append(("execute_replay", (plan_id, candidate_key, mode)))
+            or {"status": "completed"}
         ),
     )
 
@@ -185,13 +187,24 @@ def test_retention_and_replay_routes_validate_and_delegate(
         ),
         (
             "/api/v1/storage/cleanup/execute",
-            {"plan_id": "cleanup-plan-one", "confirm": True},
+            {
+                "plan_id": "cleanup-plan-one",
+                "entry_ids": ["entry-one", "entry-two"],
+                "confirm": True,
+            },
         ),
         (
             "/api/v1/replays/plan",
             {"candidate_key": "ember", "mode": "strict_replay"},
         ),
-        ("/api/v1/replays/execute", {"plan_id": "replay-one"}),
+        (
+            "/api/v1/replays/execute",
+            {
+                "plan_id": "replay-one",
+                "candidate_key": "ember",
+                "mode": "strict_replay",
+            },
+        ),
     )
     for path, body in requests:
         status, _, payload = _request(ui_server, "POST", path, json.dumps(body))
@@ -200,10 +213,23 @@ def test_retention_and_replay_routes_validate_and_delegate(
 
     assert observed == [
         ("preview", ("entry-one", "entry-two")),
-        ("cleanup", ("cleanup-plan-one", True)),
+        ("cleanup", ("cleanup-plan-one", ("entry-one", "entry-two"), True)),
         ("plan_replay", ("ember", "strict_replay")),
-        ("execute_replay", "replay-one"),
+        ("execute_replay", ("replay-one", "ember", "strict_replay")),
     ]
+
+
+def test_storage_script_binds_controls_and_consent_to_exact_plans() -> None:
+    source = (
+        Path(__file__).parents[2] / "src" / "temper_ml" / "ui" / "assets" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "cleanup_selection_plan_mismatch" in source
+    assert "replay_controls_plan_mismatch" in source
+    assert "renderedCleanupPlanKey" in source
+    assert "button, input, select, textarea" in source
+    assert "checkbox.disabled = Boolean(cleanupPlan)" in source
+    assert "replayCandidate.disabled = Boolean(replayPlan)" in source
 
 
 @pytest.mark.parametrize(

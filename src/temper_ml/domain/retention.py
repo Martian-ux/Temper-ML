@@ -54,6 +54,8 @@ class CleanupObjectStatus(str, Enum):
     """Disposition of one selected logical storage entry."""
 
     REMOVED = "removed"
+    RETAINED = "retained"
+    AMBIGUOUS = "ambiguous"
     FAILED = "failed"
     NOT_ATTEMPTED = "not_attempted"
 
@@ -73,7 +75,7 @@ class CleanupObjectReceipt:
 
     def __post_init__(self) -> None:
         require_identifier("entry_id", self.entry_id)
-        _require_logical_key(self.logical_key)
+        require_cleanup_logical_key(self.logical_key)
         require_identifier("byte_class", self.byte_class)
         if self.byte_class not in _BYTE_CLASSES:
             raise RecordValidationError("cleanup object byte_class is unknown")
@@ -252,7 +254,9 @@ class CleanupReceipt(TypedRecord):
         }
 
 
-def _require_logical_key(value: str) -> str:
+def require_cleanup_logical_key(value: str) -> str:
+    """Require the portable relative key shared by cleanup intent and receipt."""
+
     if not isinstance(value, str) or not value or "\\" in value:
         raise RecordValidationError("logical_key must be a portable relative path")
     path = PurePosixPath(value)
