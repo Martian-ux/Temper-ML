@@ -77,6 +77,7 @@ class LocalUseRequest:
     settings: InferenceSettings
     inputs: tuple[Mapping[str, Any], ...]
     session_id: str | None = None
+    evaluation_captures: tuple[ContentIdentity, ...] = ()
 
     def __post_init__(self) -> None:
         expected = (
@@ -95,6 +96,13 @@ class LocalUseRequest:
                 require_identifier("session_id", self.session_id)
             except RecordValidationError:
                 raise ApplicationServiceError("local_use_request_invalid") from None
+        if not isinstance(self.evaluation_captures, tuple) or any(
+            not isinstance(capture, ContentIdentity)
+            for capture in self.evaluation_captures
+        ):
+            raise ApplicationServiceError("local_use_request_invalid")
+        if len(set(self.evaluation_captures)) != len(self.evaluation_captures):
+            raise ApplicationServiceError("local_use_request_invalid")
 
     @property
     def ephemeral(self) -> bool:
@@ -119,6 +127,20 @@ class LocalUseResult:
         if self.session is not None:
             value["session"] = record_reference(self.session).to_dict()
         return value
+
+
+@dataclass(frozen=True)
+class ArtifactInspection:
+    """Current, byte-verified availability for one recorded artifact."""
+
+    integrity: ArtifactIntegrityResult
+
+    def to_view(self) -> dict[str, object]:
+        return {
+            "integrity_status": "passed",
+            "available": True,
+            "integrity": self.integrity.to_receipt(),
+        }
 
 
 @dataclass(frozen=True)
@@ -202,6 +224,23 @@ class LocalUseService:
         self.runtime = runtime if runtime is not None else FixtureInferenceRuntime()
         if not isinstance(self.runtime, FixtureInferenceRuntime):
             raise ApplicationServiceError("fixture_inference_runtime_invalid")
+
+    def inspect_artifact(
+        self,
+        artifact: Artifact,
+        base_model_revision: BaseModelRevision,
+        compatibility_group: CompatibilityGroup,
+        execution_target: ExecutionTarget,
+    ) -> ArtifactInspection:
+        """Report availability only after the same checks required for local use."""
+
+        context = self._verified_artifact(
+            artifact,
+            base_model_revision,
+            compatibility_group,
+            execution_target,
+        )
+        return ArtifactInspection(context.integrity)
 
     def focused(self, request: LocalUseRequest) -> LocalUseResult:
         """Run one focused local-use input after full compatibility verification."""
@@ -406,6 +445,7 @@ class LocalUseService:
             outputs=tuple(thaw_json(value) for value in inference.outputs),
             runtime_evidence=inference.runtime_evidence,
             integrity_evidence=context.integrity.evidence_identity,
+            evaluation_captures=request.evaluation_captures,
         )
         try:
             require_no_conflicting_logical_revision(

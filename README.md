@@ -70,6 +70,27 @@ python scripts/temper-gate.py diff
 `python scripts/temper-gate.py fixture-help` describes the deterministic
 fixture walkthrough entry point.
 
+## Local evaluation lab
+
+Slice 7 adds a dependency-free loopback UI for the complete deterministic
+fixture journey:
+
+```powershell
+uv run temper ui .temper-fixture-output
+```
+
+Open the printed `127.0.0.1` URL, then move through project setup, dataset
+inspection, recipe resolution and preflight, two fixture runs, synchronized
+comparison and review, evidence-backed recommendation, explicit selection,
+focused or batch local use, case capture, and verified adapter export. The UI
+binds only to numeric loopback addresses and all canonical writes go through
+the existing application services. Project state remains inspectable with the
+CLI commands below.
+
+This lab is offline fixture behavior. It does not load a real model, create a
+deployment, provide chat memory, or require an external dashboard. Those
+boundaries are surfaced in the UI instead of being implied capabilities.
+
 ## Evidence inspection
 
 The committed minimal project exercises the canonical store without private
