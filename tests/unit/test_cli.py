@@ -284,3 +284,49 @@ def test_fixture_workflow_cli_fails_closed_on_unimplemented_quality_mode(
         "status": "error",
     }
     assert str(tmp_path) not in captured.err
+
+
+def test_cleanup_cli_previews_executes_and_inspects_an_exact_plan(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _fixture(tmp_path)
+    debug_root = tmp_path / ".temper-fixture-output" / "logs"
+    debug_root.mkdir(parents=True)
+    debug_file = debug_root / "synthetic-debug.log"
+    debug_file.write_bytes(b"synthetic debug evidence")
+
+    assert main(["inventory", str(tmp_path)]) == 0
+    inventory = _assert_canonical_stdout(capsys.readouterr().out)
+    assert inventory["retention_default"] == "full"
+    entry_id = inventory["entries"][0]["entry_id"]
+
+    assert main(["cleanup-plan", str(tmp_path), "--entry-id", entry_id]) == 0
+    plan = _assert_canonical_stdout(capsys.readouterr().out)
+    assert plan["requires_confirmation"] is True
+    assert plan["physical_bytes_freed"] == len(b"synthetic debug evidence")
+
+    assert (
+        main(
+            [
+                "cleanup-execute",
+                str(tmp_path),
+                "--entry-id",
+                entry_id,
+                "--plan-id",
+                plan["plan_id"],
+                "--execution-id",
+                plan["execution_id"],
+                "--confirm",
+            ]
+        )
+        == 0
+    )
+    executed = _assert_canonical_stdout(capsys.readouterr().out)
+    assert executed["status"] == "completed"
+    assert not debug_file.exists()
+    receipt_id = executed["receipt"]["receipt_id"]
+
+    assert main(["cleanup-receipt", str(tmp_path), "--id", receipt_id]) == 0
+    inspected = _assert_canonical_stdout(capsys.readouterr().out)
+    assert inspected["receipt"] == executed["receipt"]

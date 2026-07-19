@@ -47,6 +47,7 @@ _PUBLIC_RECORD_FIELDS: dict[str, frozenset[str]] = {
         "artifact_availability",
         "baseline_policy",
         "base_model_revision",
+        "cleanup_receipt",
         "compatibility_group",
         "dataset_version",
         "execution_target",

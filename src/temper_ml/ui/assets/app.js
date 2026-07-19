@@ -16,6 +16,7 @@ const viewMeta = {
   run: ["Workspace / 04", "Runs", "Follow runtime evidence from launch through artifact integrity."],
   evaluate: ["Workspace / 05", "Evaluate", "Compare synchronized outputs and record honest review evidence."],
   use: ["Workspace / 06", "Local use", "Select one verified adapter for focused local work and export."],
+  storage: ["Workspace / 07", "Storage & replay", "Inspect local bytes, preview cleanup consequences, and reproduce transparently."],
 };
 
 const stageLabels = {
@@ -25,6 +26,7 @@ const stageLabels = {
   run: "candidate runs",
   evaluate: "evaluation",
   use: "local use",
+  storage: "storage and replay",
 };
 
 const actions = {
@@ -73,6 +75,28 @@ const actions = {
   export: () => post("/api/v1/exports", {
     candidate_key: value("candidate-selection"),
   }),
+  "cleanup-preview": () => {
+    const entryIds = selectedStorageEntryIds();
+    if (!entryIds.length) throw new Error("cleanup_selection_required");
+    return post("/api/v1/storage/cleanup/preview", { entry_ids: entryIds });
+  },
+  "cleanup-execute": () => {
+    const planId = workspace?.retention?.active_plan?.plan_id;
+    if (!planId) throw new Error("cleanup_plan_required");
+    if (!document.querySelector("#cleanup-confirmation").checked) {
+      throw new Error("cleanup_confirmation_required");
+    }
+    return post("/api/v1/storage/cleanup/execute", { plan_id: planId, confirm: true });
+  },
+  "replay-plan": () => post("/api/v1/replays/plan", {
+    candidate_key: value("replay-candidate"),
+    mode: value("replay-mode"),
+  }),
+  "replay-execute": () => {
+    const planId = workspace?.reproduction?.active_plan?.plan_id;
+    if (!planId) throw new Error("replay_plan_required");
+    return post("/api/v1/replays/execute", { plan_id: planId });
+  },
 };
 
 document.querySelectorAll("[data-stage]").forEach((button) => {
@@ -155,6 +179,10 @@ function consumeAction(action, result) {
     revealIdentities(result.candidate_mappings);
   } else if (action === "focused" || action === "batch" || action === "export") {
     renderLocalResult(result);
+  } else if (action === "cleanup-preview" || action === "replay-plan") {
+    rawEvidence.textContent = JSON.stringify(result, null, 2);
+  } else if (action === "cleanup-execute" || action === "replay-execute") {
+    rawEvidence.textContent = JSON.stringify(result, null, 2);
   }
 }
 
@@ -191,6 +219,7 @@ function renderWorkspace() {
   renderRuns();
   renderRecommendation();
   renderReviewCapture();
+  renderStorage();
   renderInspector();
 }
 
@@ -469,6 +498,149 @@ function renderLocalResult(result) {
   );
 }
 
+function renderStorage() {
+  const retention = workspace.retention || {};
+  document.querySelector("#retention-default").textContent = capitalize(retention.retention_default || "full");
+  document.querySelector("#storage-logical-bytes").textContent = formatBytes(retention.logical_bytes);
+  document.querySelector("#storage-physical-bytes").textContent = formatBytes(retention.physical_bytes);
+  document.querySelector("#storage-reclaimable-bytes").textContent = formatBytes(retention.reclaimable_physical_bytes);
+  document.querySelector("#storage-entry-count").textContent = `${formatNumber(retention.entry_count)} objects`;
+
+  const selected = new Set(retention.active_plan?.selected_entry_ids || []);
+  const target = document.querySelector("#storage-entries");
+  const entries = retention.entries || [];
+  target.replaceChildren(...(
+    entries.length
+      ? entries.map((entry) => {
+        const attributes = {
+          type: "checkbox",
+          value: entry.entry_id,
+          "aria-label": `Select ${entry.logical_key}`,
+        };
+        if (!entry.deletable) attributes.disabled = "";
+        if (selected.has(entry.entry_id)) attributes.checked = "";
+        const checkbox = element("input", "storage-entry-select", [], attributes);
+        checkbox.addEventListener("change", updateStorageSelectionSummary);
+        return element("tr", entry.deletable ? "" : "is-protected", [
+          element("td", "storage-select", checkbox),
+          element("td", "storage-object", [
+            element("strong", "", entry.logical_key),
+            element("small", "", entry.deletable ? entry.entry_id : "Protected runtime evidence"),
+          ]),
+          element("td", "", entry.byte_class.replaceAll("_", " ")),
+          element("td", "storage-size", formatBytes(entry.byte_count)),
+          element("td", "", `${entry.local_reference_count} local / ${entry.external_reference_count} external`),
+        ]);
+      })
+      : [element("tr", "", element("td", "storage-empty", "No runtime bytes have been created yet.", { colspan: "5" }))]
+  ));
+  updateStorageSelectionSummary();
+  renderCleanupPlan(retention.active_plan, retention.receipts || []);
+  renderReplayPlan(workspace.reproduction || {});
+}
+
+function updateStorageSelectionSummary() {
+  const ids = new Set(selectedStorageEntryIds());
+  const entries = workspace?.retention?.entries || [];
+  const bytes = entries
+    .filter((entry) => ids.has(entry.entry_id))
+    .reduce((total, entry) => total + entry.byte_count, 0);
+  const target = document.querySelector("#cleanup-selection-summary");
+  if (!target) return;
+  target.textContent = ids.size
+    ? `${ids.size} explicit object${ids.size === 1 ? "" : "s"} / ${formatBytes(bytes)} logical bytes selected.`
+    : "Select explicit deletable objects to calculate consequences.";
+}
+
+function selectedStorageEntryIds() {
+  return [...document.querySelectorAll(".storage-entry-select:checked")].map((item) => item.value);
+}
+
+function renderCleanupPlan(plan, receipts) {
+  const title = document.querySelector("#cleanup-plan-title");
+  const target = document.querySelector("#cleanup-plan-view");
+  const confirmation = document.querySelector("#cleanup-confirmation");
+  if (plan) {
+    title.textContent = `${formatBytes(plan.physical_bytes_freed)} physically reclaimable`;
+    const warnings = plan.warnings || [];
+    target.replaceChildren(
+      element("div", "consequence-metrics", [
+        element("div", "", [element("span", "", "Logical removal"), element("strong", "", formatBytes(plan.logical_bytes_selected))]),
+        element("div", "", [element("span", "", "Physical freed"), element("strong", "", formatBytes(plan.physical_bytes_freed))]),
+      ]),
+      element("p", "consequence-label", "Impact warnings"),
+      ...(warnings.length
+        ? warnings.map((warning) => element("div", "impact-warning", [
+          element("strong", "", warning.category.replaceAll("_", " ")),
+          element("span", "", `${warning.entry_ids.length} affected object${warning.entry_ids.length === 1 ? "" : "s"}`),
+        ]))
+        : [element("p", "", "No capability loss was identified for this exact selection.")]),
+      element("p", "retained-classes", `Retained classes: ${(plan.retained_byte_classes || []).join(", ") || "none"}`),
+    );
+    return;
+  }
+  confirmation.checked = false;
+  const latest = receipts.at(-1);
+  if (latest) {
+    title.textContent = `Recorded cleanup ${latest.outcome}`;
+    target.replaceChildren(
+      element("div", `cleanup-result cleanup-${latest.outcome}`, [
+        element("strong", "", `${formatBytes(latest.physical_bytes_freed)} physically freed`),
+        element("span", "", `${formatBytes(latest.logical_bytes_removed)} logical bytes removed`),
+        element("small", "", latest.failure_code || "Immutable receipt recorded"),
+      ]),
+      element("p", "retained-classes", "Canonical manifests and lifecycle evidence remain in the project store."),
+    );
+    return;
+  }
+  title.textContent = "Nothing is selected.";
+  target.replaceChildren(element("p", "", "Temper will calculate physical bytes freed, retained classes, affected records, and every loss of capability before deletion."));
+}
+
+function renderReplayPlan(reproduction) {
+  const target = document.querySelector("#replay-plan-view");
+  const plan = reproduction.active_plan;
+  if (plan) {
+    const exact = plan.mode === "strict_replay";
+    target.replaceChildren(
+      element("p", "card-kicker", exact ? "Exact reproduction" : "Adapted reproduction"),
+      element("h3", "", exact ? "Manifest identity preserved" : "New derived experiment"),
+      element("div", "manifest-identity-pair", [
+        element("div", "", [element("span", "", "Source"), element("code", "", shortIdentity(plan.source_manifest_identity?.value))]),
+        element("span", "manifest-arrow", exact ? "=" : "→"),
+        element("div", "", [element("span", "", "Planned"), element("code", "", shortIdentity(plan.planned_manifest_identity?.value))]),
+      ]),
+      ...(plan.manifest_changes || []).map((change) => element("div", "manifest-change", [
+        element("code", "", change.path),
+        element("span", "", change.operation),
+        element("small", "", `${manifestValue(change.before)} → ${manifestValue(change.after)}`),
+      ])),
+      element("p", `replay-status replay-${plan.status}`, plan.status === "ready" ? "Ready to execute as a new run." : `Blocked: ${(plan.reasons || []).join(", ")}`),
+    );
+    return;
+  }
+  const latestExecution = (reproduction.executions || []).at(-1);
+  const latestDerivation = (reproduction.derivations || []).at(-1);
+  if (latestExecution || latestDerivation) {
+    target.replaceChildren(
+      element("p", "card-kicker", latestExecution?.adapted_reproduction ? "Adapted reproduction" : "Strict replay"),
+      element("h3", "", latestExecution ? `Replay ${latestExecution.status}` : "Derived experiment recorded"),
+      element("p", "", latestExecution?.run_id || latestDerivation?.reason || "Reproduction evidence is available."),
+      ...((latestDerivation?.manifest_changes || []).map((change) => element("div", "manifest-change", [
+        element("code", "", change.path),
+        element("span", "", change.operation),
+        element("small", "", `${manifestValue(change.before)} → ${manifestValue(change.after)}`),
+      ]))),
+    );
+    return;
+  }
+  target.replaceChildren(
+    element("p", "card-kicker", "Manifest comparison"),
+    element("h3", "", "No replay planned"),
+    element("p", "", "Choose a candidate and mode to compare the source and planned manifests before launch."),
+  );
+}
+
 function renderInspector() {
   const project = workspace.project;
   document.querySelector("#inspector-status").textContent = project
@@ -482,6 +654,9 @@ function renderInspector() {
     Decisions: workspace.registry?.length ?? 0,
     Sessions: workspace.local_use?.saved_session_count ?? 0,
     Exports: workspace.local_use?.export_count ?? 0,
+    "Physical bytes": formatBytes(workspace.retention?.physical_bytes),
+    "Cleanup receipts": workspace.retention?.receipts?.length ?? 0,
+    Replays: workspace.reproduction?.executions?.length ?? 0,
     Deployment: "none",
   };
   document.querySelector("#inspector-ledger").replaceChildren(...Object.entries(ledger).flatMap(([key, item]) => [
@@ -508,7 +683,8 @@ function showStage(stage) {
     document.querySelector("#view-title").textContent = meta[1];
     document.querySelector("#view-subtitle").textContent = meta[2];
   }
-  document.querySelector(`[data-panel="${activeStage}"] [data-panel-title]`)?.focus?.();
+  const panelTitle = document.querySelector(`[data-panel="${activeStage}"] [data-panel-title]`);
+  if (panelTitle instanceof HTMLElement) panelTitle.focus({ preventScroll: true });
 }
 
 function showNotice(message, isError) {
@@ -558,6 +734,10 @@ function successMessage(action) {
     focused: "Focused local-use session saved without chat memory.",
     batch: "Local batch completed with shared settings.",
     export: "Portable adapter export verified; no deployment was created.",
+    "cleanup-preview": "Exact cleanup consequences calculated; no bytes were removed.",
+    "cleanup-execute": "Cleanup finished and an immutable receipt was recorded.",
+    "replay-plan": "Replay plan calculated with exact manifest identities.",
+    "replay-execute": "Reproduction completed as a new immutable run.",
   }[action] || "Action completed.";
 }
 
@@ -575,6 +755,35 @@ function numberValue(id) {
 
 function formatNumber(item) {
   return Number(item || 0).toLocaleString("en-US");
+}
+
+function formatBytes(item) {
+  const bytes = Number(item || 0);
+  if (bytes < 1024) return `${formatNumber(bytes)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = "B";
+  for (const candidate of units) {
+    value /= 1024;
+    unit = candidate;
+    if (value < 1024) break;
+  }
+  return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`;
+}
+
+function capitalize(item) {
+  const text = String(item || "");
+  return text ? `${text[0].toUpperCase()}${text.slice(1)}` : "";
+}
+
+function shortIdentity(value) {
+  return typeof value === "string" ? `${value.slice(0, 12)}…` : "pending";
+}
+
+function manifestValue(value) {
+  if (value === undefined) return "∅";
+  const encoded = JSON.stringify(value);
+  return encoded.length > 52 ? `${encoded.slice(0, 49)}…` : encoded;
 }
 
 function definitionList(values, className) {

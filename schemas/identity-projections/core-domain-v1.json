@@ -6,6 +6,7 @@
     {"record_type":"artifact_availability","record_schema_version":"v1","projection_name":"record.artifact_availability","projection_version":"v1","record_schema":"schemas/records/artifact_availability.schema.json"},
     {"record_type":"base_model_revision","record_schema_version":"v1","projection_name":"record.base_model_revision","projection_version":"v1","record_schema":"schemas/records/base_model_revision.schema.json"},
     {"record_type":"baseline_policy","record_schema_version":"v1","projection_name":"record.baseline_policy","projection_version":"v1","record_schema":"schemas/records/baseline_policy.schema.json"},
+    {"record_type":"cleanup_receipt","record_schema_version":"v1","projection_name":"record.cleanup_receipt","projection_version":"v1","record_schema":"schemas/records/cleanup_receipt.schema.json"},
     {"record_type":"compatibility_group","record_schema_version":"v1","projection_name":"record.compatibility_group","projection_version":"v1","record_schema":"schemas/records/compatibility_group.schema.json"},
     {"record_type":"dataset_version","record_schema_version":"v1","projection_name":"record.dataset_version","projection_version":"v1","record_schema":"schemas/records/dataset_version.schema.json"},
     {"record_type":"evaluation_result","record_schema_version":"v1","projection_name":"record.evaluation_result","projection_version":"v1","record_schema":"schemas/records/evaluation_result.schema.json"},

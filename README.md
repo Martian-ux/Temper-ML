@@ -140,6 +140,39 @@ This lab is offline fixture behavior. It does not load a real model, create a
 deployment, provide chat memory, or require an external dashboard. Those
 boundaries are surfaced in the UI instead of being implied capabilities.
 
+## Retention, cleanup, and reproduction
+
+Slice 9 keeps every local runtime byte by default and adds a consequence-first
+storage workspace to the loopback UI. The inventory counts logical links and
+physical file objects separately, keeps shared references honest, and never
+places the canonical `.temper` store inside cleanup scope. Runtime-control,
+active staging, unknown, linked, and non-regular objects fail closed.
+
+Cleanup is always explicit: select exact inventory entry IDs, inspect the plan
+and its capability warnings, then confirm that same plan and unique execution
+identity. A durable pre-delete intent and unavailable safety fences make an
+interrupted attempt restart-reconcilable. Completed, partial, and failed work
+records immutable receipts and lifecycle events. A project-scoped cleanup lease
+serializes confirmed attempts and restart reconciliation. Removing an adapter member
+supersedes its availability record; removing or fencing a checkpoint prevents
+the workspace from advertising it as resume-available.
+
+The CLI exposes the same inventory and planning services as stable JSON:
+
+```powershell
+uv run temper inventory <project>
+uv run temper cleanup-plan <project> --entry-id <entry-id>
+uv run temper cleanup-execute <project> --entry-id <entry-id> --plan-id <plan-id> --execution-id <execution-id> --confirm
+uv run temper cleanup-receipt <project> --id <receipt-id>
+```
+
+Replay planning distinguishes an unchanged strict replay from an assisted
+adapted reproduction. A strict execution creates a new run for the original
+manifest. Adaptation creates and labels a derived experiment, persists its
+exact manifest diff, and never presents the result as exact. The UI demonstrates
+both flows; `temper replay-plan --help` lists the explicit experiment, profile,
+mode, derivation, and resource-estimate inputs for the equivalent CLI view.
+
 ## Evidence inspection
 
 The committed minimal project exercises the canonical store without private

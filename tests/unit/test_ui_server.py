@@ -86,6 +86,10 @@ def test_ui_shell_is_local_accessible_and_hardened(ui_server) -> None:
     assert b'id="workflow-steps"' in body
     assert b'id="review-capture-selection"' in body
     assert b"Convert selected review to case" in body
+    assert b"Inspect storage before cleanup" in body
+    assert b'id="storage-entries"' in body
+    assert b'id="cleanup-confirmation"' in body
+    assert b'id="replay-plan-view"' in body
     assert b"general chat" not in body.lower()
     assert b'aria-live="polite"' in body
 
@@ -139,6 +143,67 @@ def test_ui_routes_call_services_and_get_remains_read_only(ui_server) -> None:
     status, _, after = _request(ui_server, "GET", "/api/v1/workspace", origin=False)
     assert status == 200
     assert after != before
+
+
+def test_retention_and_replay_routes_validate_and_delegate(
+    ui_server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        ui_server.journey,
+        "preview_cleanup",
+        lambda entry_ids: observed.append(("preview", entry_ids)) or {"planned": True},
+    )
+    monkeypatch.setattr(
+        ui_server.journey,
+        "execute_cleanup",
+        lambda plan_id, *, confirm: (
+            observed.append(("cleanup", (plan_id, confirm))) or {"outcome": "completed"}
+        ),
+    )
+    monkeypatch.setattr(
+        ui_server.journey,
+        "prepare_replay",
+        lambda candidate_key, mode: (
+            observed.append(("plan_replay", (candidate_key, mode)))
+            or {"status": "ready"}
+        ),
+    )
+    monkeypatch.setattr(
+        ui_server.journey,
+        "execute_replay",
+        lambda plan_id: (
+            observed.append(("execute_replay", plan_id)) or {"status": "completed"}
+        ),
+    )
+
+    requests = (
+        (
+            "/api/v1/storage/cleanup/preview",
+            {"entry_ids": ["entry-one", "entry-two"]},
+        ),
+        (
+            "/api/v1/storage/cleanup/execute",
+            {"plan_id": "cleanup-plan-one", "confirm": True},
+        ),
+        (
+            "/api/v1/replays/plan",
+            {"candidate_key": "ember", "mode": "strict_replay"},
+        ),
+        ("/api/v1/replays/execute", {"plan_id": "replay-one"}),
+    )
+    for path, body in requests:
+        status, _, payload = _request(ui_server, "POST", path, json.dumps(body))
+        assert status == 200
+        assert json.loads(payload)["ok"] is True
+
+    assert observed == [
+        ("preview", ("entry-one", "entry-two")),
+        ("cleanup", ("cleanup-plan-one", True)),
+        ("plan_replay", ("ember", "strict_replay")),
+        ("execute_replay", "replay-one"),
+    ]
 
 
 @pytest.mark.parametrize(

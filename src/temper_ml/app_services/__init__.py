@@ -65,6 +65,20 @@ from temper_ml.app_services.runs import (
     RunRecoveryRequest,
     RunService,
 )
+from temper_ml.app_services.retention import (
+    ByteClass,
+    CleanupImpact,
+    CleanupPlan,
+    InventoryEntry,
+    RetentionDefault,
+    RetentionService,
+    StorageInventory,
+)
+from temper_ml.app_services.reproduction import (
+    ReplayExecutionRequest,
+    ReplayExecutionResult,
+    ReproductionService,
+)
 
 __all__ = [
     "ApplicationServiceError",
@@ -77,6 +91,9 @@ __all__ = [
     "BlindReviewPacket",
     "CorrectionReport",
     "CandidateSpec",
+    "ByteClass",
+    "CleanupImpact",
+    "CleanupPlan",
     "CsvDatasetAdapter",
     "DatasetAdapterError",
     "DatasetImportRequest",
@@ -91,6 +108,7 @@ __all__ = [
     "FixtureTokenizer",
     "HuggingFaceRowsDatasetAdapter",
     "ImportedSource",
+    "InventoryEntry",
     "JsonDatasetAdapter",
     "JsonlDatasetAdapter",
     "LocalDatasetAdapter",
@@ -102,12 +120,18 @@ __all__ = [
     "ProjectService",
     "PreparedDataset",
     "ReplayMode",
+    "ReplayExecutionRequest",
+    "ReplayExecutionResult",
     "ReplayPlan",
     "ReplayStatus",
+    "RetentionDefault",
+    "RetentionService",
+    "ReproductionService",
     "ReimportComparison",
     "ReimportValueDelta",
     "SharedTokenCountDelta",
     "SplitChange",
+    "StorageInventory",
     "RunExecutionResult",
     "RunLaunchRequest",
     "RunLifecycleStatus",

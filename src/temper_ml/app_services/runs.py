@@ -288,6 +288,8 @@ class RunService:
         event = self._checkpoint_event(prior.run_id, request.checkpoint_identity)
         if event.payload.get("resume_compatible") is not True:
             raise ApplicationServiceError("run_recovery_checkpoint_incompatible")
+        if not self._checkpoint_resume_available(prior.run_id, event):
+            raise ApplicationServiceError("run_recovery_checkpoint_unavailable")
         step = _event_positive_int(event, "step")
         state_identity = _event_identity(event, "training_state_identity")
         provisional = FixtureCheckpoint(
@@ -1560,15 +1562,38 @@ class RunService:
         return matches[0]
 
     def _checkpoint_event(self, run_id: str, identity: ContentIdentity) -> StoredEvent:
+        events = self._events(run_id)
         matches = [
             event
-            for event in self._events(run_id)
+            for event in events
             if event.event_type == "run_checkpoint"
             and _event_identity(event, "checkpoint_identity") == identity
         ]
         if len(matches) != 1:
             raise ApplicationServiceError("run_recovery_checkpoint_not_found")
         return matches[0]
+
+    def _checkpoint_resume_available(
+        self,
+        run_id: str,
+        checkpoint: StoredEvent,
+    ) -> bool:
+        identity = _event_identity(checkpoint, "checkpoint_identity")
+        resume_available = checkpoint.payload.get("resume_compatible") is True
+        for event in self._events(run_id):
+            if event.event_type not in {
+                "run_checkpoint_cleanup_pending",
+                "run_checkpoint_cleanup_cancelled",
+                "run_checkpoint_removed",
+            }:
+                continue
+            if _event_identity(event, "content_identity") != identity:
+                continue
+            resume_available = (
+                event.event_type == "run_checkpoint_cleanup_cancelled"
+                and event.payload.get("resume_available") is True
+            )
+        return resume_available
 
     def _checkpoint_from_event(self, run: Run, event: StoredEvent) -> FixtureCheckpoint:
         if event.event_type != "run_checkpoint":
