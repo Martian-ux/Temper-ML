@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
+import pickle
 import shutil
 from threading import Event
 
@@ -1069,13 +1070,18 @@ def test_real_backend_rejects_decoded_terminal_checkpoint_step(
     tmp_path: Path,
 ) -> None:
     foundation, _, _, _ = _library_foundation(tmp_path)
+    rng_state = object()
     serialized_state = {
-        "schema_version": "v1",
+        "schema_version": "v2",
         "step": foundation.resolution.training_steps,
+        "batches_consumed": foundation.resolution.training_steps,
         "recipe_resolution": record_reference(foundation.resolution).to_dict(),
         "adapter_state": {},
         "optimizer_state": {},
         "scheduler_state": {},
+        "torch_rng_state": rng_state,
+        "cuda_rng_states": (),
+        "accelerator_scaler_state": None,
     }
 
     class FakeTorch:
@@ -1083,9 +1089,46 @@ def test_real_backend_rejects_decoded_terminal_checkpoint_step(
         def load(*args, **kwargs):
             return serialized_state
 
+        @staticmethod
+        def is_tensor(value):
+            return value is rng_state
+
     with pytest.raises(LibraryRuntimeError, match="library_checkpoint_restore_failed"):
         library_backend_module._checkpoint_state(
             FakeTorch(), b"synthetic-checkpoint", foundation.resolution
+        )
+
+
+@pytest.mark.parametrize("failure", [EOFError(), pickle.UnpicklingError("synthetic")])
+def test_real_backend_normalizes_checkpoint_deserialization_failures(
+    tmp_path: Path, failure: Exception
+) -> None:
+    foundation, _, _, _ = _library_foundation(tmp_path)
+
+    class FakeTorch:
+        @staticmethod
+        def load(*args, **kwargs):
+            raise failure
+
+    with pytest.raises(LibraryRuntimeError, match="library_checkpoint_restore_failed"):
+        library_backend_module._checkpoint_state(
+            FakeTorch(), b"synthetic-malformed-checkpoint", foundation.resolution
+        )
+
+
+def test_checkpoint_loader_position_matches_accumulation_and_loader_end(
+    tmp_path: Path,
+) -> None:
+    foundation, _, _, _ = _library_foundation(tmp_path)
+    resolution = replace(foundation.resolution, gradient_accumulation=2)
+    loader = ("batch-a", "batch-b", "batch-c")
+
+    library_backend_module._validate_checkpoint_loader_position(
+        {"step": 2, "batches_consumed": 3}, loader, resolution
+    )
+    with pytest.raises(LibraryRuntimeError, match="library_checkpoint_restore_failed"):
+        library_backend_module._validate_checkpoint_loader_position(
+            {"step": 1, "batches_consumed": 1}, loader, resolution
         )
 
 

@@ -75,17 +75,22 @@ The implementations are:
 
 The real backend loads local tokenizer and model directories with remote code
 disabled, constructs a PEFT LoRA model, prepares training and inference through
-Accelerate, emits integer-microunit loss evidence, serializes adapter,
-optimizer, and scheduler resume state, loads it with restricted `weights_only`
-deserialization, and saves an adapter payload in safetensors or PyTorch-bin
-form. Library-owned filenames and identifiers are normalized before artifact
-ingestion and do not become Temper identity.
+Accelerate, emits integer-microunit loss evidence, and saves an adapter payload
+in safetensors or PyTorch-bin form. Its restricted `weights_only` checkpoint
+captures adapter, optimizer, scheduler, mixed-precision scaler, prepared-loader
+position, and CPU/device PyTorch RNG state. Restore prepares the same
+Accelerator boundary, advances the deterministic loader to the exact next
+batch, and then restores that state, so recovery follows the uninterrupted
+training trajectory. Library-owned filenames and identifiers are normalized
+before artifact ingestion and do not become Temper identity.
 
-Checkpoint payloads bind their exact recipe resolution and decoded optimizer
-step. Restore accepts only an integer step strictly below the frozen training
-step count. A final-step checkpoint may be retained for audit evidence, but it
-is explicitly non-resumable in both worker messages and canonical receipts, so
-a disconnect after the final checkpoint cannot execute an extra update.
+Checkpoint payloads bind their exact recipe resolution, decoded optimizer step,
+and prepared-loader consumption count. Restore accepts only the complete
+trajectory-preserving checkpoint schema and an integer step strictly below the
+frozen training step count. A final-step checkpoint may be retained for audit
+evidence, but it is explicitly non-resumable in both worker messages and
+canonical receipts, so a disconnect after the final checkpoint cannot execute
+an extra update.
 
 ## Windows/WSL boundary
 

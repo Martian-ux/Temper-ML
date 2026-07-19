@@ -204,6 +204,7 @@ class WslWorkerBackend:
         self._validate_sources(context, model_source, tokenizer_source)
         if context.operation is not RuntimeOperation.TRAIN:
             raise LibraryRuntimeError("wsl_training_context_invalid")
+        frozen_capability = self.probe()
         prefix = self._operation_prefix(context)
         dataset_location = PortableLocation(
             f"{prefix.logical_path}/inputs/rendered-dataset.jsonl"
@@ -355,8 +356,13 @@ class WslWorkerBackend:
                 "library_versions",
             }
             or metadata["schema_version"] != "v1"
+            or not isinstance(metadata["library_versions"], Mapping)
         ):
             raise LibraryRuntimeError("wsl_training_result_invalid")
+        if dict(metadata["library_versions"]) != dict(
+            frozen_capability.library_versions
+        ):
+            raise LibraryRuntimeError("wsl_training_library_versions_mismatch")
         adapter_config = metadata["adapter_config"]
         if not isinstance(adapter_config, Mapping):
             raise LibraryRuntimeError("wsl_training_result_invalid")

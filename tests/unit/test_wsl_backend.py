@@ -8,6 +8,7 @@ from temper_ml.domain.projections import ContentIdentity
 from temper_ml.domain.recipes import RecipeResolution
 from temper_ml.domain.records import RecordReference, identity_fields
 from temper_ml.runtime.library_backend import (
+    LibraryCapability,
     LibraryExecutionContext,
     LibraryRuntimeError,
 )
@@ -30,6 +31,7 @@ from temper_ml.runtime.worker_port import (
     WslWorkerLaunchSpec,
 )
 from temper_ml.runtime.wsl_backend import WslWorkerBackend, WslWorkerConfig
+from temper_ml.store.canonical_json import dumps_canonical_json
 
 
 IDENTITY = ContentIdentity("sha256", "4" * 64)
@@ -84,7 +86,8 @@ def _config(root: Path) -> WslWorkerConfig:
         target_class="wsl_rocm",
         launch=WslWorkerLaunchSpec("Ubuntu-ROCm", PurePosixPath("/usr/bin/python3")),
         path_map=WindowsWslPathMap(
-            PureWindowsPath(str(root)), PurePosixPath("/temper-staging")
+            PureWindowsPath("C:/synthetic-temper-staging"),
+            PurePosixPath("/temper-staging"),
         ),
         host_model_source=(root / "model").resolve(),
         host_tokenizer_source=(root / "tokenizer").resolve(),
@@ -93,8 +96,29 @@ def _config(root: Path) -> WslWorkerConfig:
     )
 
 
+def _capability(*, transformers_version: str = "1.test") -> LibraryCapability:
+    return LibraryCapability(
+        accelerator_backend="rocm",
+        accelerator_architecture="amd-gpu",
+        accelerator_model="Synthetic AMD GPU",
+        accelerator_count=1,
+        accelerator_memory_bytes=(1_000_000,),
+        system_memory_bytes=2_000_000,
+        supported_precision_modes=("fp32",),
+        supported_quantization_modes=("none",),
+        capabilities=("checkpoint_resume", "lora", "transformers"),
+        library_versions={
+            "accelerate": "1.test",
+            "peft": "1.test",
+            "torch": "1.test",
+            "transformers": transformers_version,
+        },
+    )
+
+
 def test_partial_worker_ledger_replays_verified_checkpoint_without_relaunch(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path)
     checkpoint = b"synthetic-checkpoint"
@@ -166,6 +190,8 @@ def test_partial_worker_ledger_replays_verified_checkpoint_without_relaunch(
             raise WorkerPortError("worker_reconciliation_required", messages=messages)
 
     backend = WslWorkerBackend(config, launcher=PartialLauncher())
+    monkeypatch.setattr(backend, "_host_root", lambda: tmp_path)
+    backend._capability = _capability()
     result = backend.train(
         context=LibraryExecutionContext(
             IDENTITY,
@@ -195,6 +221,7 @@ def test_partial_worker_ledger_replays_verified_checkpoint_without_relaunch(
 
 def test_worker_response_cannot_reference_output_outside_operation_prefix(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path)
 
@@ -216,5 +243,84 @@ def test_worker_response_cannot_reference_output_outside_operation_prefix(
             return WorkerLaunchResult(response, (), False)
 
     backend = WslWorkerBackend(config, launcher=EscapingLauncher())
+    monkeypatch.setattr(backend, "_host_root", lambda: tmp_path)
     with pytest.raises(LibraryRuntimeError, match="wsl_response_location_invalid"):
         backend.probe()
+
+
+def test_training_versions_must_match_the_frozen_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    frozen = _capability()
+
+    class DriftedTrainingLauncher(WslWorkerLauncher):
+        def launch(self, spec, invocation, **kwargs):
+            del spec, kwargs
+            adapter_location = PortableLocation(
+                f"{invocation.output_prefix.logical_path}/outputs/adapter.bin"
+            )
+            metadata_location = PortableLocation(
+                f"{invocation.output_prefix.logical_path}/outputs/training-result.json"
+            )
+            adapter = b"synthetic-adapter"
+            metadata = dumps_canonical_json(
+                {
+                    "schema_version": "v1",
+                    "adapter_payload_format": "safetensors",
+                    "adapter_config": {"peft_type": "lora"},
+                    "library_versions": dict(
+                        _capability(transformers_version="2.drifted").library_versions
+                    ),
+                }
+            )
+            manifest = build_transfer_manifest(
+                TransferDirection.WORKER_TO_HOST,
+                {
+                    adapter_location: ("adapter_payload", adapter),
+                    metadata_location: ("training_result", metadata),
+                },
+            )
+            stage_transfer(
+                tmp_path,
+                manifest,
+                {adapter_location: adapter, metadata_location: metadata},
+            )
+            response = WorkerResponse(
+                invocation.context,
+                "completed",
+                manifest,
+                {
+                    "adapter_location": adapter_location.to_dict(),
+                    "metadata_location": metadata_location.to_dict(),
+                    "checkpoints": [],
+                },
+            )
+            return WorkerLaunchResult(response, (), False)
+
+    backend = WslWorkerBackend(config, launcher=DriftedTrainingLauncher())
+    monkeypatch.setattr(backend, "_host_root", lambda: tmp_path)
+    backend._capability = frozen
+
+    with pytest.raises(
+        LibraryRuntimeError, match="wsl_training_library_versions_mismatch"
+    ):
+        backend.train(
+            context=LibraryExecutionContext(
+                IDENTITY,
+                "run-wsl-version-drift",
+                RuntimeOperation.TRAIN,
+                config.target_class,
+            ),
+            model_source=config.host_model_source,
+            tokenizer_source=config.host_tokenizer_source,
+            rendered_dataset=b'{"text":"Synthetic WSL input"}\n',
+            resolution=_resolution(),
+            resume_checkpoint=None,
+            on_progress=lambda step, loss: None,
+            on_checkpoint=lambda checkpoint: None,
+            on_heartbeat=lambda step: None,
+            cancellation_requested=lambda: False,
+            interruption_requested=lambda: False,
+        )

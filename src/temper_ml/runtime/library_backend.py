@@ -10,6 +10,7 @@ from importlib import metadata
 import io
 import os
 from pathlib import Path
+import pickle
 import platform
 import tempfile
 from types import MappingProxyType
@@ -470,14 +471,6 @@ class TransformersPeftBackend:
             num_training_steps=resolution.training_steps,
         )
         checkpoint_state = _checkpoint_state(torch, resume_checkpoint, resolution)
-        if checkpoint_state is not None:
-            _restore_checkpoint(
-                peft,
-                model,
-                optimizer,
-                scheduler,
-                checkpoint_state,
-            )
         mixed_precision = {
             "fp16": "fp16",
             "bf16": "bf16",
@@ -489,14 +482,33 @@ class TransformersPeftBackend:
         model, optimizer, loader, scheduler = accelerator.prepare(
             model, optimizer, loader, scheduler
         )
+        batches = _repeat_loader(loader)
+        if checkpoint_state is not None:
+            _validate_checkpoint_loader_position(checkpoint_state, loader, resolution)
+            for _ in range(int(checkpoint_state["batches_consumed"])):
+                next(batches)
+            _restore_checkpoint(
+                torch,
+                peft,
+                accelerator.unwrap_model(model),
+                optimizer,
+                scheduler,
+                accelerator,
+                checkpoint_state,
+            )
         model.train()
         start_step = (
             int(checkpoint_state["step"]) if checkpoint_state is not None else 0
         )
+        batches_consumed = (
+            int(checkpoint_state["batches_consumed"])
+            if checkpoint_state is not None
+            else 0
+        )
         completed_steps = start_step
         progress: list[tuple[int, int]] = []
         checkpoints: list[LibraryCheckpointPayload] = []
-        for batch in _repeat_loader(loader):
+        for batch in batches:
             if interruption_requested():
                 return LibraryTrainingResult(
                     None,
@@ -515,6 +527,7 @@ class TransformersPeftBackend:
                     tuple(checkpoints),
                     cancelled=True,
                 )
+            batches_consumed += 1
             with accelerator.accumulate(model):
                 outputs = model(**batch)
                 loss = outputs.loss
@@ -542,7 +555,9 @@ class TransformersPeftBackend:
                         accelerator.unwrap_model(model),
                         optimizer,
                         scheduler,
+                        accelerator,
                         completed_steps,
+                        batches_consumed,
                         resolution,
                     ),
                 )
@@ -739,7 +754,12 @@ def _system_memory_bytes() -> int:
 
             status = MemoryStatus()
             status.length = ctypes.sizeof(status)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            windll: Any = getattr(ctypes, "windll", None)
+            kernel32: Any = getattr(windll, "kernel32", None)
+            global_memory_status = getattr(kernel32, "GlobalMemoryStatusEx", None)
+            if callable(global_memory_status) and global_memory_status(
+                ctypes.byref(status)
+            ):
                 return int(status.total_physical)
         sysconf = getattr(os, "sysconf", None)
         if not callable(sysconf):
@@ -805,34 +825,57 @@ def _checkpoint_bytes(
     model: Any,
     optimizer: Any,
     scheduler: Any,
+    accelerator: Any,
     step: int,
+    batches_consumed: int,
     resolution: RecipeResolution,
 ) -> bytes:
     buffer = io.BytesIO()
+    torch_rng_state, cuda_rng_states = _capture_torch_rng_state(torch)
+    scaler = getattr(accelerator, "scaler", None)
     state = {
-        "schema_version": "v1",
+        "schema_version": "v2",
         "step": step,
+        "batches_consumed": batches_consumed,
         "recipe_resolution": record_reference(resolution).to_dict(),
         "adapter_state": peft.get_peft_model_state_dict(model),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
+        "torch_rng_state": torch_rng_state,
+        "cuda_rng_states": cuda_rng_states,
+        "accelerator_scaler_state": (
+            scaler.state_dict() if scaler is not None else None
+        ),
     }
     torch.save(state, buffer)
     return buffer.getvalue()
 
 
 def _restore_checkpoint(
+    torch: Any,
     peft: Any,
     model: Any,
     optimizer: Any,
     scheduler: Any,
+    accelerator: Any,
     state: Mapping[str, Any],
 ) -> None:
     try:
         peft.set_peft_model_state_dict(model, state["adapter_state"])
         optimizer.load_state_dict(state["optimizer_state"])
         scheduler.load_state_dict(state["scheduler_state"])
-    except (KeyError, RuntimeError, TypeError, ValueError):
+        scaler = getattr(accelerator, "scaler", None)
+        scaler_state = state["accelerator_scaler_state"]
+        if (scaler is None) != (scaler_state is None):
+            raise ValueError
+        if scaler is not None:
+            scaler.load_state_dict(scaler_state)
+        _restore_torch_rng_state(
+            torch,
+            state["torch_rng_state"],
+            tuple(state["cuda_rng_states"]),
+        )
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
         raise LibraryRuntimeError("library_checkpoint_restore_failed") from None
 
 
@@ -848,27 +891,100 @@ def _checkpoint_state(
         if not isinstance(value, dict) or set(value) != {
             "schema_version",
             "step",
+            "batches_consumed",
             "recipe_resolution",
             "adapter_state",
             "optimizer_state",
             "scheduler_state",
+            "torch_rng_state",
+            "cuda_rng_states",
+            "accelerator_scaler_state",
         }:
             raise ValueError
         step = value["step"]
+        batches_consumed = value["batches_consumed"]
         if (
-            value["schema_version"] != "v1"
+            value["schema_version"] != "v2"
             or value["recipe_resolution"] != record_reference(resolution).to_dict()
             or isinstance(step, bool)
             or not isinstance(step, int)
             or not 1 <= step < resolution.training_steps
+            or isinstance(batches_consumed, bool)
+            or not isinstance(batches_consumed, int)
+            or batches_consumed < step
+            or batches_consumed > step * resolution.gradient_accumulation
             or not isinstance(value["adapter_state"], Mapping)
             or not isinstance(value["optimizer_state"], Mapping)
             or not isinstance(value["scheduler_state"], Mapping)
+            or not _is_torch_rng_state(torch, value["torch_rng_state"])
+            or not isinstance(value["cuda_rng_states"], (list, tuple))
+            or any(
+                not _is_torch_rng_state(torch, item)
+                for item in value["cuda_rng_states"]
+            )
+            or (
+                value["accelerator_scaler_state"] is not None
+                and not isinstance(value["accelerator_scaler_state"], Mapping)
+            )
         ):
             raise ValueError
-    except (KeyError, RuntimeError, TypeError, ValueError):
+    except (
+        EOFError,
+        KeyError,
+        OSError,
+        pickle.UnpicklingError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
         raise LibraryRuntimeError("library_checkpoint_restore_failed") from None
     return value
+
+
+def _validate_checkpoint_loader_position(
+    state: Mapping[str, Any], loader: Any, resolution: RecipeResolution
+) -> None:
+    try:
+        loader_batches = len(loader)
+        step = state["step"]
+        batches_consumed = state["batches_consumed"]
+        accumulation = resolution.gradient_accumulation
+        if loader_batches < 1:
+            raise ValueError
+        steps_per_loader = (loader_batches + accumulation - 1) // accumulation
+        completed_loaders, steps_in_loader = divmod(step, steps_per_loader)
+        expected = completed_loaders * loader_batches + steps_in_loader * accumulation
+        if batches_consumed != expected:
+            raise ValueError
+    except (KeyError, OverflowError, TypeError, ValueError):
+        raise LibraryRuntimeError("library_checkpoint_restore_failed") from None
+
+
+def _capture_torch_rng_state(torch: Any) -> tuple[Any, tuple[Any, ...]]:
+    cpu_state = torch.get_rng_state()
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None or not cuda.is_available():
+        return cpu_state, ()
+    return cpu_state, tuple(cuda.get_rng_state_all())
+
+
+def _restore_torch_rng_state(
+    torch: Any, cpu_state: Any, cuda_states: tuple[Any, ...]
+) -> None:
+    torch.set_rng_state(cpu_state)
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None or not cuda.is_available():
+        if cuda_states:
+            raise ValueError
+        return
+    if len(cuda_states) != int(cuda.device_count()):
+        raise ValueError
+    cuda.set_rng_state_all(cuda_states)
+
+
+def _is_torch_rng_state(torch: Any, value: Any) -> bool:
+    is_tensor = getattr(torch, "is_tensor", None)
+    return callable(is_tensor) and bool(is_tensor(value))
 
 
 def _repeat_loader(loader: Any) -> Iterator[Any]:

@@ -34,9 +34,11 @@ deployment, cleanup, Slice 9 retention execution, or later automated loops.
   coordinator owns declared accelerator capacity, and one durable run-scoped
   OS lease closes the cross-service unused-run race. An unresolved claim blocks
   relaunch until identity-bound reconciliation instead of duplicating work.
-- Checkpoints bind the frozen recipe and decoded optimizer step. Final-step
-  checkpoints remain auditable but are non-resumable, preventing a timeout
-  after the final save from executing an extra optimizer update.
+- Checkpoints bind the frozen recipe, decoded optimizer step, prepared-loader
+  position, CPU/device RNG state, and mixed-precision scaler state. Recovery
+  restores the prepared execution boundary and exact next batch; final-step
+  checkpoints remain auditable but non-resumable, preventing a timeout after
+  the final save from executing an extra optimizer update.
 - Training, evaluation, and local use bind private model/tokenizer sources to
   the verified Temper base-model reference and tokenizer identity. Backend
   capabilities and library versions are probed rather than trusted from a

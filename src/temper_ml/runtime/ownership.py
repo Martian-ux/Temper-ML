@@ -161,8 +161,7 @@ def claim_run_ownership(
 def _lock_nonblocking(handle: Any) -> None:
     try:
         if os.name == "nt":
-            import msvcrt
-
+            msvcrt: Any = importlib.import_module("msvcrt")
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             fcntl: Any = importlib.import_module("fcntl")
@@ -173,8 +172,7 @@ def _lock_nonblocking(handle: Any) -> None:
 
 def _unlock(handle: Any) -> None:
     if os.name == "nt":
-        import msvcrt
-
+        msvcrt: Any = importlib.import_module("msvcrt")
         msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
     else:
         fcntl: Any = importlib.import_module("fcntl")
