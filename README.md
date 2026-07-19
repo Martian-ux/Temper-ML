@@ -70,6 +70,55 @@ python scripts/temper-gate.py diff
 `python scripts/temper-gate.py fixture-help` describes the deterministic
 fixture walkthrough entry point.
 
+## Library-backed local runtime
+
+Slice 8 adds a Temper-owned LoRA runtime port with three implementations:
+
+- `DeterministicLibraryBackend` exercises the complete service, artifact,
+  evaluation-inference, and local-use contract without ML libraries or
+  hardware.
+- `WslWorkerBackend` is the reference Windows-hosted port. It invokes one
+  explicitly named WSL distribution without a shell and uses an explicitly
+  mapped shared staging root for immutable requests, typed lifecycle messages,
+  cooperative control markers, and content-verified transfers.
+- `TransformersPeftBackend` is the local PyTorch, Transformers, PEFT, and
+  Accelerate implementation. Running it directly is the secondary native
+  execution path; it is eligible only when its probe proves the selected
+  execution target and recipe requirements.
+
+Install the optional library stack in the environment that runs the real
+backend. The default development and fixture gate does not install it:
+
+```powershell
+uv sync --dev --extra runtime --locked
+```
+
+Model and tokenizer inputs must already be local directories. The runtime uses
+local-only library loading with remote code disabled; it does not download a
+model or silently switch between WSL and native execution. The caller supplies
+one explicit target class, local model/tokenizer sources, and, for WSL, one
+Windows/WSL staging-root mapping and worker Python executable. Capability facts
+are converted into the existing hardware profile and must pass the existing
+preflight checks before a request is frozen.
+
+The worker never opens the canonical project store. Windows-side application
+services alone ingest verified messages, transfer receipts, checkpoints, and
+the normalized three-member adapter bundle. A partial transfer, conflicting
+message replay, missing terminal response, or worker loss cannot complete a
+run or admit an artifact. The detailed ownership and failure model is recorded
+in `docs/superpowers/plans/2026-07-18-slice-8-runtime-architecture.md`.
+
+The opt-in ROCm smoke test documents the required private environment variable
+names without embedding machine values:
+
+```powershell
+$env:TEMPER_RUN_SLICE8_HARDWARE = "1"
+uv run --extra runtime pytest -m hardware tests/hardware/test_slice8_real_adapter.py
+```
+
+It skips truthfully unless every explicitly configured local prerequisite is
+present. No hardware test is required by the normal repository gate.
+
 ## Local evaluation lab
 
 Slice 7 adds a dependency-free loopback UI for the complete deterministic

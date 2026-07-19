@@ -23,7 +23,13 @@ from temper_ml.domain.records import (
     record_reference,
 )
 from temper_ml.domain.runs import ResolvedRuntimeRequest, Run
-from temper_ml.store.canonical_json import dumps_canonical_json
+from temper_ml.store.canonical_json import (
+    CanonicalJsonError,
+    dumps_canonical_json,
+    loads_canonical_json,
+)
+from temper_ml.runtime.protocol import RuntimeMessage
+from temper_ml.runtime.staging import TransferReceipt
 
 FIXTURE_RUNTIME_PROJECTION = HashProjection("runtime.fixture_adapter", "v1")
 FIXTURE_TRAINING_STATE_PROJECTION = HashProjection(
@@ -129,22 +135,14 @@ class FixtureAdapterRequest:
             != request.rendered_dataset_identity.value
         ):
             raise FixtureAdapterError("fixture_rendered_dataset_identity_mismatch")
-        if request.runtime_identity != FIXTURE_RUNTIME_IDENTITY:
-            raise FixtureAdapterError("fixture_runtime_identity_mismatch")
         if self.run.experiment != record_reference(self.experiment):
             raise FixtureAdapterError("fixture_run_experiment_mismatch")
         if self.run.request_identity != request.identity:
             raise FixtureAdapterError("fixture_run_request_mismatch")
         if self.run.training_state_identity != request.training_state_identity:
             raise FixtureAdapterError("fixture_run_training_state_mismatch")
-        expected_state = fixture_training_state_identity(
-            self.experiment,
-            self.recipe_resolution,
-            self.dataset_version,
-            request.starting_step,
-        )
-        if request.training_state_identity != expected_state:
-            raise FixtureAdapterError("fixture_training_state_mismatch")
+        if self.run.runtime_identity != request.runtime_identity:
+            raise FixtureAdapterError("fixture_run_runtime_mismatch")
 
 
 @dataclass(frozen=True)
@@ -201,6 +199,8 @@ class FixtureAdapterOutput:
     logs: tuple[FixtureLog, ...]
     members: Mapping[str, bytes]
     bundle_manifest: BundleManifest | None
+    runtime_messages: tuple[RuntimeMessage, ...] = ()
+    transfer_receipts: tuple[TransferReceipt, ...] = ()
 
     def __post_init__(self) -> None:
         copied = {path: bytes(value) for path, value in self.members.items()}
@@ -213,6 +213,15 @@ class FixtureAdapterOutput:
                 raise FixtureAdapterError("fixture_bundle_manifest_mismatch")
         elif copied or self.bundle_manifest is not None:
             raise FixtureAdapterError("fixture_terminal_artifact_invalid")
+        if not isinstance(self.runtime_messages, tuple) or any(
+            not isinstance(message, RuntimeMessage) for message in self.runtime_messages
+        ):
+            raise FixtureAdapterError("fixture_runtime_messages_invalid")
+        if not isinstance(self.transfer_receipts, tuple) or any(
+            not isinstance(receipt, TransferReceipt)
+            for receipt in self.transfer_receipts
+        ):
+            raise FixtureAdapterError("fixture_transfer_receipts_invalid")
 
     @property
     def completed(self) -> bool:
@@ -223,15 +232,92 @@ class FixtureAdapter:
     """Pure deterministic trainer used to exercise the production runtime port."""
 
     runtime_identity = FIXTURE_RUNTIME_IDENTITY
+    runtime_kind = "fixture"
+
+    def training_state_identity(
+        self,
+        experiment: Experiment,
+        resolution: RecipeResolution,
+        dataset_version: DatasetVersion,
+        step: int,
+    ) -> ContentIdentity:
+        return fixture_training_state_identity(
+            experiment, resolution, dataset_version, step
+        )
+
+    def validate_checkpoint(
+        self,
+        request: FixtureAdapterRequest,
+        checkpoint: FixtureCheckpoint,
+    ) -> None:
+        if not isinstance(request, FixtureAdapterRequest) or not isinstance(
+            checkpoint, FixtureCheckpoint
+        ):
+            raise FixtureAdapterError("fixture_checkpoint_invalid")
+        expected_state = fixture_training_state_identity(
+            request.experiment,
+            request.recipe_resolution,
+            request.dataset_version,
+            checkpoint.step,
+        )
+        expected_producing_run = (
+            request.runtime_request.resume_from_run
+            if request.runtime_request.resume_from_run is not None
+            else record_reference(request.run)
+        )
+        try:
+            payload = loads_canonical_json(checkpoint.payload)
+        except (CanonicalJsonError, TypeError, ValueError):
+            raise FixtureAdapterError("fixture_checkpoint_invalid") from None
+        expected_payload = {
+            "schema_version": "v1",
+            "producing_run": expected_producing_run.to_dict(),
+            "experiment_manifest_identity": identity_fields(
+                request.experiment.manifest_identity
+            ),
+            "recipe_resolution": record_reference(request.recipe_resolution).to_dict(),
+            "dataset_version_identity": identity_fields(
+                request.dataset_version.identity
+            ),
+            "rendered_dataset_identity": identity_fields(
+                request.dataset_version.rendered_bytes_identity
+            ),
+            "execution_target": request.runtime_request.execution_target.to_dict(),
+            "runtime_identity": identity_fields(FIXTURE_RUNTIME_IDENTITY),
+            "step": checkpoint.step,
+            "training_state_identity": identity_fields(expected_state),
+        }
+        if (
+            payload != expected_payload
+            or dumps_canonical_json(payload) != checkpoint.payload
+            or checkpoint.training_state_identity != expected_state
+            or checkpoint.checkpoint_identity
+            != ContentIdentity("sha256", hashlib.sha256(checkpoint.payload).hexdigest())
+            or checkpoint.resume_compatible
+            != (checkpoint.step < request.recipe_resolution.training_steps)
+        ):
+            raise FixtureAdapterError("fixture_checkpoint_invalid")
 
     def execute(
         self,
         request: FixtureAdapterRequest,
         *,
         control: FixtureControl | None = None,
+        resume_checkpoint: FixtureCheckpoint | None = None,
     ) -> FixtureAdapterOutput:
         if not isinstance(request, FixtureAdapterRequest):
             raise FixtureAdapterError("fixture_request_invalid")
+        require_fixture_request(request)
+        resuming = request.runtime_request.starting_step > 0
+        if resuming != (resume_checkpoint is not None):
+            raise FixtureAdapterError("fixture_resume_checkpoint_missing")
+        if resume_checkpoint is not None:
+            self.validate_checkpoint(request, resume_checkpoint)
+            if (
+                request.runtime_request.resume_checkpoint_identity
+                != resume_checkpoint.checkpoint_identity
+            ):
+                raise FixtureAdapterError("fixture_resume_checkpoint_mismatch")
         active_control = control if control is not None else FixtureControl()
         if not isinstance(active_control, FixtureControl):
             raise FixtureAdapterError("fixture_control_invalid")
@@ -485,3 +571,13 @@ def require_fixture_request(request: FixtureAdapterRequest) -> None:
         request.__post_init__()
     except (FixtureAdapterError, RecordValidationError, TypeError, ValueError):
         raise FixtureAdapterError("fixture_request_invalid") from None
+    if request.runtime_request.runtime_identity != FIXTURE_RUNTIME_IDENTITY:
+        raise FixtureAdapterError("fixture_runtime_identity_mismatch")
+    expected_state = fixture_training_state_identity(
+        request.experiment,
+        request.recipe_resolution,
+        request.dataset_version,
+        request.runtime_request.starting_step,
+    )
+    if request.runtime_request.training_state_identity != expected_state:
+        raise FixtureAdapterError("fixture_training_state_mismatch")
