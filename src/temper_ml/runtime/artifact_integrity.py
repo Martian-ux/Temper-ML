@@ -1,4 +1,4 @@
-"""Fail-closed integrity verification for fixture artifacts and exports."""
+"""Fail-closed integrity verification for normalized adapter artifacts."""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ from temper_ml.runtime.fixture_adapter import (
     fixture_adapter_bytes,
     fixture_training_state_identity,
 )
+from temper_ml.runtime.library_adapter import library_training_state_identity
 from temper_ml.store.canonical_json import (
     CanonicalJsonError,
     dumps_canonical_json,
@@ -90,6 +91,20 @@ class ArtifactIntegrityExpectation:
             raise ArtifactIntegrityError("artifact_run_experiment_mismatch")
         if self.producing_run.request_identity != self.runtime_request.identity:
             raise ArtifactIntegrityError("artifact_run_request_mismatch")
+        if (
+            self.producing_run.runtime_identity != self.runtime_request.runtime_identity
+            or self.producing_run.execution_target
+            != self.runtime_request.execution_target
+            or self.producing_run.training_state_identity
+            != self.runtime_request.training_state_identity
+        ):
+            raise ArtifactIntegrityError("artifact_run_request_mismatch")
+        if (
+            self.runtime_request.experiment != record_reference(self.experiment)
+            or self.runtime_request.experiment_manifest_identity
+            != self.experiment.manifest_identity
+        ):
+            raise ArtifactIntegrityError("artifact_request_experiment_mismatch")
         if self.runtime_request.recipe_resolution != record_reference(
             self.recipe_resolution
         ):
@@ -174,7 +189,7 @@ def verify_artifact_bundle(
     root: Path | str,
     expectation: ArtifactIntegrityExpectation,
 ) -> ArtifactIntegrityResult:
-    """Verify a complete transferred fixture bundle against Temper-owned facts."""
+    """Verify a complete transferred bundle against Temper-owned facts."""
 
     if not isinstance(expectation, ArtifactIntegrityExpectation):
         raise ArtifactIntegrityError("artifact_expectation_invalid")
@@ -199,13 +214,14 @@ def verify_artifact_bundle(
         members["provenance.json"], "artifact_provenance_invalid"
     )
     adapter_identity = _bytes_identity(adapter)
-    expected_adapter = fixture_adapter_bytes(
-        expectation.experiment,
-        expectation.recipe_resolution,
-        expectation.dataset_version,
-    )
-    if adapter != expected_adapter:
-        raise ArtifactIntegrityError("artifact_adapter_bytes_mismatch")
+    if expectation.runtime_request.runtime_identity == FIXTURE_RUNTIME_IDENTITY:
+        expected_adapter = fixture_adapter_bytes(
+            expectation.experiment,
+            expectation.recipe_resolution,
+            expectation.dataset_version,
+        )
+        if adapter != expected_adapter:
+            raise ArtifactIntegrityError("artifact_adapter_bytes_mismatch")
     _verify_config(config, adapter_identity, expectation)
     _verify_provenance(provenance, expectation)
     config_identity = _bytes_identity(members["adapter_config.json"])
@@ -382,7 +398,7 @@ def _verify_config(
     adapter_identity: ContentIdentity,
     expectation: ArtifactIntegrityExpectation,
 ) -> None:
-    required = {
+    common = {
         "schema_version",
         "adapter_type",
         "target_modules",
@@ -395,6 +411,14 @@ def _verify_config(
         "runtime_identity",
         "training_steps",
     }
+    fixture = expectation.runtime_request.runtime_identity == FIXTURE_RUNTIME_IDENTITY
+    library = {
+        "runtime_kind",
+        "adapter_payload_format",
+        "library_versions",
+        "library_adapter_config",
+    }
+    required = common if fixture else common | library
     if set(value) != required or value["schema_version"] != "v1":
         raise ArtifactIntegrityError("artifact_config_invalid")
     resolution = expectation.recipe_resolution
@@ -413,7 +437,9 @@ def _verify_config(
             expectation.compatibility_group
         ).to_dict(),
         "adapter_identity": identity_fields(adapter_identity),
-        "runtime_identity": identity_fields(FIXTURE_RUNTIME_IDENTITY),
+        "runtime_identity": identity_fields(
+            expectation.runtime_request.runtime_identity
+        ),
         "training_steps": resolution.training_steps,
     }
     if any(value.get(field) != expected[field] for field in expected):
@@ -423,6 +449,42 @@ def _verify_config(
         or expectation.compatibility_group.target_modules != resolution.target_modules
     ):
         raise ArtifactIntegrityError("artifact_compatibility_group_mismatch")
+    if fixture:
+        return
+    if value.get("runtime_kind") != "library":
+        raise ArtifactIntegrityError("artifact_config_mismatch")
+    payload_format = value.get("adapter_payload_format")
+    if payload_format not in {"safetensors", "pytorch_bin"}:
+        raise ArtifactIntegrityError("artifact_config_invalid")
+    versions = value.get("library_versions")
+    if not isinstance(versions, Mapping) or any(
+        not isinstance(name, str)
+        or not name
+        or not isinstance(version, str)
+        or not version
+        or "://" in version
+        or version.startswith(("/", "\\\\"))
+        for name, version in versions.items()
+    ):
+        raise ArtifactIntegrityError("artifact_config_invalid")
+    declared_versions = expectation.recipe_resolution.library_versions
+    if any(
+        name not in versions or versions[name] != declared
+        for name, declared in declared_versions.items()
+    ):
+        raise ArtifactIntegrityError("artifact_config_mismatch")
+    library_config = value.get("library_adapter_config")
+    expected_library_config = {
+        "peft_type": "lora",
+        "task_type": "causal_lm",
+        "bias": "none",
+        "rank": resolution.rank,
+        "alpha": resolution.alpha,
+        "dropout": str(resolution.dropout),
+        "payload_format": payload_format,
+    }
+    if library_config != expected_library_config:
+        raise ArtifactIntegrityError("artifact_config_mismatch")
 
 
 def _verify_provenance(
@@ -465,12 +527,21 @@ def _verify_provenance(
         )
     except RecordValidationError:
         raise ArtifactIntegrityError("artifact_provenance_invalid") from None
-    expected_state = fixture_training_state_identity(
-        expectation.experiment,
-        expectation.recipe_resolution,
-        expectation.dataset_version,
-        expectation.recipe_resolution.training_steps,
-    )
+    if expectation.runtime_request.runtime_identity == FIXTURE_RUNTIME_IDENTITY:
+        expected_state = fixture_training_state_identity(
+            expectation.experiment,
+            expectation.recipe_resolution,
+            expectation.dataset_version,
+            expectation.recipe_resolution.training_steps,
+        )
+    else:
+        expected_state = library_training_state_identity(
+            expectation.experiment,
+            expectation.recipe_resolution,
+            expectation.dataset_version,
+            expectation.runtime_request.runtime_identity,
+            expectation.recipe_resolution.training_steps,
+        )
     if observed_state != expected_state:
         raise ArtifactIntegrityError("artifact_provenance_mismatch")
 

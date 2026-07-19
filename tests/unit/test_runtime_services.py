@@ -1,9 +1,13 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
+import pickle
 import shutil
+from threading import Event
 
 import pytest
 import temper_ml.app_services.runs as runs_module
+import temper_ml.runtime.library_backend as library_backend_module
 
 from temper_ml.app_services.datasets import (
     DatasetImportRequest,
@@ -43,15 +47,36 @@ from temper_ml.domain.hardware import (
 from temper_ml.domain.local_use import LocalUseSession
 from temper_ml.domain.projections import ContentIdentity
 from temper_ml.domain.recipes import RecipeResolution
+from temper_ml.domain.records import record_reference
 from temper_ml.domain.runs import EvaluationMode, ResolvedRuntimeRequest, Run
 from temper_ml.runtime.fixture_adapter import (
     FixtureAdapter,
     FixtureAdapterError,
+    FixtureAdapterRequest,
     FixtureControl,
 )
+from temper_ml.runtime.controller import ControllerState
+from temper_ml.runtime.fixture_inference import (
+    FixtureInferenceRequest,
+    InferenceSettings,
+)
+from temper_ml.runtime.library_adapter import (
+    LibraryAdapter,
+    LibraryInferenceRuntime,
+    LibraryRuntimeSources,
+)
+from temper_ml.runtime.library_backend import (
+    LibraryCapability,
+    LibraryRuntimeError,
+    LibraryTrainingResult,
+)
+from temper_ml.runtime.library_double import DeterministicLibraryBackend
 from temper_ml.runtime.preflight import EstimateComponents, estimate_resources
-from temper_ml.runtime.fixture_inference import InferenceSettings
-from temper_ml.store.canonical_json import dumps_canonical_json
+from temper_ml.runtime.protocol import RuntimeOperation
+from temper_ml.store.canonical_json import (
+    dumps_canonical_json,
+    loads_canonical_json,
+)
 from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
 from temper_ml.store.event_stream import EventRequest
 from temper_ml.store.safe_io import SafeIoError
@@ -180,6 +205,81 @@ def _foundation(root: Path) -> _Foundation:
         _one(store, HardwareRequirements),
         _one(store, ExecutionTarget),
         _one(store, HardwareCapabilityProfile),
+    )
+
+
+def _library_foundation(
+    root: Path,
+) -> tuple[
+    _Foundation,
+    DeterministicLibraryBackend,
+    LibraryRuntimeSources,
+    LibraryAdapter,
+]:
+    fixture = _foundation(root)
+    versions = {
+        "accelerate": "1.test",
+        "peft": "1.test",
+        "torch": "1.test",
+        "transformers": "1.test",
+    }
+    capability = LibraryCapability(
+        accelerator_backend=fixture.target.accelerator_backend,
+        accelerator_architecture="synthetic-library-cpu",
+        accelerator_model="Synthetic library CPU",
+        accelerator_count=0,
+        accelerator_memory_bytes=(),
+        system_memory_bytes=1_000_000,
+        supported_precision_modes=("fp32",),
+        supported_quantization_modes=("none",),
+        capabilities=(
+            "accelerate",
+            "cancellation",
+            "checkpoint_resume",
+            "evaluation_inference",
+            "fixture_adapter",
+            "local_staging",
+            "local_use_inference",
+            "lora",
+            "peft",
+            "transformers",
+        ),
+        library_versions=versions,
+    )
+    backend = DeterministicLibraryBackend(capability)
+    sources = LibraryRuntimeSources(
+        (root.resolve() / "private-model-cache"),
+        (root.resolve() / "private-tokenizer-cache"),
+        (root.resolve() / ".temper-fixture-output" / "library-staging"),
+        fixture.target.target_class,
+        record_reference(fixture.model),
+        fixture.model.tokenizer_identity,
+    )
+    adapter = LibraryAdapter(backend, sources, capability=capability)
+    resolution = replace(
+        fixture.resolution,
+        resolution_id="resolution-library-runtime",
+        library_versions=versions,
+    )
+    experiment = replace(
+        fixture.experiment,
+        experiment_id="experiment-library-runtime",
+        recipe_resolution=record_reference(resolution),
+    )
+    profile = adapter.capability_profile("profile-library-runtime", fixture.target)
+    store = TypedEvidenceStore(root)
+    for record in (resolution, experiment, profile):
+        store.write_record(record)
+    return (
+        replace(
+            fixture,
+            experiment=experiment,
+            resolution=resolution,
+            profile=profile,
+        ),
+        backend,
+        sources,
+        adapter,
     )
 
 
@@ -682,6 +782,456 @@ def test_slice_five_fails_closed_on_future_quality_modes(tmp_path: Path) -> None
         ApplicationServiceError, match="run_evaluation_mode_not_supported"
     ):
         RunService(tmp_path).launch(launch)
+
+
+def test_library_runtime_preserves_run_artifact_local_use_and_export_contracts(
+    tmp_path: Path,
+) -> None:
+    foundation, backend, sources, adapter = _library_foundation(tmp_path)
+    service = RunService(tmp_path, adapter=adapter)
+    launch = foundation.launch(
+        run_id="run-library-runtime",
+        request_id="request-library-runtime",
+        artifact_id="artifact-library-runtime",
+    )
+
+    result = service.launch(launch)
+
+    assert result.status is RunLifecycleStatus.COMPLETED
+    assert result.artifact is not None
+    assert result.integrity is not None
+    assert backend.train_calls == 1
+    assert (
+        service.reconcile_runtime_controller(result.run.run_id).state
+        is ControllerState.COMPLETED
+    )
+    event_types = tuple(
+        event.event_type for event in service._events(result.run.run_id)
+    )
+    assert "run_worker_message" in event_types
+    assert "runtime_transfer_verified" in event_types
+    assert event_types[-1] == "run_completed"
+    config = loads_canonical_json(
+        (
+            tmp_path
+            / ".temper-fixture-output"
+            / "artifacts"
+            / launch.artifact_id
+            / "adapter_config.json"
+        ).read_bytes()
+    )
+    assert config["runtime_kind"] == "library"
+    assert config["runtime_identity"] == {
+        "algorithm": adapter.runtime_identity.algorithm,
+        "value": adapter.runtime_identity.value,
+    }
+
+    reopened = service.reopen_completed(launch)
+    assert reopened.artifact == result.artifact
+    assert backend.train_calls == 1
+
+    inference_runtime = LibraryInferenceRuntime(
+        backend, sources, adapter.runtime_identity
+    )
+    drifted_capability = replace(
+        backend.probe(),
+        library_versions={
+            **backend.probe().library_versions,
+            "transformers": "2.test",
+        },
+    )
+    with pytest.raises(LibraryRuntimeError, match="library_inference_runtime_mismatch"):
+        LibraryInferenceRuntime(
+            DeterministicLibraryBackend(drifted_capability),
+            sources,
+            adapter.runtime_identity,
+        )
+    local = LocalUseService(tmp_path, runtime=inference_runtime)
+    focused = local.focused(
+        LocalUseRequest(
+            artifact=result.artifact,
+            base_model_revision=foundation.model,
+            compatibility_group=foundation.group,
+            execution_target=foundation.target,
+            settings=InferenceSettings(),
+            inputs=({"prompt": "Synthetic focused input"},),
+        )
+    )
+    batch = local.batch(
+        LocalUseRequest(
+            artifact=result.artifact,
+            base_model_revision=foundation.model,
+            compatibility_group=foundation.group,
+            execution_target=foundation.target,
+            settings=InferenceSettings(),
+            inputs=({"prompt": "Synthetic single-item batch input"},),
+            session_id="library-local-session",
+        )
+    )
+    assert focused.ephemeral is True
+    assert batch.session is not None
+    adapter_bytes = (
+        tmp_path
+        / ".temper-fixture-output"
+        / "artifacts"
+        / launch.artifact_id
+        / "adapter.bin"
+    ).read_bytes()
+    evaluated = inference_runtime.infer_verified(
+        FixtureInferenceRequest(
+            adapter_bytes,
+            result.artifact.content_identity,
+            InferenceSettings(),
+            ({"prompt": "Synthetic evaluation input"},),
+        ),
+        resolution=foundation.resolution,
+        adapter_config=config,
+        operation=RuntimeOperation.EVALUATE,
+    )
+    assert len(evaluated.outputs) == 1
+    mismatched_config = dict(config)
+    mismatched_config["tokenizer_identity"] = {
+        "algorithm": "sha256",
+        "value": "e" * 64,
+    }
+    with pytest.raises(LibraryRuntimeError, match="library_inference_source_mismatch"):
+        inference_runtime.infer_verified(
+            FixtureInferenceRequest(
+                adapter_bytes,
+                result.artifact.content_identity,
+                InferenceSettings(),
+                ({"prompt": "Synthetic mismatched source input"},),
+            ),
+            resolution=foundation.resolution,
+            adapter_config=mismatched_config,
+            operation=RuntimeOperation.EVALUATE,
+        )
+
+    class PrivateDiagnosticBackend(DeterministicLibraryBackend):
+        def infer(self, **kwargs):
+            del kwargs
+            raise OSError("<private-model-source>/tokenizer.json is malformed")
+
+    private_backend = PrivateDiagnosticBackend(backend.probe())
+    private_runtime = LibraryInferenceRuntime(
+        private_backend,
+        sources,
+        adapter.runtime_identity,
+    )
+    with pytest.raises(LibraryRuntimeError) as failure:
+        private_runtime.infer_verified(
+            FixtureInferenceRequest(
+                adapter_bytes,
+                result.artifact.content_identity,
+                InferenceSettings(),
+                ({"prompt": "Synthetic private diagnostic boundary input"},),
+            ),
+            resolution=foundation.resolution,
+            adapter_config=config,
+            operation=RuntimeOperation.EVALUATE,
+        )
+    assert failure.value.code == "library_inference_failed"
+    assert str(failure.value) == "library_inference_failed"
+    assert backend.inference_calls == 3
+    assert backend.inference_operations == [
+        RuntimeOperation.INFER_FOCUSED,
+        RuntimeOperation.INFER_BATCH,
+        RuntimeOperation.EVALUATE,
+    ]
+
+    exported = local.export(
+        AdapterExportRequest(
+            "library-export",
+            result.artifact,
+            foundation.model,
+            foundation.group,
+            foundation.target,
+        )
+    )
+    assert exported.record.export_format == "temper_library_adapter_bundle"
+    assert (
+        local.verify_export(
+            exported.record,
+            artifact=result.artifact,
+            base_model_revision=foundation.model,
+            compatibility_group=foundation.group,
+            execution_target=foundation.target,
+        )
+        == exported.integrity
+    )
+
+
+def test_library_runtime_cancellation_interruption_and_recovery_release_resources(
+    tmp_path: Path,
+) -> None:
+    foundation, backend, _, adapter = _library_foundation(tmp_path)
+    service = RunService(tmp_path, adapter=adapter)
+    cancelled = service.launch(
+        foundation.launch(
+            run_id="run-library-cancelled",
+            request_id="request-library-cancelled",
+            artifact_id="artifact-library-cancelled",
+        ),
+        control=FixtureControl(cancel_after_step=2),
+    )
+    assert cancelled.status is RunLifecycleStatus.CANCELLED
+    assert not adapter.resources.leases
+
+    interrupted = service.launch(
+        foundation.launch(
+            run_id="run-library-interrupted",
+            request_id="request-library-interrupted",
+            artifact_id="artifact-library-interrupted",
+        ),
+        control=FixtureControl(interrupt_after_step=3),
+    )
+    assert interrupted.status is RunLifecycleStatus.INTERRUPTED
+    assert interrupted.checkpoints
+    assert (
+        service.reconcile_runtime_controller(interrupted.run.run_id).state
+        is ControllerState.INTERRUPTED
+    )
+    assert not adapter.resources.leases
+
+    recovered = service.recover(
+        RunRecoveryRequest(
+            foundation.launch(
+                run_id="run-library-recovered",
+                request_id="request-library-recovered",
+                artifact_id="artifact-library-recovered",
+            ),
+            interrupted.run,
+            interrupted.checkpoints[-1].checkpoint_identity,
+        )
+    )
+    assert recovered.status is RunLifecycleStatus.COMPLETED
+    assert recovered.runtime_request.starting_step == interrupted.checkpoints[-1].step
+    assert recovered.run.attempt_number == 2
+    assert backend.train_calls == 3
+    assert not adapter.resources.leases
+
+
+def test_terminal_library_checkpoint_is_retained_but_cannot_resume(
+    tmp_path: Path,
+) -> None:
+    foundation, base_backend, sources, _ = _library_foundation(tmp_path)
+
+    class FinalCheckpointInterruptedBackend(DeterministicLibraryBackend):
+        def train(self, **kwargs):
+            completed = super().train(**kwargs)
+            return LibraryTrainingResult(
+                None,
+                None,
+                None,
+                completed.progress,
+                completed.checkpoints,
+                interrupted=True,
+            )
+
+    backend = FinalCheckpointInterruptedBackend(base_backend.probe())
+    service = RunService(
+        tmp_path,
+        adapter=LibraryAdapter(backend, sources, capability=backend.probe()),
+    )
+    interrupted = service.launch(
+        foundation.launch(
+            run_id="run-library-final-checkpoint",
+            request_id="request-library-final-checkpoint",
+            artifact_id="artifact-library-final-checkpoint",
+        )
+    )
+
+    assert interrupted.status is RunLifecycleStatus.INTERRUPTED
+    final_checkpoint = interrupted.checkpoints[-1]
+    assert final_checkpoint.step == foundation.resolution.training_steps
+    assert final_checkpoint.resume_compatible is False
+    final_event = service._checkpoint_event(
+        interrupted.run.run_id, final_checkpoint.checkpoint_identity
+    )
+    assert final_event.payload["resume_compatible"] is False
+    with pytest.raises(
+        ApplicationServiceError, match="run_recovery_checkpoint_incompatible"
+    ):
+        service.recover(
+            RunRecoveryRequest(
+                foundation.launch(
+                    run_id="run-library-final-checkpoint-recovery",
+                    request_id="request-library-final-checkpoint-recovery",
+                    artifact_id="artifact-library-final-checkpoint-recovery",
+                ),
+                interrupted.run,
+                final_checkpoint.checkpoint_identity,
+            )
+        )
+    assert backend.train_calls == 1
+
+
+def test_real_backend_rejects_decoded_terminal_checkpoint_step(
+    tmp_path: Path,
+) -> None:
+    foundation, _, _, _ = _library_foundation(tmp_path)
+    rng_state = object()
+    serialized_state = {
+        "schema_version": "v2",
+        "step": foundation.resolution.training_steps,
+        "batches_consumed": foundation.resolution.training_steps,
+        "recipe_resolution": record_reference(foundation.resolution).to_dict(),
+        "adapter_state": {},
+        "optimizer_state": {},
+        "scheduler_state": {},
+        "torch_rng_state": rng_state,
+        "cuda_rng_states": (),
+        "accelerator_scaler_state": None,
+    }
+
+    class FakeTorch:
+        @staticmethod
+        def load(*args, **kwargs):
+            return serialized_state
+
+        @staticmethod
+        def is_tensor(value):
+            return value is rng_state
+
+    with pytest.raises(LibraryRuntimeError, match="library_checkpoint_restore_failed"):
+        library_backend_module._checkpoint_state(
+            FakeTorch(), b"synthetic-checkpoint", foundation.resolution
+        )
+
+
+@pytest.mark.parametrize("failure", [EOFError(), pickle.UnpicklingError("synthetic")])
+def test_real_backend_normalizes_checkpoint_deserialization_failures(
+    tmp_path: Path, failure: Exception
+) -> None:
+    foundation, _, _, _ = _library_foundation(tmp_path)
+
+    class FakeTorch:
+        @staticmethod
+        def load(*args, **kwargs):
+            raise failure
+
+    with pytest.raises(LibraryRuntimeError, match="library_checkpoint_restore_failed"):
+        library_backend_module._checkpoint_state(
+            FakeTorch(), b"synthetic-malformed-checkpoint", foundation.resolution
+        )
+
+
+def test_checkpoint_loader_position_matches_accumulation_and_loader_end(
+    tmp_path: Path,
+) -> None:
+    foundation, _, _, _ = _library_foundation(tmp_path)
+    resolution = replace(foundation.resolution, gradient_accumulation=2)
+    loader = ("batch-a", "batch-b", "batch-c")
+
+    library_backend_module._validate_checkpoint_loader_position(
+        {"step": 2, "batches_consumed": 3}, loader, resolution
+    )
+    with pytest.raises(LibraryRuntimeError, match="library_checkpoint_restore_failed"):
+        library_backend_module._validate_checkpoint_loader_position(
+            {"step": 1, "batches_consumed": 1}, loader, resolution
+        )
+
+
+def test_library_runtime_has_one_live_owner_per_run(tmp_path: Path) -> None:
+    foundation, base_backend, sources, _ = _library_foundation(tmp_path)
+
+    class BlockingBackend(DeterministicLibraryBackend):
+        def __init__(self, capability: LibraryCapability) -> None:
+            super().__init__(capability)
+            self.started = Event()
+            self.release = Event()
+
+        def train(self, **kwargs):
+            self.started.set()
+            if not self.release.wait(timeout=5):
+                raise RuntimeError("test backend release timed out")
+            return super().train(**kwargs)
+
+    backend = BlockingBackend(base_backend.probe())
+    adapter = LibraryAdapter(backend, sources, capability=backend.probe())
+    service = RunService(tmp_path, adapter=adapter)
+    launch = foundation.launch(
+        run_id="run-library-single-owner",
+        request_id="request-library-single-owner",
+        artifact_id="artifact-library-single-owner",
+    )
+    runtime_request, run = service._build_execution_records(
+        launch,
+        ContentIdentity("sha256", "9" * 64),
+        attempt_number=1,
+        retry_of=None,
+        recovery_checkpoint=None,
+    )
+    request = FixtureAdapterRequest(
+        foundation.experiment,
+        foundation.resolution,
+        foundation.prepared.version,
+        foundation.prepared.rendered_bytes,
+        runtime_request,
+        run,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(adapter.execute, request)
+        assert backend.started.wait(timeout=5)
+        try:
+            with pytest.raises(LibraryRuntimeError, match="library_run_already_active"):
+                adapter.execute(request)
+        finally:
+            backend.release.set()
+        assert future.result(timeout=10).completed is True
+
+    assert backend.train_calls == 1
+    assert not adapter.resources.leases
+
+
+def test_run_service_serializes_one_run_across_adapter_instances(
+    tmp_path: Path,
+) -> None:
+    foundation, base_backend, sources, _ = _library_foundation(tmp_path)
+
+    class BlockingBackend(DeterministicLibraryBackend):
+        def __init__(self, capability: LibraryCapability) -> None:
+            super().__init__(capability)
+            self.started = Event()
+            self.release = Event()
+
+        def train(self, **kwargs):
+            self.started.set()
+            if not self.release.wait(timeout=5):
+                raise RuntimeError("test backend release timed out")
+            return super().train(**kwargs)
+
+    backend = BlockingBackend(base_backend.probe())
+    first_service = RunService(
+        tmp_path,
+        adapter=LibraryAdapter(backend, sources, capability=backend.probe()),
+    )
+    second_service = RunService(
+        tmp_path,
+        adapter=LibraryAdapter(backend, sources, capability=backend.probe()),
+    )
+    launch = foundation.launch(
+        run_id="run-library-cross-service-owner",
+        request_id="request-library-cross-service-owner",
+        artifact_id="artifact-library-cross-service-owner",
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(first_service.launch, launch)
+        assert backend.started.wait(timeout=5)
+        try:
+            with pytest.raises(
+                ApplicationServiceError, match="run_ownership_unavailable"
+            ):
+                second_service.launch(launch)
+        finally:
+            backend.release.set()
+        assert future.result(timeout=10).status is RunLifecycleStatus.COMPLETED
+
+    with pytest.raises(ApplicationServiceError, match="run_id_already_used"):
+        second_service.launch(launch)
+    assert backend.train_calls == 1
 
 
 def test_local_use_distinguishes_ephemeral_and_saved_sessions_and_batches(

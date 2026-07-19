@@ -1,4 +1,4 @@
-"""Temper-owned runtime planning primitives without hardware execution."""
+"""Temper-owned planning, fixture, and local library runtime ports."""
 
 from temper_ml.runtime.paths import (
     PortableLocation,
@@ -56,9 +56,67 @@ from temper_ml.runtime.fixture_inference import (
     FixtureInferenceRuntime,
     InferenceSettings,
 )
+from temper_ml.runtime.controller import (
+    ControllerSnapshot,
+    ControllerState,
+    ResourceLease,
+    RuntimeControllerError,
+    SerializedResourceCoordinator,
+    SerializedRunController,
+)
+from temper_ml.runtime.library_adapter import (
+    LibraryAdapter,
+    LibraryAdapterExecutionError,
+    LibraryInferenceRuntime,
+    LibraryRuntimeSources,
+    library_training_state_identity,
+)
+from temper_ml.runtime.library_backend import (
+    LibraryBackend,
+    LibraryCapability,
+    LibraryCheckpointPayload,
+    LibraryExecutionContext,
+    LibraryInferenceResult,
+    LibraryRuntimeError,
+    LibraryTrainingResult,
+    TransformersPeftBackend,
+)
+from temper_ml.runtime.library_double import DeterministicLibraryBackend
+from temper_ml.runtime.protocol import (
+    RuntimeMessage,
+    RuntimeMessageKind,
+    RuntimeMessageLedger,
+    RuntimeOperation,
+    RuntimeProtocolError,
+)
+from temper_ml.runtime.staging import (
+    StagingError,
+    TransferDirection,
+    TransferManifest,
+    TransferMember,
+    TransferReceipt,
+    build_transfer_manifest,
+    read_verified_transfer,
+    stage_transfer,
+    verify_transfer,
+)
+from temper_ml.runtime.worker_port import (
+    WorkerInvocation,
+    WorkerLaunchResult,
+    WorkerPortError,
+    WorkerResponse,
+    WslWorkerLauncher,
+    WslWorkerLaunchSpec,
+)
+from temper_ml.runtime.wsl_backend import (
+    WslWorkerBackend,
+    WslWorkerConfig,
+)
 
 __all__ = [
     "ConstraintCheck",
+    "ControllerSnapshot",
+    "ControllerState",
     "ArtifactIntegrityError",
     "ArtifactIntegrityExpectation",
     "ArtifactIntegrityResult",
@@ -79,6 +137,17 @@ __all__ = [
     "FixtureProgress",
     "FixtureTermination",
     "InferenceSettings",
+    "LibraryAdapter",
+    "LibraryAdapterExecutionError",
+    "LibraryBackend",
+    "LibraryCapability",
+    "LibraryCheckpointPayload",
+    "LibraryExecutionContext",
+    "LibraryInferenceResult",
+    "LibraryInferenceRuntime",
+    "LibraryRuntimeError",
+    "LibraryRuntimeSources",
+    "LibraryTrainingResult",
     "PortableLocation",
     "PortablePathError",
     "PreflightError",
@@ -89,17 +158,46 @@ __all__ = [
     "RecipeCatalogEntry",
     "RecipeResolutionError",
     "RecipeResolver",
+    "ResourceLease",
     "ResolutionConstraint",
+    "RuntimeControllerError",
+    "RuntimeMessage",
+    "RuntimeMessageKind",
+    "RuntimeMessageLedger",
+    "RuntimeOperation",
+    "RuntimeProtocolError",
+    "SerializedResourceCoordinator",
+    "SerializedRunController",
+    "StagingError",
+    "TransferDirection",
+    "TransferManifest",
+    "TransferMember",
+    "TransferReceipt",
+    "TransformersPeftBackend",
     "WindowsWslPathMap",
+    "WorkerInvocation",
+    "WorkerLaunchResult",
+    "WorkerPortError",
+    "WorkerResponse",
+    "WslWorkerBackend",
+    "WslWorkerConfig",
+    "WslWorkerLauncher",
+    "WslWorkerLaunchSpec",
     "capture_capability_profile",
     "build_fixture_checkpoint",
+    "build_transfer_manifest",
+    "DeterministicLibraryBackend",
     "estimate_resources",
     "material_change_reasons",
     "preflight",
     "fixture_adapter_bytes",
     "fixture_training_state_identity",
+    "library_training_state_identity",
+    "read_verified_transfer",
     "resolution_view",
     "select_execution_target",
+    "stage_transfer",
+    "verify_transfer",
     "verify_artifact_bundle",
     "verify_export_bundle",
 ]

@@ -51,13 +51,24 @@ from temper_ml.runtime.artifact_integrity import (
     verify_artifact_bundle,
     verify_export_bundle,
 )
-from temper_ml.runtime.fixture_adapter import FIXTURE_ARTIFACT_MEMBERS
+from temper_ml.runtime.fixture_adapter import (
+    FIXTURE_ARTIFACT_MEMBERS,
+    FIXTURE_RUNTIME_IDENTITY,
+)
 from temper_ml.runtime.fixture_inference import (
     FixtureInferenceError,
     FixtureInferenceRequest,
     FixtureInferenceResult,
     FixtureInferenceRuntime,
     InferenceSettings,
+)
+from temper_ml.runtime.library_adapter import LibraryInferenceRuntime
+from temper_ml.runtime.library_backend import LibraryRuntimeError
+from temper_ml.runtime.protocol import RuntimeOperation
+from temper_ml.store.canonical_json import (
+    CanonicalJsonError,
+    dumps_canonical_json,
+    loads_canonical_json,
 )
 from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
 from temper_ml.store.event_stream import EventRequest
@@ -217,13 +228,15 @@ class LocalUseService:
         self,
         project_root: Path | str,
         *,
-        runtime: FixtureInferenceRuntime | None = None,
+        runtime: FixtureInferenceRuntime | LibraryInferenceRuntime | None = None,
     ) -> None:
         self.project_root = Path(project_root)
         self.store = TypedEvidenceStore(self.project_root)
         self.runtime = runtime if runtime is not None else FixtureInferenceRuntime()
-        if not isinstance(self.runtime, FixtureInferenceRuntime):
-            raise ApplicationServiceError("fixture_inference_runtime_invalid")
+        if not isinstance(
+            self.runtime, (FixtureInferenceRuntime, LibraryInferenceRuntime)
+        ):
+            raise ApplicationServiceError("inference_runtime_invalid")
 
     def inspect_artifact(
         self,
@@ -247,14 +260,14 @@ class LocalUseService:
 
         if not isinstance(request, LocalUseRequest) or len(request.inputs) != 1:
             raise ApplicationServiceError("focused_local_use_requires_one_input")
-        return self._infer(request)
+        return self._infer(request, operation=RuntimeOperation.INFER_FOCUSED)
 
     def batch(self, request: LocalUseRequest) -> LocalUseResult:
         """Run one deterministic local batch with settings shared by every input."""
 
         if not isinstance(request, LocalUseRequest):
             raise ApplicationServiceError("local_use_request_invalid")
-        return self._infer(request)
+        return self._infer(request, operation=RuntimeOperation.INFER_BATCH)
 
     def export(self, request: AdapterExportRequest) -> VerifiedAdapterExport:
         """Write and re-verify a portable bundle without deployment semantics."""
@@ -314,7 +327,11 @@ class LocalUseService:
             compatibility_groups=context.artifact.compatibility_groups,
             compatibility_requirements=requirements,
             provenance=context.artifact.provenance,
-            export_format="temper_fixture_adapter_bundle",
+            export_format=(
+                "temper_fixture_adapter_bundle"
+                if context.runtime_request.runtime_identity == FIXTURE_RUNTIME_IDENTITY
+                else "temper_library_adapter_bundle"
+            ),
             storage_reference=StorageReference("export_store", request.export_id),
         )
         try:
@@ -401,7 +418,9 @@ class LocalUseService:
             raise ApplicationServiceError("adapter_export_integrity_mismatch")
         return result
 
-    def _infer(self, request: LocalUseRequest) -> LocalUseResult:
+    def _infer(
+        self, request: LocalUseRequest, *, operation: RuntimeOperation
+    ) -> LocalUseResult:
         context = self._verified_artifact(
             request.artifact,
             request.base_model_revision,
@@ -415,17 +434,38 @@ class LocalUseService:
                 != context.integrity.adapter_identity
             ):
                 raise ApplicationServiceError("local_use_adapter_identity_mismatch")
-            inference = self.runtime.infer(
-                FixtureInferenceRequest(
-                    adapter_bytes=adapter_bytes,
-                    artifact_content_identity=context.artifact.content_identity,
-                    settings=request.settings,
-                    inputs=request.inputs,
-                )
+            inference_request = FixtureInferenceRequest(
+                adapter_bytes=adapter_bytes,
+                artifact_content_identity=context.artifact.content_identity,
+                settings=request.settings,
+                inputs=request.inputs,
             )
+            config = self._artifact_config(context.root)
+            library_artifact = config.get("runtime_kind") == "library"
+            if library_artifact:
+                if not isinstance(self.runtime, LibraryInferenceRuntime):
+                    raise ApplicationServiceError("library_inference_runtime_required")
+                if (
+                    context.runtime_request.runtime_identity
+                    != self.runtime.runtime_identity
+                ):
+                    raise ApplicationServiceError("library_inference_runtime_mismatch")
+                inference = self.runtime.infer_verified(
+                    inference_request,
+                    resolution=context.recipe_resolution,
+                    adapter_config=config,
+                    operation=operation,
+                )
+            else:
+                if (
+                    context.runtime_request.runtime_identity != FIXTURE_RUNTIME_IDENTITY
+                    or not isinstance(self.runtime, FixtureInferenceRuntime)
+                ):
+                    raise ApplicationServiceError("fixture_inference_runtime_required")
+                inference = self.runtime.infer(inference_request)
         except SafeIoError:
             raise ApplicationServiceError("local_use_adapter_unreadable") from None
-        except FixtureInferenceError as exc:
+        except (FixtureInferenceError, LibraryRuntimeError) as exc:
             raise ApplicationServiceError(exc.code) from None
         if request.ephemeral:
             return LocalUseResult(inference, context.integrity, None)
@@ -475,6 +515,17 @@ class LocalUseService:
         except EvidenceError as exc:
             raise ApplicationServiceError(exc.code) from None
         return LocalUseResult(inference, context.integrity, session)
+
+    @staticmethod
+    def _artifact_config(root: Path) -> dict[str, Any]:
+        try:
+            data = read_stable_bytes(root / "adapter_config.json")
+            value = loads_canonical_json(data)
+        except (CanonicalJsonError, SafeIoError, TypeError, ValueError):
+            raise ApplicationServiceError("local_use_adapter_config_invalid") from None
+        if not isinstance(value, dict) or dumps_canonical_json(value) != data:
+            raise ApplicationServiceError("local_use_adapter_config_invalid")
+        return value
 
     def _verified_artifact(
         self,
