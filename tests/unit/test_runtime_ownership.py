@@ -7,6 +7,7 @@ from temper_ml.runtime.ownership import (
     RunOwnershipError,
     claim_released_run_ownership,
     claim_run_ownership,
+    reconcile_run_ownership,
     released_run_claim_identity,
 )
 
@@ -40,6 +41,20 @@ def test_run_ownership_stays_blocked_when_terminal_resolution_is_missing(
     with pytest.raises(RunOwnershipError, match="run_ownership_unresolved"):
         with claim_run_ownership(root, "run-unresolved", CLAIM):
             raise AssertionError("an unresolved claim was reacquired")
+
+
+def test_exact_unresolved_claim_can_be_reconciled_after_terminal_validation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path.resolve()
+
+    with claim_run_ownership(root, "run-reconciled", CLAIM):
+        pass
+
+    assert reconcile_run_ownership(root, "run-reconciled", CLAIM) == CLAIM
+    assert released_run_claim_identity(root, "run-reconciled") == CLAIM
+    with claim_released_run_ownership(root, "run-reconciled", CLAIM):
+        pass
 
 
 def test_released_claim_never_recreates_a_missing_lock(tmp_path: Path) -> None:

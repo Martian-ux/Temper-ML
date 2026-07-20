@@ -26,6 +26,23 @@ Full retention is the default. Nothing is selected implicitly. Runtime control
 files, active staging, unknown byte classes, links/reparse points, non-regular
 files, and every canonical surface fail closed.
 
+### Local filesystem threat boundary
+
+The project-local runtime/output root and its cleanup-control namespace are a
+trusted, cooperatively managed same-user boundary. The project cleanup lease
+serializes cleanup and recovery across cooperating Temper processes. Before
+pathname deletion, Temper moves a selected entry into its execution-scoped
+quarantine and revalidates the quarantined object; detectable substitutions
+fail closed and are never reported as successful removal.
+
+Portable POSIX interfaces do not provide a conditional unlink-by-file-object
+operation. Temper therefore does not claim to defend this local namespace from
+a hostile process running under the same account that deliberately renames and
+replaces a quarantined pathname after its final verification. Such hostile
+same-UID mutation is outside the v1 threat model. The quarantine protocol is a
+concurrency and recovery control for cooperating processes, not a security
+boundary against that attacker.
+
 ## Cleanup protocol
 
 Cleanup has three explicit stages:

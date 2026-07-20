@@ -157,6 +157,14 @@ serializes confirmed attempts and restart reconciliation. Removing an adapter me
 supersedes its availability record; removing or fencing a checkpoint prevents
 the workspace from advertising it as resume-available.
 
+The project-local runtime/output and cleanup-control namespaces are a trusted,
+cooperatively managed same-user boundary. The cleanup lease serializes Temper
+processes, and quarantine plus exact revalidation fails closed for detectable
+pathname substitutions. It does not claim to make portable pathname deletion
+safe against a hostile process running as the same account and deliberately
+rewriting `.temper-fixture-output`; that attacker is outside the v1 local threat
+model.
+
 The CLI exposes the same inventory and planning services as stable JSON:
 
 ```powershell

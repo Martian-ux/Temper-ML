@@ -58,7 +58,13 @@ class RunOwnershipLease:
         except RunOwnershipError:
             raise
         except (OSError, SafeIoError, UnsafeFilesystemPath):
-            raise RunOwnershipError("run_ownership_resolution_failed") from None
+            try:
+                if read_stable_bytes(self.resolution_path) != self.resolution_payload:
+                    raise RunOwnershipError("run_ownership_resolution_conflict")
+            except RunOwnershipError:
+                raise
+            except (OSError, SafeIoError, UnsafeFilesystemPath):
+                raise RunOwnershipError("run_ownership_resolution_failed") from None
         self._resolved = True
 
 
@@ -68,32 +74,12 @@ def released_run_claim_identity(
 ) -> ContentIdentity:
     """Read one exact durable release without creating ownership state."""
 
-    if not isinstance(private_root, Path) or not private_root.is_absolute():
-        raise RunOwnershipError("run_ownership_root_invalid")
-    try:
-        require_identifier("run_id", run_id)
-    except RecordValidationError:
-        raise RunOwnershipError("run_ownership_subject_invalid") from None
+    claim_identity = existing_run_claim_identity(private_root, run_id)
     root = private_root / "runtime-ownership" / run_id
-    claim_path = root / "claim.json"
     resolution_path = root / "resolved.json"
     try:
-        claim_bytes = read_stable_bytes(claim_path)
         resolution_bytes = read_stable_bytes(resolution_path)
-        claim = loads_canonical_json(claim_bytes)
         resolution = loads_canonical_json(resolution_bytes)
-        if not isinstance(claim, dict) or set(claim) != {
-            "schema_version",
-            "run_id",
-            "claim_identity",
-        }:
-            raise RunOwnershipError("run_ownership_claim_conflict")
-        if claim.get("schema_version") != "v1" or claim.get("run_id") != run_id:
-            raise RunOwnershipError("run_ownership_claim_conflict")
-        raw_identity = claim.get("claim_identity")
-        if not isinstance(raw_identity, dict):
-            raise RunOwnershipError("run_ownership_claim_conflict")
-        claim_identity = parse_identity(raw_identity, field="run ownership claim")
         expected_resolution = {
             "schema_version": "v1",
             "run_id": run_id,
@@ -102,9 +88,7 @@ def released_run_claim_identity(
         }
         if resolution != expected_resolution:
             raise RunOwnershipError("run_ownership_resolution_conflict")
-        if claim_bytes != dumps_canonical_json(claim) or resolution_bytes != (
-            dumps_canonical_json(expected_resolution)
-        ):
+        if resolution_bytes != dumps_canonical_json(expected_resolution):
             raise RunOwnershipError("run_ownership_resolution_conflict")
         return claim_identity
     except RunOwnershipError:
@@ -122,6 +106,75 @@ def released_run_claim_identity(
         raise RunOwnershipError("run_ownership_resolution_conflict") from None
 
 
+def existing_run_claim_identity(
+    private_root: Path,
+    run_id: str,
+) -> ContentIdentity:
+    """Read and validate one immutable claim whether or not it is resolved."""
+
+    if not isinstance(private_root, Path) or not private_root.is_absolute():
+        raise RunOwnershipError("run_ownership_root_invalid")
+    try:
+        require_identifier("run_id", run_id)
+    except RecordValidationError:
+        raise RunOwnershipError("run_ownership_subject_invalid") from None
+    claim_path = private_root / "runtime-ownership" / run_id / "claim.json"
+    try:
+        claim_bytes = read_stable_bytes(claim_path)
+        claim = loads_canonical_json(claim_bytes)
+        if not isinstance(claim, dict) or set(claim) != {
+            "schema_version",
+            "run_id",
+            "claim_identity",
+        }:
+            raise RunOwnershipError("run_ownership_claim_conflict")
+        if claim.get("schema_version") != "v1" or claim.get("run_id") != run_id:
+            raise RunOwnershipError("run_ownership_claim_conflict")
+        raw_identity = claim.get("claim_identity")
+        if not isinstance(raw_identity, dict):
+            raise RunOwnershipError("run_ownership_claim_conflict")
+        claim_identity = parse_identity(raw_identity, field="run ownership claim")
+        if claim_bytes != dumps_canonical_json(claim):
+            raise RunOwnershipError("run_ownership_claim_conflict")
+        return claim_identity
+    except RunOwnershipError:
+        raise
+    except FileNotFoundError:
+        raise RunOwnershipError("run_ownership_claim_missing") from None
+    except (
+        OSError,
+        SafeIoError,
+        UnsafeFilesystemPath,
+        RecordValidationError,
+        TypeError,
+        ValueError,
+    ):
+        raise RunOwnershipError("run_ownership_claim_conflict") from None
+
+
+def reconcile_run_ownership(
+    private_root: Path,
+    run_id: str,
+    claim_identity: ContentIdentity,
+) -> ContentIdentity:
+    """Resolve one exact existing claim after its caller verifies run terminality."""
+
+    if existing_run_claim_identity(private_root, run_id) != claim_identity:
+        raise RunOwnershipError("run_ownership_claim_conflict")
+    with _claim_run_ownership(
+        private_root,
+        run_id,
+        claim_identity,
+        allow_create=False,
+        require_resolved=False,
+    ) as lease:
+        lease.resolve()
+    released = released_run_claim_identity(private_root, run_id)
+    if released != claim_identity:
+        raise RunOwnershipError("run_ownership_resolution_conflict")
+    return released
+
+
 @contextmanager
 def claim_run_ownership(
     private_root: Path,
@@ -135,6 +188,7 @@ def claim_run_ownership(
         run_id,
         claim_identity,
         allow_create=True,
+        require_resolved=True,
     ) as lease:
         yield lease
 
@@ -152,6 +206,7 @@ def claim_released_run_ownership(
         run_id,
         claim_identity,
         allow_create=False,
+        require_resolved=True,
     ) as lease:
         yield lease
 
@@ -163,6 +218,7 @@ def _claim_run_ownership(
     claim_identity: ContentIdentity,
     *,
     allow_create: bool,
+    require_resolved: bool,
 ) -> Iterator[RunOwnershipLease]:
     """Implement creating launch claims and non-creating released claims."""
 
@@ -248,7 +304,8 @@ def _claim_run_ownership(
                 if existing_resolution is not None:
                     raise RunOwnershipError("run_ownership_resolution_conflict")
             elif existing_resolution is None:
-                raise RunOwnershipError("run_ownership_unresolved")
+                if require_resolved:
+                    raise RunOwnershipError("run_ownership_unresolved")
             elif read_stable_bytes(resolution_path) != resolution:
                 raise RunOwnershipError("run_ownership_resolution_conflict")
         except RunOwnershipError:

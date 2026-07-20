@@ -9,6 +9,7 @@ from temper_ml.domain.records import (
     record_reference,
 )
 from temper_ml.store.evidence import (
+    EvidenceError,
     EvidenceExists,
     StoredTypedRecord,
     TypedEvidenceStore,
@@ -39,6 +40,14 @@ def write_record_idempotently(
         return store.write_record(record)
     except EvidenceExists:
         stored = store.read_record(record_reference(record))
+        if stored.envelope.to_dict() != record.to_dict():
+            raise ApplicationServiceError(conflict_code) from None
+        return stored
+    except EvidenceError as error:
+        try:
+            stored = store.read_record(record_reference(record))
+        except EvidenceError:
+            raise error
         if stored.envelope.to_dict() != record.to_dict():
             raise ApplicationServiceError(conflict_code) from None
         return stored

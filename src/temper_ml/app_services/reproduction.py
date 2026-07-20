@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, replace as dataclass_replace
+import errno
 import hashlib
+import importlib
+import os
 from pathlib import Path
+import stat
+from typing import Any
 
 from temper_ml.app_services.errors import ApplicationServiceError
 from temper_ml.app_services.experiments import ReplayMode, ReplayPlan
 from temper_ml.app_services.runs import (
+    RUNTIME_OUTPUT_DIRECTORY,
     RunExecutionResult,
     RunLaunchRequest,
     RunLifecycleStatus,
@@ -28,6 +35,14 @@ from temper_ml.domain.records import (
 from temper_ml.domain.runs import ResolvedRuntimeRequest, Run
 from temper_ml.runtime.fixture_adapter import FixtureAdapter, FixtureControl
 from temper_ml.runtime.preflight import PreflightError, PreflightResult, preflight
+from temper_ml.filesystem import (
+    UnsafeFilesystemPath,
+    ensure_safe_directory,
+    is_link_or_reparse,
+    require_safe_regular_file,
+    safe_path_stat,
+    same_file_object,
+)
 from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
 from temper_ml.store.event_stream import EventRequest, StoredEvent
 
@@ -144,6 +159,7 @@ class _ReplayIntent:
     run_identity: ContentIdentity
     request_id: str
     runtime_request_identity: ContentIdentity
+    run_ownership_identity: ContentIdentity | None
     artifact_id: str
     source_experiment_id: str
     source_experiment_identity: ContentIdentity
@@ -160,8 +176,10 @@ class _ReplayIntent:
         return f"replay-{execution_key}"
 
     def to_payload(self) -> dict[str, object]:
-        return {
-            "intent_schema_version": "v2",
+        payload: dict[str, object] = {
+            "intent_schema_version": (
+                "v3" if self.run_ownership_identity is not None else "v2"
+            ),
             "plan_id": self.plan_id,
             "mode": self.mode.value,
             "candidate_key": self.candidate_key,
@@ -183,6 +201,11 @@ class _ReplayIntent:
                 self.planned_manifest_identity
             ),
         }
+        if self.run_ownership_identity is not None:
+            payload["run_ownership_identity"] = identity_fields(
+                self.run_ownership_identity
+            )
+        return payload
 
     def terminal_payload(
         self,
@@ -190,8 +213,10 @@ class _ReplayIntent:
         *,
         failure_code: str | None = None,
     ) -> dict[str, object]:
-        return {
-            "intent_schema_version": "v2",
+        payload: dict[str, object] = {
+            "intent_schema_version": (
+                "v3" if self.run_ownership_identity is not None else "v2"
+            ),
             "plan_id": self.plan_id,
             "mode": self.mode.value,
             "candidate_key": self.candidate_key,
@@ -203,6 +228,11 @@ class _ReplayIntent:
             "adapted_reproduction": self.mode is ReplayMode.ADAPTED,
             "failure_code": failure_code,
         }
+        if self.run_ownership_identity is not None:
+            payload["run_ownership_identity"] = identity_fields(
+                self.run_ownership_identity
+            )
+        return payload
 
 
 class ReproductionService:
@@ -243,6 +273,9 @@ class ReproductionService:
             run_identity=expected_run.identity,
             request_id=launch.request_id,
             runtime_request_identity=expected_request.identity,
+            run_ownership_identity=(
+                run_service.planned_first_attempt_ownership(launch)
+            ),
             artifact_id=launch.artifact_id,
             source_experiment_id=plan.source_experiment.experiment_id,
             source_experiment_identity=plan.source_experiment.identity,
@@ -251,8 +284,36 @@ class ReproductionService:
             source_manifest_identity=plan.source_experiment.manifest_identity,
             planned_manifest_identity=plan.planned_experiment.manifest_identity,
         )
+        with self._claim_replay_execution(intent.stream_id):
+            return self._execute_locked(
+                request,
+                intent,
+                run_service,
+                expected_request,
+                expected_run,
+                control=control,
+            )
+
+    def _execute_locked(
+        self,
+        request: ReplayExecutionRequest,
+        intent: _ReplayIntent,
+        run_service: RunService,
+        expected_request: ResolvedRuntimeRequest,
+        expected_run: Run,
+        *,
+        control: FixtureControl | None,
+    ) -> ReplayExecutionResult | ReplayReconciliationResult:
+        """Execute or reconcile while holding the exact replay stream lease."""
+
+        plan = request.plan
+        launch = request.launch
         events = self._replay_events(intent.stream_id)
-        _, terminal = self._validate_replay_events(events, expected_intent=intent)
+        durable_intent, terminal = self._validate_replay_events(
+            events, expected_intent=intent
+        )
+        if durable_intent is not None:
+            intent = durable_intent
         if terminal is not None:
             return terminal
         if not events:
@@ -265,9 +326,13 @@ class ReproductionService:
                 ),
             )
         else:
-            reconciled = self._reconcile_intent(intent, run_service)
+            reconciled = self._reconcile_intent(intent, run_service, abandoned=True)
             if reconciled is not None:
-                self._append_terminal(intent, reconciled.status)
+                self._append_terminal(
+                    intent,
+                    reconciled.status,
+                    failure_code=reconciled.failure_code,
+                )
                 return reconciled
             if self._run_status_or_none(run_service, intent.run_id) is not None:
                 raise ApplicationServiceError("replay_reconciliation_required")
@@ -289,6 +354,11 @@ class ReproductionService:
                 }:
                     return reconciled
                 raise
+            if exc.code == "run_ownership_unavailable" and (
+                self._run_status_or_none(run_service, intent.run_id)
+                is RunLifecycleStatus.RUNNING
+            ):
+                raise ApplicationServiceError("replay_execution_active") from None
             try:
                 self._append_terminal(
                     intent,
@@ -304,6 +374,10 @@ class ReproductionService:
             or result.run.run_id != launch.run_id
         ):
             raise ApplicationServiceError("replay_run_identity_mismatch")
+        run_service.reconcile_terminal_ownership(
+            intent.run_id,
+            intent.run_ownership_identity,
+        )
         self._append_terminal(intent, result.status)
         return ReplayExecutionResult(plan, result)
 
@@ -329,23 +403,34 @@ class ReproductionService:
         run_service = RunService(self.project_root, adapter=self.adapter)
         results: list[ReplayReconciliationResult] = []
         for snapshot in streams:
-            intent, terminal = self._validate_replay_events(snapshot.events)
-            if intent is None:
-                continue
-            if snapshot.stream_id != intent.stream_id:
-                raise ApplicationServiceError("replay_execution_evidence_conflict")
-            if terminal is not None:
-                results.append(terminal)
-                continue
-            reconciled = self._reconcile_intent(intent, run_service)
-            if reconciled is None:
-                continue
-            self._append_terminal(
-                intent,
-                reconciled.status,
-                failure_code=reconciled.failure_code,
-            )
-            results.append(reconciled)
+            try:
+                with self._claim_replay_execution(snapshot.stream_id):
+                    current = self._replay_events(snapshot.stream_id)
+                    intent, terminal = self._validate_replay_events(current)
+                    if intent is None:
+                        continue
+                    if snapshot.stream_id != intent.stream_id:
+                        raise ApplicationServiceError(
+                            "replay_execution_evidence_conflict"
+                        )
+                    if terminal is not None:
+                        results.append(terminal)
+                        continue
+                    reconciled = self._reconcile_intent(
+                        intent, run_service, abandoned=True
+                    )
+                    if reconciled is None:
+                        continue
+                    self._append_terminal(
+                        intent,
+                        reconciled.status,
+                        failure_code=reconciled.failure_code,
+                    )
+                    results.append(reconciled)
+            except ApplicationServiceError as exc:
+                if exc.code == "replay_execution_busy":
+                    continue
+                raise
         return tuple(results)
 
     def reconcile_plan(
@@ -440,7 +525,14 @@ class ReproductionService:
         self,
         intent: _ReplayIntent,
         run_service: RunService,
+        *,
+        abandoned: bool = False,
     ) -> ReplayReconciliationResult | None:
+        run_service.reconcile_launch_record_set(
+            intent.run_id,
+            intent.runtime_request_identity,
+            intent.run_identity,
+        )
         try:
             records = tuple(item.record for item in self.store.iter_records())
         except EvidenceError as exc:
@@ -470,14 +562,22 @@ class ReproductionService:
             and item.experiment_id == intent.planned_experiment_id
             and item.identity == intent.planned_experiment_identity
         )
+        if len(source_experiments) != 1 or len(planned_experiments) != 1:
+            raise ApplicationServiceError("replay_execution_evidence_conflict")
         if not runs and not requests:
-            return None
-        if (
-            len(runs) != 1
-            or len(requests) != 1
-            or len(source_experiments) != 1
-            or len(planned_experiments) != 1
-        ):
+            if not abandoned:
+                return None
+            return ReplayReconciliationResult(
+                intent.plan_id,
+                intent.mode,
+                intent.candidate_key,
+                intent.run_id,
+                intent.run_identity,
+                intent.runtime_request_identity,
+                RunLifecycleStatus.FAILED,
+                "run_launch_record_persistence_failed",
+            )
+        if len(runs) != 1 or len(requests) != 1:
             raise ApplicationServiceError("replay_execution_evidence_conflict")
         run = runs[0]
         runtime_request = requests[0]
@@ -521,7 +621,7 @@ class ReproductionService:
         launch_evidence_failed = (
             status is RunLifecycleStatus.FAILED
             and not launched
-            and terminal.payload.get("phase") == "launch_evidence"
+            and terminal.payload.get("phase") in {"launch_evidence", "launch_records"}
         )
         if not launch_evidence_failed and (
             len(launched) != 1
@@ -557,6 +657,10 @@ class ReproductionService:
                 != artifacts[0].identity
             ):
                 raise ApplicationServiceError("replay_execution_evidence_conflict")
+        run_service.reconcile_terminal_ownership(
+            intent.run_id,
+            intent.run_ownership_identity,
+        )
         return ReplayReconciliationResult(
             intent.plan_id,
             intent.mode,
@@ -613,7 +717,9 @@ class ReproductionService:
         ):
             raise ApplicationServiceError("replay_execution_evidence_conflict")
         intent = _intent_from_payload(events[0].payload)
-        if expected_intent is not None and intent != expected_intent:
+        if expected_intent is not None and not _intents_compatible(
+            intent, expected_intent
+        ):
             raise ApplicationServiceError("replay_execution_evidence_conflict")
         if events[0].idempotency_key != f"{intent.stream_id}-started":
             raise ApplicationServiceError("replay_execution_evidence_conflict")
@@ -665,6 +771,18 @@ class ReproductionService:
         try:
             self.store.append_event(stream_id, request)
         except EvidenceError as exc:
+            try:
+                matches = tuple(
+                    event
+                    for event in self._replay_events(stream_id)
+                    if event.idempotency_key == request.idempotency_key
+                )
+            except ApplicationServiceError:
+                matches = ()
+            if len(matches) == 1 and matches[0].request_fields() == (
+                request.canonical_fields()
+            ):
+                return
             raise ApplicationServiceError(exc.code) from None
 
     def _append_terminal(
@@ -677,6 +795,13 @@ class ReproductionService:
         event_type = _REPLAY_TERMINAL_EVENT_BY_STATUS.get(status)
         if event_type is None:
             raise ApplicationServiceError("replay_terminal_status_invalid")
+        _, existing = self._validate_replay_events(
+            self._replay_events(intent.stream_id), expected_intent=intent
+        )
+        if existing is not None:
+            if existing.status == status and existing.failure_code == failure_code:
+                return
+            raise ApplicationServiceError("replay_execution_evidence_conflict")
         suffix = event_type.removeprefix("replay_execution_")
         self._append_replay_event(
             intent.stream_id,
@@ -690,6 +815,96 @@ class ReproductionService:
             self.store.verify()
         except EvidenceError as exc:
             raise ApplicationServiceError(exc.code) from None
+        _, durable = self._validate_replay_events(
+            self._replay_events(intent.stream_id), expected_intent=intent
+        )
+        if (
+            durable is None
+            or durable.status != status
+            or durable.failure_code != failure_code
+        ):
+            raise ApplicationServiceError("replay_execution_evidence_conflict")
+
+    @contextmanager
+    def _claim_replay_execution(self, stream_id: str) -> Iterator[None]:
+        """Hold one non-blocking cross-process lease for an exact replay stream."""
+
+        try:
+            require_identifier("replay_stream_id", stream_id)
+        except RecordValidationError:
+            raise ApplicationServiceError(
+                "replay_execution_evidence_conflict"
+            ) from None
+        lock_path = (
+            Path(os.path.abspath(self.project_root / RUNTIME_OUTPUT_DIRECTORY))
+            / "runtime-ownership"
+            / "replay"
+            / stream_id
+            / "lease.lock"
+        )
+        try:
+            ensure_safe_directory(lock_path.parent)
+            existing = safe_path_stat(lock_path, allow_missing=True)
+            if existing is not None and not stat.S_ISREG(existing.st_mode):
+                raise ApplicationServiceError("replay_execution_lock_invalid")
+            flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            descriptor = os.open(lock_path, flags, 0o600)
+        except ApplicationServiceError:
+            raise
+        except (OSError, UnsafeFilesystemPath):
+            raise ApplicationServiceError("replay_execution_lock_unavailable") from None
+        with os.fdopen(descriptor, "r+b") as handle:
+            locked = False
+            try:
+                opened = os.fstat(handle.fileno())
+                current = require_safe_regular_file(lock_path)
+                if (
+                    is_link_or_reparse(opened)
+                    or not stat.S_ISREG(opened.st_mode)
+                    or not same_file_object(opened, current)
+                    or opened.st_nlink != 1
+                ):
+                    raise ApplicationServiceError("replay_execution_lock_invalid")
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                if size == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                elif size != 1:
+                    raise ApplicationServiceError("replay_execution_lock_invalid")
+                handle.seek(0)
+                _lock_replay_handle(handle)
+                locked = True
+                opened = os.fstat(handle.fileno())
+                current = require_safe_regular_file(lock_path)
+                handle.seek(0)
+                if (
+                    not same_file_object(opened, current)
+                    or opened.st_nlink != 1
+                    or opened.st_size != 1
+                    or handle.read(1) != b"\0"
+                ):
+                    raise ApplicationServiceError("replay_execution_lock_invalid")
+                yield
+            except ApplicationServiceError:
+                raise
+            except (OSError, UnsafeFilesystemPath):
+                raise ApplicationServiceError(
+                    "replay_execution_lock_unavailable"
+                ) from None
+            finally:
+                if locked:
+                    try:
+                        handle.seek(0)
+                        _unlock_replay_handle(handle)
+                    except OSError:
+                        pass
 
 
 def _intent_from_payload(payload: Mapping[str, object]) -> _ReplayIntent:
@@ -710,7 +925,12 @@ def _intent_from_payload(payload: Mapping[str, object]) -> _ReplayIntent:
         "source_manifest_identity",
         "planned_manifest_identity",
     }
-    if set(payload) != required or payload.get("intent_schema_version") != "v2":
+    schema_version = payload.get("intent_schema_version")
+    if schema_version == "v3":
+        required.add("run_ownership_identity")
+    elif schema_version != "v2":
+        raise ApplicationServiceError("replay_execution_evidence_conflict")
+    if set(payload) != required:
         raise ApplicationServiceError("replay_execution_evidence_conflict")
     try:
         mode = ReplayMode(payload.get("mode"))
@@ -726,6 +946,11 @@ def _intent_from_payload(payload: Mapping[str, object]) -> _ReplayIntent:
             request_id=_required_identifier(payload, "request_id"),
             runtime_request_identity=_payload_identity(
                 payload, "runtime_request_identity"
+            ),
+            run_ownership_identity=(
+                _payload_identity(payload, "run_ownership_identity")
+                if schema_version == "v3"
+                else None
             ),
             artifact_id=_required_identifier(payload, "artifact_id"),
             source_experiment_id=_required_identifier(payload, "source_experiment_id"),
@@ -764,6 +989,48 @@ def _intent_from_payload(payload: Mapping[str, object]) -> _ReplayIntent:
         return intent
     except (ApplicationServiceError, RecordValidationError, TypeError, ValueError):
         raise ApplicationServiceError("replay_execution_evidence_conflict") from None
+
+
+def _intents_compatible(first: _ReplayIntent, second: _ReplayIntent) -> bool:
+    """Permit a legacy v2 intent only when every shared identity is exact."""
+
+    if first == second:
+        return True
+    first_without_claim = dataclass_replace(first, run_ownership_identity=None)
+    second_without_claim = dataclass_replace(second, run_ownership_identity=None)
+    return first_without_claim == second_without_claim and (
+        first.run_ownership_identity is None
+        or second.run_ownership_identity is None
+        or first.run_ownership_identity == second.run_ownership_identity
+    )
+
+
+def _lock_replay_handle(handle: Any) -> None:
+    try:
+        if os.name == "nt":
+            msvcrt: Any = importlib.import_module("msvcrt")
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl: Any = importlib.import_module("fcntl")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        deadlock = getattr(errno, "EDEADLK", None)
+        if (
+            isinstance(exc, BlockingIOError)
+            or exc.errno in {errno.EACCES, errno.EAGAIN}
+            or (deadlock is not None and exc.errno == deadlock)
+        ):
+            raise ApplicationServiceError("replay_execution_busy") from None
+        raise ApplicationServiceError("replay_execution_lock_unavailable") from None
+
+
+def _unlock_replay_handle(handle: Any) -> None:
+    if os.name == "nt":
+        msvcrt: Any = importlib.import_module("msvcrt")
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl: Any = importlib.import_module("fcntl")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _required_identifier(payload: Mapping[str, object], field: str) -> str:

@@ -88,6 +88,7 @@ from temper_ml.runtime.ownership import (
 
 RUNTIME_OUTPUT_DIRECTORY = ".temper-fixture-output"
 CLEANUP_LOCK_LOGICAL_KEY = "runtime-ownership/cleanup/lease.lock"
+CLEANUP_QUARANTINE_ROOT = "runtime-ownership/cleanup-quarantine"
 INVENTORY_PROJECTION = HashProjection("retention.inventory", "v1")
 ENTRY_PROJECTION = HashProjection("retention.inventory_entry", "v1")
 PHYSICAL_GROUP_PROJECTION = HashProjection("retention.physical_group", "v1")
@@ -378,6 +379,7 @@ class RetentionService:
         project_root: Path | str,
         *,
         _remove_file: Callable[[Path], None] | None = None,
+        _move_file: Callable[[Path, Path], None] | None = None,
         _execution_id_factory: Callable[[], str] | None = None,
         _hash_chunk_size: int = _HASH_CHUNK_BYTES,
     ) -> None:
@@ -385,6 +387,7 @@ class RetentionService:
         self.store = TypedEvidenceStore(self.project_root)
         self._cleanup_lock_held = False
         self._remove_file = _remove_file if _remove_file is not None else os.unlink
+        self._move_file = _move_file if _move_file is not None else os.rename
         self._execution_id_factory = (
             _execution_id_factory
             if _execution_id_factory is not None
@@ -393,6 +396,8 @@ class RetentionService:
         self._hash_chunk_size = _hash_chunk_size
         if not callable(self._remove_file):
             raise ApplicationServiceError("cleanup_remove_strategy_invalid")
+        if not callable(self._move_file):
+            raise ApplicationServiceError("cleanup_move_strategy_invalid")
         if not callable(self._execution_id_factory):
             raise ApplicationServiceError("cleanup_execution_id_factory_invalid")
         if (
@@ -793,6 +798,7 @@ class RetentionService:
                 try:
                     self._unlink_verified(
                         entry,
+                        execution_id=intent.execution_id,
                         expected_link_count=(
                             entry._signature[-1]
                             - removed_by_group[entry.physical_group_id]
@@ -904,6 +910,7 @@ class RetentionService:
         self,
         entry: InventoryEntry,
         *,
+        execution_id: str,
         expected_link_count: int,
     ) -> None:
         expected_signature = (*entry._signature[:-1], expected_link_count)
@@ -927,9 +934,21 @@ class RetentionService:
             raise _RemovalError(
                 "cleanup_object_removal_ambiguous", CleanupObjectStatus.AMBIGUOUS
             ) from None
+        quarantine = self._quarantine_path(
+            execution_id,
+            entry.entry_id,
+            entry._path.name,
+        )
         try:
-            self._remove_file(entry._path)
-        except OSError:
+            ensure_safe_directory(quarantine.parent)
+            if safe_path_stat(quarantine, allow_missing=True) is not None:
+                raise _RemovalError(
+                    "cleanup_quarantine_conflict", CleanupObjectStatus.AMBIGUOUS
+                )
+            self._move_file(entry._path, quarantine)
+        except _RemovalError:
+            raise
+        except (OSError, UnsafeFilesystemPath):
             if self._entry_still_matches(
                 entry, expected_link_count=expected_link_count
             ):
@@ -939,19 +958,49 @@ class RetentionService:
             raise _RemovalError(
                 "cleanup_object_removal_ambiguous", CleanupObjectStatus.AMBIGUOUS
             ) from None
+        if not self._path_matches(
+            entry,
+            quarantine,
+            expected_link_count=expected_link_count,
+        ):
+            self._restore_quarantined(entry, quarantine, expected_link_count)
+            raise _RemovalError("cleanup_object_changed", CleanupObjectStatus.AMBIGUOUS)
+        # Portable deletion is pathname-based. The project lease excludes
+        # cooperating Temper processes; this final quarantine revalidation
+        # detects substitutions before deletion. Hostile same-UID mutation of
+        # the trusted runtime-control namespace is outside the documented v1
+        # local threat model.
         try:
-            remaining = safe_path_stat(entry._path, allow_missing=True)
+            self._remove_file(quarantine)
+        except OSError:
+            try:
+                remaining = safe_path_stat(quarantine, allow_missing=True)
+            except (OSError, UnsafeFilesystemPath):
+                remaining = None
+            if remaining is not None and self._path_matches(
+                entry,
+                quarantine,
+                expected_link_count=expected_link_count,
+            ):
+                if self._restore_quarantined(entry, quarantine, expected_link_count):
+                    raise _RemovalError(
+                        "cleanup_object_remove_failed",
+                        CleanupObjectStatus.RETAINED,
+                    ) from None
+                raise _RemovalError(
+                    "cleanup_object_removal_ambiguous",
+                    CleanupObjectStatus.AMBIGUOUS,
+                ) from None
+            raise _RemovalError(
+                "cleanup_object_removal_ambiguous", CleanupObjectStatus.AMBIGUOUS
+            ) from None
+        try:
+            remaining = safe_path_stat(quarantine, allow_missing=True)
         except (OSError, UnsafeFilesystemPath):
             raise _RemovalError(
                 "cleanup_object_removal_ambiguous", CleanupObjectStatus.AMBIGUOUS
             ) from None
         if remaining is not None:
-            if self._entry_still_matches(
-                entry, expected_link_count=expected_link_count
-            ):
-                raise _RemovalError(
-                    "cleanup_object_remove_failed", CleanupObjectStatus.RETAINED
-                )
             raise _RemovalError(
                 "cleanup_object_removal_ambiguous", CleanupObjectStatus.AMBIGUOUS
             )
@@ -962,16 +1011,60 @@ class RetentionService:
         *,
         expected_link_count: int,
     ) -> bool:
+        return self._path_matches(
+            entry,
+            entry._path,
+            expected_link_count=expected_link_count,
+        )
+
+    def _path_matches(
+        self,
+        entry: InventoryEntry,
+        path: Path,
+        *,
+        expected_link_count: int,
+    ) -> bool:
         try:
-            snapshot = _stream_file_snapshot(
-                entry._path, chunk_size=self._hash_chunk_size
-            )
+            snapshot = _stream_file_snapshot(path, chunk_size=self._hash_chunk_size)
         except (FileNotFoundError, OSError, SafeIoError, UnsafeFilesystemPath):
             return False
         return (
             snapshot.signature == (*entry._signature[:-1], expected_link_count)
             and snapshot.byte_count == entry.byte_count
             and snapshot.content_identity == entry.content_identity
+        )
+
+    def _restore_quarantined(
+        self,
+        entry: InventoryEntry,
+        quarantine: Path,
+        expected_link_count: int,
+    ) -> bool:
+        try:
+            if safe_path_stat(entry._path, allow_missing=True) is not None:
+                return False
+            self._move_file(quarantine, entry._path)
+        except (OSError, UnsafeFilesystemPath):
+            return False
+        return self._entry_still_matches(entry, expected_link_count=expected_link_count)
+
+    def _quarantine_path(
+        self,
+        execution_id: str,
+        entry_id: str,
+        file_name: str,
+    ) -> Path:
+        try:
+            require_identifier("execution_id", execution_id)
+            require_identifier("entry_id", entry_id)
+        except RecordValidationError:
+            raise ApplicationServiceError("cleanup_intent_invalid") from None
+        return (
+            self._runtime_root()
+            / CLEANUP_QUARANTINE_ROOT
+            / execution_id
+            / entry_id
+            / file_name
         )
 
     def _intent_from_plan(
@@ -1688,6 +1781,10 @@ class RetentionService:
             raise ApplicationServiceError("cleanup_intent_invalid")
         statuses: dict[str, CleanupObjectStatus] = {}
         for item in intent.objects:
+            quarantined = self._reconcile_quarantined_status(intent, item)
+            if quarantined is not None:
+                statuses[item.entry_id] = quarantined
+                continue
             if item.entry_id in recorded_removed:
                 statuses[item.entry_id] = CleanupObjectStatus.REMOVED
                 continue
@@ -1716,6 +1813,56 @@ class RetentionService:
             except (OSError, SafeIoError, UnsafeFilesystemPath):
                 raise ApplicationServiceError("cleanup_reconciliation_unsafe") from None
         return statuses
+
+    def _reconcile_quarantined_status(
+        self,
+        intent: _CleanupIntent,
+        item: _CleanupIntentObject,
+    ) -> CleanupObjectStatus | None:
+        original = self._runtime_root().joinpath(*PurePosixPath(item.logical_key).parts)
+        quarantine = self._quarantine_path(
+            intent.execution_id,
+            item.entry_id,
+            PurePosixPath(item.logical_key).name,
+        )
+        try:
+            if safe_path_stat(quarantine, allow_missing=True) is None:
+                return None
+            snapshot = _stream_file_snapshot(
+                quarantine, chunk_size=self._hash_chunk_size
+            )
+        except (OSError, SafeIoError, UnsafeFilesystemPath):
+            return CleanupObjectStatus.AMBIGUOUS
+        if (
+            snapshot.byte_count != item.byte_count
+            or snapshot.content_identity != item.content_identity
+        ):
+            return CleanupObjectStatus.AMBIGUOUS
+        try:
+            self._remove_file(quarantine)
+        except OSError:
+            try:
+                remaining = safe_path_stat(quarantine, allow_missing=True)
+            except (OSError, UnsafeFilesystemPath):
+                return CleanupObjectStatus.AMBIGUOUS
+            if remaining is None:
+                return CleanupObjectStatus.REMOVED
+            try:
+                if safe_path_stat(original, allow_missing=True) is None:
+                    self._move_file(quarantine, original)
+                    if self._intent_object_still_matches(item):
+                        return CleanupObjectStatus.RETAINED
+            except (OSError, UnsafeFilesystemPath):
+                pass
+            return CleanupObjectStatus.AMBIGUOUS
+        try:
+            return (
+                CleanupObjectStatus.REMOVED
+                if safe_path_stat(quarantine, allow_missing=True) is None
+                else CleanupObjectStatus.AMBIGUOUS
+            )
+        except (OSError, UnsafeFilesystemPath):
+            return CleanupObjectStatus.AMBIGUOUS
 
     def _append_cleanup(
         self,

@@ -75,6 +75,8 @@ from temper_ml.runtime.ownership import (
     RunOwnershipError,
     RunOwnershipLease,
     claim_run_ownership,
+    reconcile_run_ownership,
+    released_run_claim_identity,
 )
 from temper_ml.runtime.preflight import (
     PreflightError,
@@ -308,6 +310,21 @@ class RunService:
         return self._build_execution_records(
             request,
             preflight_identity,
+            attempt_number=1,
+            retry_of=None,
+            recovery_checkpoint=None,
+        )
+
+    def planned_first_attempt_ownership(
+        self,
+        request: RunLaunchRequest,
+    ) -> ContentIdentity:
+        """Derive the exact durable ownership claim for a first attempt."""
+
+        if not isinstance(request, RunLaunchRequest):
+            raise ApplicationServiceError("run_launch_request_invalid")
+        return self._ownership_identity(
+            request,
             attempt_number=1,
             retry_of=None,
             recovery_checkpoint=None,
@@ -889,6 +906,113 @@ class RunService:
         status, _ = validated_run_lifecycle(events)
         return status
 
+    def reconcile_launch_record_set(
+        self,
+        run_id: str,
+        runtime_request_identity: ContentIdentity,
+        run_identity: ContentIdentity,
+    ) -> RunLifecycleStatus | None:
+        """Repair a first-attempt record prefix and terminalize before execution."""
+
+        try:
+            require_identifier("run_id", run_id)
+        except RecordValidationError:
+            raise ApplicationServiceError("run_id_invalid") from None
+        if not isinstance(runtime_request_identity, ContentIdentity) or not isinstance(
+            run_identity, ContentIdentity
+        ):
+            raise ApplicationServiceError("run_launch_record_reconciliation_invalid")
+        try:
+            records = tuple(stored.record for stored in self.store.iter_records())
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        requests = tuple(
+            record
+            for record in records
+            if isinstance(record, ResolvedRuntimeRequest)
+            and record.identity == runtime_request_identity
+        )
+        runs = tuple(
+            record
+            for record in records
+            if isinstance(record, Run) and record.run_id == run_id
+        )
+        if not requests and not runs:
+            return None
+        if len(requests) != 1 or len(runs) > 1:
+            raise ApplicationServiceError("run_launch_record_reconciliation_conflict")
+        runtime_request = requests[0]
+        expected_run = Run(
+            run_id=run_id,
+            experiment=runtime_request.experiment,
+            experiment_manifest_identity=(runtime_request.experiment_manifest_identity),
+            attempt_number=1,
+            hardware_capability_profile=(runtime_request.hardware_capability_profile),
+            execution_target=runtime_request.execution_target,
+            runtime_identity=runtime_request.runtime_identity,
+            request_identity=runtime_request.identity,
+            training_state_identity=runtime_request.training_state_identity,
+            retry_of=None,
+        )
+        if expected_run.identity != run_identity:
+            raise ApplicationServiceError("run_launch_record_reconciliation_conflict")
+        if runs:
+            if runs[0] != expected_run:
+                raise ApplicationServiceError(
+                    "run_launch_record_reconciliation_conflict"
+                )
+        else:
+            require_no_conflicting_logical_revision(
+                self.store,
+                expected_run,
+                conflict_code="run_launch_record_reconciliation_conflict",
+            )
+            write_record_idempotently(
+                self.store,
+                expected_run,
+                conflict_code="run_launch_record_reconciliation_conflict",
+            )
+        events = self._events(run_id)
+        if events:
+            try:
+                status, _ = validated_run_lifecycle(events)
+            except ApplicationServiceError as exc:
+                if exc.code != "run_lifecycle_incomplete":
+                    raise
+            else:
+                return status
+        if any(event.event_type == "run_launched" for event in events):
+            return RunLifecycleStatus.RUNNING
+        self._append_failure(
+            run_id,
+            "launch_records",
+            "run_launch_record_persistence_failed",
+        )
+        return self.status(run_id)
+
+    def reconcile_terminal_ownership(
+        self,
+        run_id: str,
+        expected_claim_identity: ContentIdentity | None,
+    ) -> ContentIdentity:
+        """Repair output ownership only after one verified canonical terminal."""
+
+        events = self._events(run_id)
+        status, lifecycle = validated_run_lifecycle(events)
+        if (
+            not status.terminal
+            or sum(event.event_type in _RUN_TERMINAL_STATUSES for event in lifecycle)
+            != 1
+        ):
+            raise ApplicationServiceError("run_ownership_terminal_required")
+        root = self._runtime_root().absolute()
+        try:
+            if expected_claim_identity is None:
+                return released_run_claim_identity(root, run_id)
+            return reconcile_run_ownership(root, run_id, expected_claim_identity)
+        except RunOwnershipError as exc:
+            raise ApplicationServiceError(exc.code) from None
+
     def reconcile_runtime_controller(self, run_id: str) -> ControllerSnapshot:
         """Rebuild non-canonical live ownership from durable worker messages."""
 
@@ -939,7 +1063,43 @@ class RunService:
     ) -> RunExecutionResult:
         if not isinstance(request, RunLaunchRequest):
             raise ApplicationServiceError("run_launch_request_invalid")
-        claim_identity = content_identity(
+        claim_identity = self._ownership_identity(
+            request,
+            attempt_number=attempt_number,
+            retry_of=retry_of,
+            recovery_checkpoint=recovery_checkpoint,
+        )
+        try:
+            with claim_run_ownership(
+                (self.project_root / RUNTIME_OUTPUT_DIRECTORY).absolute(),
+                request.run_id,
+                claim_identity,
+            ) as ownership:
+                try:
+                    result = self._launch_owned(
+                        request,
+                        control=control,
+                        attempt_number=attempt_number,
+                        retry_of=retry_of,
+                        recovery_checkpoint=recovery_checkpoint,
+                    )
+                except Exception:
+                    self._resolve_run_ownership(request.run_id, ownership)
+                    raise
+                self._resolve_run_ownership(request.run_id, ownership)
+                return result
+        except RunOwnershipError as exc:
+            raise ApplicationServiceError(exc.code) from None
+
+    def _ownership_identity(
+        self,
+        request: RunLaunchRequest,
+        *,
+        attempt_number: int,
+        retry_of: Run | None,
+        recovery_checkpoint: FixtureCheckpoint | None,
+    ) -> ContentIdentity:
+        return content_identity(
             RUN_OWNERSHIP_PROJECTION,
             {
                 "schema_version": "v1",
@@ -972,27 +1132,6 @@ class RunService:
                 ),
             },
         )
-        try:
-            with claim_run_ownership(
-                (self.project_root / RUNTIME_OUTPUT_DIRECTORY).absolute(),
-                request.run_id,
-                claim_identity,
-            ) as ownership:
-                try:
-                    result = self._launch_owned(
-                        request,
-                        control=control,
-                        attempt_number=attempt_number,
-                        retry_of=retry_of,
-                        recovery_checkpoint=recovery_checkpoint,
-                    )
-                except Exception:
-                    self._resolve_run_ownership(request.run_id, ownership)
-                    raise
-                self._resolve_run_ownership(request.run_id, ownership)
-                return result
-        except RunOwnershipError as exc:
-            raise ApplicationServiceError(exc.code) from None
 
     def _resolve_run_ownership(self, run_id: str, ownership: RunOwnershipLease) -> None:
         """Release a launch claim only before launch or after one durable terminal."""
@@ -1007,16 +1146,14 @@ class RunService:
         if not launched:
             ownership.resolve()
             return
-        terminal_types = {
-            "run_cancelled",
-            "run_interrupted",
-            "run_completed",
-            "run_failed",
-        }
+        try:
+            status, lifecycle = validated_run_lifecycle(events)
+        except ApplicationServiceError:
+            return
         terminals = tuple(
-            event for event in events if event.event_type in terminal_types
+            event for event in lifecycle if event.event_type in _RUN_TERMINAL_STATUSES
         )
-        if len(launched) == 1 and len(terminals) == 1 and events[-1] == terminals[0]:
+        if len(launched) == 1 and status.terminal and len(terminals) == 1:
             ownership.resolve()
 
     def _launch_owned(
@@ -1077,9 +1214,16 @@ class RunService:
         ):
             raise ApplicationServiceError("run_launch_record_invalid") from None
         start_step = runtime_request.starting_step
-        self._persist_launch_records(
-            request.hardware_capability_profile, runtime_request, run
-        )
+        try:
+            self._persist_launch_records(
+                request.hardware_capability_profile, runtime_request, run
+            )
+        except ApplicationServiceError:
+            raise
+        except Exception:
+            raise ApplicationServiceError(
+                "run_launch_record_persistence_failed"
+            ) from None
         try:
             self._append(
                 request.run_id,

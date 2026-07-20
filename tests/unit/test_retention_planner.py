@@ -1,5 +1,9 @@
 import os
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
+import time
 
 import pytest
 
@@ -445,7 +449,7 @@ def test_failed_selected_unlink_does_not_restore_a_changed_unselected_member(
     unselected = next(entry for entry in artifact_entries if entry != selected)
 
     def change_unselected_then_retain(path: Path) -> None:
-        assert path == selected._path
+        assert path.name == selected._path.name
         unselected._path.write_bytes(b"changed unselected bundle member")
         raise PermissionError(path.name)
 
@@ -889,6 +893,212 @@ def test_parallel_cleanup_execution_is_rejected_before_evidence_can_fork(
     assert observed_codes == ["cleanup_execution_busy"]
     assert tuple(item.receipt_id for item in receipts) == (first_receipt.receipt_id,)
     assert receipts[0].outcome is CleanupOutcome.COMPLETED
+    second_stream_id = (
+        f"cleanup-{second_plan.execution_id.removeprefix('cleanup-execution-')}"
+    )
+    assert all(
+        snapshot.stream_id != second_stream_id
+        for snapshot in second_service.store.iter_streams()
+    )
+    second_quarantine = (
+        tmp_path
+        / ".temper-fixture-output"
+        / retention_module.CLEANUP_QUARANTINE_ROOT
+        / second_plan.execution_id
+        / second_plan.selected_entries[0].entry_id
+        / second_plan.selected_entries[0]._path.name
+    )
+    assert not second_quarantine.exists()
+
+
+def test_cleanup_process_lease_blocks_recovery_and_releases_for_restart(
+    tmp_path: Path,
+) -> None:
+    _project(tmp_path)
+    selected_path = _write_debug_file(
+        tmp_path, "process-serialized.log", b"process serialized cleanup"
+    )
+    ready = tmp_path / "cleanup-owner-ready"
+    release = tmp_path / "cleanup-owner-release"
+    child_code = textwrap.dedent(
+        """
+        import os
+        from pathlib import Path
+        import sys
+        import time
+
+        from temper_ml.app_services.retention import ByteClass, RetentionService
+
+        project_root = Path(sys.argv[1])
+        ready_path = Path(sys.argv[2])
+        release_path = Path(sys.argv[3])
+
+        def interrupt_while_holding_lease(target: Path) -> None:
+            ready_path.write_text("ready", encoding="utf-8")
+            deadline = time.monotonic() + 30
+            while not release_path.exists():
+                if time.monotonic() >= deadline:
+                    os._exit(24)
+                time.sleep(0.01)
+            os._exit(23)
+
+        service = RetentionService(
+            project_root,
+            _remove_file=interrupt_while_holding_lease,
+        )
+        entry = next(
+            item
+            for item in service.inventory().entries
+            if item.byte_class is ByteClass.DEBUG_EVIDENCE
+        )
+        service.execute(service.plan((entry.entry_id,)), confirm=True)
+        """
+    )
+    owner = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(tmp_path), str(ready), str(release)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not ready.exists() and owner.poll() is None:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        if not ready.exists():
+            stdout, stderr = owner.communicate(timeout=5)
+            pytest.fail(
+                "cleanup owner did not reach its removal boundary: "
+                f"exit={owner.returncode}, stdout={stdout!r}, stderr={stderr!r}"
+            )
+
+        store = TypedEvidenceStore(tmp_path)
+        streams_before = store.iter_streams()
+        records_before = tuple(store.iter_records())
+        quarantine_root = (
+            tmp_path
+            / ".temper-fixture-output"
+            / retention_module.CLEANUP_QUARANTINE_ROOT
+        )
+        quarantined = tuple(
+            path for path in quarantine_root.rglob("*") if path.is_file()
+        )
+        assert len(quarantined) == 1
+        assert quarantined[0].read_bytes() == b"process serialized cleanup"
+
+        with pytest.raises(ApplicationServiceError, match="^cleanup_execution_busy$"):
+            RetentionService(tmp_path).reconcile_pending()
+
+        assert store.iter_streams() == streams_before
+        assert tuple(store.iter_records()) == records_before
+        assert quarantined[0].read_bytes() == b"process serialized cleanup"
+
+        release.write_text("release", encoding="utf-8")
+        owner.wait(timeout=10)
+        assert owner.returncode == 23
+
+        receipts = RetentionService(tmp_path).reconcile_pending()
+        assert len(receipts) == 1
+        assert receipts[0].outcome is CleanupOutcome.PARTIAL
+        assert receipts[0].objects[0].status is CleanupObjectStatus.REMOVED
+        assert not selected_path.exists()
+        assert not any(path.is_file() for path in quarantine_root.rglob("*"))
+        cleanup_streams = tuple(
+            snapshot
+            for snapshot in store.iter_streams()
+            if snapshot.stream_id.startswith("cleanup-")
+        )
+        assert len(cleanup_streams) == 1
+        assert (
+            sum(
+                event.event_type
+                in {"cleanup_completed", "cleanup_partial", "cleanup_failed"}
+                for event in cleanup_streams[0].events
+            )
+            == 1
+        )
+    finally:
+        if owner.poll() is None:
+            release.write_text("release", encoding="utf-8")
+            owner.kill()
+            owner.wait(timeout=10)
+
+
+def test_cleanup_never_deletes_a_replacement_substituted_before_quarantine(
+    tmp_path: Path,
+) -> None:
+    _project(tmp_path)
+    selected_path = _write_debug_file(
+        tmp_path, "substitution-race.log", b"selected original bytes"
+    )
+    escaped_original = selected_path.with_name("substitution-race-escaped.log")
+    replacement = b"unrelated replacement bytes"
+    substituted = False
+
+    def substitute_before_quarantine(source: Path, destination: Path) -> None:
+        nonlocal substituted
+        if source == selected_path and not substituted:
+            substituted = True
+            os.rename(source, escaped_original)
+            source.write_bytes(replacement)
+        os.rename(source, destination)
+
+    service = RetentionService(tmp_path, _move_file=substitute_before_quarantine)
+    entry = next(
+        item for item in service.inventory().entries if item._path == selected_path
+    )
+    plan = service.plan((entry.entry_id,))
+
+    with pytest.raises(
+        ApplicationServiceError, match="^cleanup_reconciliation_required$"
+    ):
+        service.execute(plan, confirm=True)
+
+    assert substituted is True
+    assert selected_path.read_bytes() == replacement
+    assert escaped_original.read_bytes() == b"selected original bytes"
+    receipt = RetentionService(tmp_path).receipts()[0]
+    assert receipt.objects[0].status is CleanupObjectStatus.AMBIGUOUS
+
+
+def test_cleanup_detects_a_replacement_substituted_after_quarantine_rename(
+    tmp_path: Path,
+) -> None:
+    _project(tmp_path)
+    selected_path = _write_debug_file(
+        tmp_path, "quarantine-substitution.log", b"selected original bytes"
+    )
+    escaped_original = selected_path.with_name("quarantine-original-escaped.log")
+    replacement = b"unrelated quarantine replacement"
+    substituted = False
+
+    def substitute_after_quarantine(source: Path, destination: Path) -> None:
+        nonlocal substituted
+        if source == selected_path and not substituted:
+            os.rename(source, destination)
+            os.rename(destination, escaped_original)
+            destination.write_bytes(replacement)
+            substituted = True
+            return
+        os.rename(source, destination)
+
+    service = RetentionService(tmp_path, _move_file=substitute_after_quarantine)
+    entry = next(
+        item for item in service.inventory().entries if item._path == selected_path
+    )
+    plan = service.plan((entry.entry_id,))
+
+    with pytest.raises(
+        ApplicationServiceError, match="^cleanup_reconciliation_required$"
+    ):
+        service.execute(plan, confirm=True)
+
+    assert substituted is True
+    assert selected_path.read_bytes() == replacement
+    assert escaped_original.read_bytes() == b"selected original bytes"
+    receipt = RetentionService(tmp_path).receipts()[0]
+    assert receipt.objects[0].status is CleanupObjectStatus.AMBIGUOUS
 
 
 def _current_artifact_availability(
