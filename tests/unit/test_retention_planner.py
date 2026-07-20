@@ -323,6 +323,47 @@ def test_failed_artifact_unlink_restores_verified_availability(
     assert current.checkpoint_resumable == before.checkpoint_resumable
 
 
+def test_artifact_changed_after_safety_fence_remains_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project(tmp_path, launch=True)
+    service = RetentionService(tmp_path)
+    artifact = next(
+        stored.record
+        for stored in service.store.iter_records()
+        if isinstance(stored.record, Artifact)
+        and stored.record.artifact_id == "artifact-fixture-runtime"
+    )
+    selected = tuple(
+        entry
+        for entry in service.inventory().entries
+        if entry.byte_class is ByteClass.FINAL_ADAPTER
+        and record_reference(artifact) in entry.subjects
+    )
+    assert selected
+    plan = service.plan(tuple(entry.entry_id for entry in selected))
+    original_prepare = service._prepare_safety_fences
+
+    def fence_then_mutate(intent: object) -> None:
+        original_prepare(intent)  # type: ignore[arg-type]
+        selected[0]._path.write_bytes(b"changed after the availability fence")
+
+    monkeypatch.setattr(service, "_prepare_safety_fences", fence_then_mutate)
+
+    receipt = service.execute(plan, confirm=True)
+
+    assert receipt.outcome is CleanupOutcome.FAILED
+    assert receipt.failure_code == "cleanup_object_changed"
+    assert receipt.objects[0].status is CleanupObjectStatus.AMBIGUOUS
+    current = _current_artifact_availability(service.store, artifact)
+    assert current.state is AvailabilityState.UNAVAILABLE
+    assert current.available_byte_classes == ()
+    assert current.storage_references == ()
+    assert current.checkpoint_resumable is False
+    assert selected[0]._path.exists()
+
+
 def test_failed_checkpoint_unlink_restores_resume_availability(
     tmp_path: Path,
 ) -> None:

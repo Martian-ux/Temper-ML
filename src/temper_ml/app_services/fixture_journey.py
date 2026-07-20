@@ -926,6 +926,7 @@ class FixtureJourneyService:
         }
 
     def workspace(self) -> dict[str, object]:
+        ReproductionService(self.project_root).reconcile_pending()
         previews = (
             [preview.to_dict() for preview in self.state.prepared.previews]
             if self.state.prepared is not None
@@ -980,6 +981,7 @@ class FixtureJourneyService:
     def prepare_replay(self, candidate_key: str, mode: str) -> dict[str, object]:
         """Prepare a strict replay or a visibly derived adapted reproduction."""
 
+        ReproductionService(self.project_root).reconcile_pending()
         if self.state.prepared is None:
             self.import_dataset()
         if not self.state.candidates:
@@ -1117,7 +1119,15 @@ class FixtureJourneyService:
 
         draft = self._replay_draft
         if draft is None:
-            raise ApplicationServiceError("replay_plan_required")
+            return (
+                ReproductionService(self.project_root)
+                .reconcile_plan(
+                    plan_id,
+                    candidate_key=candidate_key,
+                    mode=mode,
+                )
+                .to_view()
+            )
         if not isinstance(plan_id, str) or plan_id != draft.plan.plan_id:
             raise ApplicationServiceError("replay_plan_mismatch")
         if candidate_key is not None and candidate_key != draft.candidate_key:
@@ -1125,7 +1135,7 @@ class FixtureJourneyService:
         if mode is not None and mode != draft.plan.mode.value:
             raise ApplicationServiceError("replay_mode_plan_mismatch")
         result = ReproductionService(self.project_root).execute(
-            ReplayExecutionRequest(draft.plan, draft.launch)
+            ReplayExecutionRequest(draft.plan, draft.launch, draft.candidate_key)
         )
         self._replay_draft = None
         return result.to_view()
@@ -1856,12 +1866,14 @@ def _run_view(
     events: tuple[Any, ...],
     verified_checkpoint_identities: frozenset[str],
 ) -> dict[str, object]:
-    checkpoint_availability: dict[str, bool] = {}
+    checkpoint_base_availability: dict[str, bool] = {}
+    checkpoint_pending: dict[str, set[tuple[str, str]]] = {}
+    checkpoint_removed: set[str] = set()
     for event in events:
         if event.event_type == "run_checkpoint":
             identity = event.payload.get("checkpoint_identity")
             if isinstance(identity, Mapping) and isinstance(identity.get("value"), str):
-                checkpoint_availability[identity["value"]] = (
+                checkpoint_base_availability[identity["value"]] = (
                     event.payload.get("resume_compatible") is True
                     and identity["value"] in verified_checkpoint_identities
                 )
@@ -1872,11 +1884,28 @@ def _run_view(
         }:
             identity = event.payload.get("content_identity")
             if isinstance(identity, Mapping) and isinstance(identity.get("value"), str):
-                checkpoint_availability[identity["value"]] = (
-                    event.event_type == "run_checkpoint_cleanup_cancelled"
-                    and event.payload.get("resume_available") is True
-                    and identity["value"] in verified_checkpoint_identities
-                )
+                identity_value = identity["value"]
+                execution_id = event.payload.get("execution_id")
+                entry_id = event.payload.get("entry_id")
+                if not isinstance(execution_id, str) or not isinstance(entry_id, str):
+                    checkpoint_removed.add(identity_value)
+                    continue
+                key = (execution_id, entry_id)
+                pending = checkpoint_pending.setdefault(identity_value, set())
+                if event.event_type == "run_checkpoint_cleanup_pending":
+                    pending.add(key)
+                elif key not in pending:
+                    checkpoint_removed.add(identity_value)
+                else:
+                    pending.discard(key)
+                    if event.event_type == "run_checkpoint_removed":
+                        checkpoint_removed.add(identity_value)
+    checkpoint_availability = {
+        identity: available
+        and identity not in checkpoint_removed
+        and not checkpoint_pending.get(identity)
+        for identity, available in checkpoint_base_availability.items()
+    }
     terminal = next(
         (
             event.event_type.removeprefix("run_")
@@ -2006,7 +2035,12 @@ def _replay_execution_views(streams: tuple[Any, ...]) -> list[dict[str, object]]
                 event
                 for event in reversed(snapshot.events)
                 if event.event_type
-                in {"replay_execution_completed", "replay_execution_failed"}
+                in {
+                    "replay_execution_completed",
+                    "replay_execution_cancelled",
+                    "replay_execution_interrupted",
+                    "replay_execution_failed",
+                }
             ),
             None,
         )
@@ -2017,10 +2051,7 @@ def _replay_execution_views(streams: tuple[Any, ...]) -> list[dict[str, object]]
                 "mode": mode if isinstance(mode, str) else "unknown",
                 "run_id": run_id if isinstance(run_id, str) else None,
                 "status": (
-                    "completed"
-                    if terminal is not None
-                    and terminal.event_type == "replay_execution_completed"
-                    else "failed"
+                    str(terminal.payload.get("run_status", "failed"))
                     if terminal is not None
                     else "running"
                 ),

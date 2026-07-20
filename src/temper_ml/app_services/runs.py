@@ -102,6 +102,21 @@ ARTIFACT_LINEAGE_PROJECTION = HashProjection("artifact.runtime_lineage", "v1")
 RUN_OWNERSHIP_PROJECTION = HashProjection("runtime.run_ownership_claim", "v1")
 RUNTIME_OUTPUT_DIRECTORY = ".temper-fixture-output"
 
+_RUN_TERMINAL_STATUSES = {
+    "run_preflight_blocked": "preflight_blocked",
+    "run_cancelled": "cancelled",
+    "run_interrupted": "interrupted",
+    "run_completed": "completed",
+    "run_failed": "failed",
+}
+_RUN_POST_TERMINAL_OBSERVATIONS = frozenset(
+    {
+        "run_checkpoint_cleanup_pending",
+        "run_checkpoint_cleanup_cancelled",
+        "run_checkpoint_removed",
+    }
+)
+
 
 class RunLifecycleStatus(str, Enum):
     PREFLIGHT_BLOCKED = "preflight_blocked"
@@ -263,6 +278,41 @@ class RunService:
             recovery_checkpoint=None,
         )
 
+    def planned_first_attempt(
+        self,
+        request: RunLaunchRequest,
+        preflight_result: PreflightResult,
+    ) -> tuple[ResolvedRuntimeRequest, Run]:
+        """Derive the exact first-attempt identities without writing or launching."""
+
+        if not isinstance(request, RunLaunchRequest) or not isinstance(
+            preflight_result, PreflightResult
+        ):
+            raise ApplicationServiceError("run_launch_request_invalid")
+        self._validate_launch_graph(request)
+        try:
+            expected_preflight = preflight(
+                request.recipe_resolution,
+                request.hardware_requirements,
+                request.execution_target,
+                request.hardware_capability_profile,
+                request.estimate,
+            )
+        except PreflightError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        if expected_preflight != preflight_result or not preflight_result.ready:
+            raise ApplicationServiceError("run_preflight_mismatch")
+        preflight_identity = content_identity(
+            PREFLIGHT_EVIDENCE_PROJECTION, preflight_result.to_view()
+        )
+        return self._build_execution_records(
+            request,
+            preflight_identity,
+            attempt_number=1,
+            retry_of=None,
+            recovery_checkpoint=None,
+        )
+
     def recover(
         self,
         request: RunRecoveryRequest,
@@ -415,6 +465,7 @@ class RunService:
             raise ApplicationServiceError("run_not_found")
         if not preflight_result.ready or matching_runs != (run,):
             raise ApplicationServiceError("run_existing_conflict")
+        _, lifecycle_events = _validated_run_lifecycle(events)
         try:
             require_no_conflicting_logical_revision(
                 self.store,
@@ -648,7 +699,7 @@ class RunService:
                 ),
             )
         )
-        if tuple(event.request_fields() for event in events) != tuple(
+        if tuple(event.request_fields() for event in lifecycle_events) != tuple(
             expected.canonical_fields() for expected in expected_events
         ):
             raise ApplicationServiceError("run_existing_lifecycle_conflict")
@@ -678,13 +729,18 @@ class RunService:
         ):
             raise ApplicationServiceError("run_existing_runtime_mismatch")
         events = self._events(run.run_id)
+        _, lifecycle_events = _validated_run_lifecycle(events)
         launched = tuple(
-            event for event in events if event.event_type == "run_launched"
+            event for event in lifecycle_events if event.event_type == "run_launched"
         )
         completed = tuple(
-            event for event in events if event.event_type == "run_completed"
+            event for event in lifecycle_events if event.event_type == "run_completed"
         )
-        if len(launched) != 1 or len(completed) != 1 or events[-1] != completed[0]:
+        if (
+            len(launched) != 1
+            or len(completed) != 1
+            or lifecycle_events[-1] != completed[0]
+        ):
             raise ApplicationServiceError("run_existing_lifecycle_conflict")
         if (
             launched[0].payload.get("fixture_runtime") is not False
@@ -830,27 +886,8 @@ class RunService:
         events = self._events(run_id)
         if not events:
             raise ApplicationServiceError("run_not_found")
-        terminal_events = {
-            "run_preflight_blocked": RunLifecycleStatus.PREFLIGHT_BLOCKED,
-            "run_cancelled": RunLifecycleStatus.CANCELLED,
-            "run_interrupted": RunLifecycleStatus.INTERRUPTED,
-            "run_completed": RunLifecycleStatus.COMPLETED,
-            "run_failed": RunLifecycleStatus.FAILED,
-        }
-        terminals = [
-            terminal_events[event.event_type]
-            for event in events
-            if event.event_type in terminal_events
-        ]
-        if len(terminals) > 1:
-            raise ApplicationServiceError("run_terminal_evidence_conflict")
-        if terminals and events[-1].event_type not in terminal_events:
-            raise ApplicationServiceError("run_event_after_terminal")
-        if terminals:
-            return terminals[0]
-        if any(event.event_type == "run_launched" for event in events):
-            return RunLifecycleStatus.RUNNING
-        raise ApplicationServiceError("run_lifecycle_incomplete")
+        status, _ = _validated_run_lifecycle(events)
+        return status
 
     def reconcile_runtime_controller(self, run_id: str) -> ControllerSnapshot:
         """Rebuild non-canonical live ownership from durable worker messages."""
@@ -1580,6 +1617,8 @@ class RunService:
     ) -> bool:
         identity = _event_identity(checkpoint, "checkpoint_identity")
         resume_available = checkpoint.payload.get("resume_compatible") is True
+        pending: set[tuple[str, str]] = set()
+        removed = False
         for event in self._events(run_id):
             if event.event_type not in {
                 "run_checkpoint_cleanup_pending",
@@ -1589,11 +1628,17 @@ class RunService:
                 continue
             if _event_identity(event, "content_identity") != identity:
                 continue
-            resume_available = (
-                event.event_type == "run_checkpoint_cleanup_cancelled"
-                and event.payload.get("resume_available") is True
-            )
-        return resume_available
+            execution_id = event.payload.get("execution_id")
+            entry_id = event.payload.get("entry_id")
+            if not isinstance(execution_id, str) or not isinstance(entry_id, str):
+                raise ApplicationServiceError("run_cleanup_observation_invalid")
+            key = (execution_id, entry_id)
+            if event.event_type == "run_checkpoint_cleanup_pending":
+                pending.add(key)
+            else:
+                pending.discard(key)
+                removed = removed or event.event_type == "run_checkpoint_removed"
+        return resume_available and not removed and not pending
 
     def _checkpoint_from_event(self, run: Run, event: StoredEvent) -> FixtureCheckpoint:
         if event.event_type != "run_checkpoint":
@@ -1755,6 +1800,88 @@ class RunService:
                 raise SafeIoError("existing runtime output is unreadable") from None
             if existing != data:
                 raise SafeIoError("existing runtime output differs")
+
+
+def _validated_run_lifecycle(
+    events: tuple[StoredEvent, ...],
+) -> tuple[RunLifecycleStatus, tuple[StoredEvent, ...]]:
+    terminal_indexes = tuple(
+        index
+        for index, event in enumerate(events)
+        if event.event_type in _RUN_TERMINAL_STATUSES
+    )
+    if len(terminal_indexes) > 1:
+        raise ApplicationServiceError("run_terminal_evidence_conflict")
+    observation_indexes = tuple(
+        index
+        for index, event in enumerate(events)
+        if event.event_type in _RUN_POST_TERMINAL_OBSERVATIONS
+    )
+    if not terminal_indexes:
+        if observation_indexes:
+            raise ApplicationServiceError("run_cleanup_observation_before_terminal")
+        if any(event.event_type == "run_launched" for event in events):
+            return RunLifecycleStatus.RUNNING, events
+        raise ApplicationServiceError("run_lifecycle_incomplete")
+
+    terminal_index = terminal_indexes[0]
+    if any(index <= terminal_index for index in observation_indexes):
+        raise ApplicationServiceError("run_cleanup_observation_before_terminal")
+    trailing = events[terminal_index + 1 :]
+    if any(
+        event.event_type not in _RUN_POST_TERMINAL_OBSERVATIONS for event in trailing
+    ):
+        raise ApplicationServiceError("run_event_after_terminal")
+    checkpoints: dict[ContentIdentity, bool] = {}
+    try:
+        for event in events[:terminal_index]:
+            if event.event_type != "run_checkpoint":
+                continue
+            identity = _event_identity(event, "checkpoint_identity")
+            resume_compatible = event.payload.get("resume_compatible")
+            if not isinstance(resume_compatible, bool) or identity in checkpoints:
+                raise ApplicationServiceError("run_event_invalid")
+            checkpoints[identity] = resume_compatible
+    except ApplicationServiceError:
+        raise ApplicationServiceError("run_cleanup_observation_invalid") from None
+    observations: dict[tuple[str, str, ContentIdentity], str] = {}
+    for event in trailing:
+        execution_id = event.payload.get("execution_id")
+        entry_id = event.payload.get("entry_id")
+        resume_available = event.payload.get("resume_available")
+        try:
+            if not isinstance(execution_id, str) or not isinstance(entry_id, str):
+                raise RecordValidationError("cleanup observation identifier is invalid")
+            require_identifier("execution_id", execution_id)
+            require_identifier("entry_id", entry_id)
+            identity = _event_identity(event, "content_identity")
+        except (ApplicationServiceError, RecordValidationError):
+            raise ApplicationServiceError("run_cleanup_observation_invalid") from None
+        if not isinstance(resume_available, bool):
+            raise ApplicationServiceError("run_cleanup_observation_invalid")
+        if identity not in checkpoints or (
+            event.event_type == "run_checkpoint_cleanup_cancelled"
+            and resume_available
+            and not checkpoints[identity]
+        ):
+            raise ApplicationServiceError("run_cleanup_observation_invalid")
+        key = (execution_id, entry_id, identity)
+        prior = observations.get(key)
+        if event.event_type == "run_checkpoint_cleanup_pending":
+            if prior is not None or resume_available:
+                raise ApplicationServiceError("run_cleanup_observation_invalid")
+            observations[key] = "pending"
+            continue
+        if prior != "pending":
+            raise ApplicationServiceError("run_cleanup_observation_invalid")
+        if event.event_type == "run_checkpoint_removed" and resume_available:
+            raise ApplicationServiceError("run_cleanup_observation_invalid")
+        observations[key] = "terminal"
+
+    status = RunLifecycleStatus(
+        _RUN_TERMINAL_STATUSES[events[terminal_index].event_type]
+    )
+    return status, events[: terminal_index + 1]
 
 
 def _event_identity(event: StoredEvent, field: str) -> ContentIdentity:

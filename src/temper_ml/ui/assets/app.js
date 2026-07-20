@@ -809,7 +809,7 @@ function successMessage(action) {
     "cleanup-preview": "Exact cleanup consequences calculated; no bytes were removed.",
     "cleanup-execute": "Cleanup finished and an immutable receipt was recorded.",
     "replay-plan": "Replay plan calculated with exact manifest identities.",
-    "replay-execute": "Reproduction completed as a new immutable run.",
+    "replay-execute": "Reproduction ended with its recorded immutable run outcome.",
   }[action] || "Action completed.";
 }
 

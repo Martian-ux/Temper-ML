@@ -10,8 +10,14 @@ from temper_ml.app_services.reproduction import (
     ReplayExecutionRequest,
     ReproductionService,
 )
-from temper_ml.app_services.retention import CleanupImpact, RetentionService
+from temper_ml.app_services.retention import (
+    ByteClass,
+    CleanupImpact,
+    RetentionService,
+)
+from temper_ml.app_services.runs import RunLifecycleStatus, RunService
 from temper_ml.domain.retention import CleanupOutcome
+from temper_ml.runtime.fixture_adapter import FixtureControl
 from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
 
 
@@ -183,18 +189,24 @@ def test_checkpoint_cleanup_preserves_existing_canonical_bytes_and_removes_resum
         event["type"] == "run_checkpoint_removed" and event["resume_available"] is False
         for event in after_run["events"]
     )
+    assert RunService(tmp_path).status(run_id) is RunLifecycleStatus.COMPLETED
     assert len(after_workspace["retention"]["receipts"]) == 1
 
 
+@pytest.mark.parametrize("after_retention", [False, True], ids=["retained", "cleaned"])
 def test_replay_completion_reconciles_after_post_run_event_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    after_retention: bool,
 ) -> None:
     journey = _launched_journey(tmp_path)
     strict = journey.prepare_replay("ember", "strict_replay")
     draft = journey._replay_draft
     assert draft is not None
-    request = ReplayExecutionRequest(draft.plan, draft.launch)
+    plan_id = draft.plan.plan_id
+    run_id = draft.launch.run_id
+    artifact_id = draft.launch.artifact_id
+    request = ReplayExecutionRequest(draft.plan, draft.launch, draft.candidate_key)
     service = ReproductionService(tmp_path)
     original_append = service.store.append_event
     failed = False
@@ -216,23 +228,68 @@ def test_replay_completion_reconciles_after_post_run_event_failure(
     ):
         service.execute(request)
 
-    run_stream_id = f"run-{draft.launch.run_id}"
+    run_stream_id = f"run-{run_id}"
     replay_stream = next(
         snapshot
         for snapshot in TypedEvidenceStore(tmp_path).iter_streams()
         if snapshot.stream_id.startswith("replay-")
-        and any(
-            event.payload.get("run_id") == draft.launch.run_id
-            for event in snapshot.events
-        )
+        and any(event.payload.get("run_id") == run_id for event in snapshot.events)
     )
     assert [event.event_type for event in replay_stream.events] == [
         "replay_execution_started"
     ]
 
-    reconciled = ReproductionService(tmp_path).execute(request)
+    del request, draft, service, journey
 
-    assert reconciled.run.status.value == "completed"
+    if after_retention:
+        retention = RetentionService(tmp_path)
+        selected = tuple(
+            entry
+            for entry in retention.inventory().entries
+            if (
+                entry.byte_class is ByteClass.CHECKPOINT
+                and any(
+                    subject.record_type == "run" and subject.logical_id == run_id
+                    for subject in entry.subjects
+                )
+            )
+            or (
+                entry.byte_class is ByteClass.FINAL_ADAPTER
+                and any(
+                    subject.record_type == "artifact"
+                    and subject.logical_id == artifact_id
+                    for subject in entry.subjects
+                )
+            )
+        )
+        assert {entry.byte_class for entry in selected} == {
+            ByteClass.CHECKPOINT,
+            ByteClass.FINAL_ADAPTER,
+        }
+        cleanup = retention.execute(
+            retention.plan(tuple(entry.entry_id for entry in selected)),
+            confirm=True,
+        )
+        assert cleanup.outcome is CleanupOutcome.COMPLETED
+        assert all(not entry._path.exists() for entry in selected)
+
+    restarted = FixtureJourneyService(tmp_path)
+    workspace = restarted.workspace()
+    reconciled = restarted.execute_replay(
+        plan_id,
+        candidate_key="ember",
+        mode="strict_replay",
+    )
+
+    assert reconciled["status"] == "completed"
+    assert reconciled["reconciled"] is True
+    assert reconciled["execution"]["run_id"] == run_id
+    execution = next(
+        item
+        for item in workspace["reproduction"]["executions"]
+        if item["run_id"] == run_id
+    )
+    assert execution["status"] == "completed"
     replay_stream = next(
         snapshot
         for snapshot in TypedEvidenceStore(tmp_path).iter_streams()
@@ -249,4 +306,69 @@ def test_replay_completion_reconciles_after_post_run_event_failure(
     )
     assert sum(event.event_type == "run_launched" for event in run_events) == 1
     assert sum(event.event_type == "run_completed" for event in run_events) == 1
-    assert strict["plan_id"] == reconciled.plan.plan_id
+    assert strict["plan_id"] == plan_id
+    assert TypedEvidenceStore(tmp_path).verify().to_dict()["status"] == "verified"
+
+
+@pytest.mark.parametrize(
+    ("control", "expected_status", "terminal_event"),
+    [
+        (
+            FixtureControl(cancel_after_step=2),
+            RunLifecycleStatus.CANCELLED,
+            "replay_execution_cancelled",
+        ),
+        (
+            FixtureControl(interrupt_after_step=3),
+            RunLifecycleStatus.INTERRUPTED,
+            "replay_execution_interrupted",
+        ),
+    ],
+    ids=["cancelled", "interrupted"],
+)
+def test_replay_records_the_actual_noncompleted_terminal_outcome(
+    tmp_path: Path,
+    control: FixtureControl,
+    expected_status: RunLifecycleStatus,
+    terminal_event: str,
+) -> None:
+    journey = _launched_journey(tmp_path)
+    prepared = journey.prepare_replay("ember", "strict_replay")
+    draft = journey._replay_draft
+    assert draft is not None
+    plan_id = draft.plan.plan_id
+    run_id = draft.launch.run_id
+
+    result = ReproductionService(tmp_path).execute(
+        ReplayExecutionRequest(draft.plan, draft.launch, draft.candidate_key),
+        control=control,
+    )
+
+    assert result.to_view()["status"] == expected_status.value
+    del result, draft, journey
+    restarted = FixtureJourneyService(tmp_path)
+    workspace = restarted.workspace()
+    execution = next(
+        item
+        for item in workspace["reproduction"]["executions"]
+        if item["run_id"] == run_id
+    )
+    assert execution["status"] == expected_status.value
+    reconciled = restarted.execute_replay(
+        plan_id,
+        candidate_key="ember",
+        mode="strict_replay",
+    )
+    assert reconciled["status"] == expected_status.value
+    assert reconciled["reconciled"] is True
+    replay_stream = next(
+        snapshot
+        for snapshot in TypedEvidenceStore(tmp_path).iter_streams()
+        if snapshot.stream_id.startswith("replay-")
+        and any(event.payload.get("run_id") == run_id for event in snapshot.events)
+    )
+    assert [event.event_type for event in replay_stream.events] == [
+        "replay_execution_started",
+        terminal_event,
+    ]
+    assert prepared["plan_id"] == plan_id

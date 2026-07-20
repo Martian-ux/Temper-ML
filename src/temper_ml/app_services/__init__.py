@@ -77,6 +77,7 @@ from temper_ml.app_services.retention import (
 from temper_ml.app_services.reproduction import (
     ReplayExecutionRequest,
     ReplayExecutionResult,
+    ReplayReconciliationResult,
     ReproductionService,
 )
 
@@ -122,6 +123,7 @@ __all__ = [
     "ReplayMode",
     "ReplayExecutionRequest",
     "ReplayExecutionResult",
+    "ReplayReconciliationResult",
     "ReplayPlan",
     "ReplayStatus",
     "RetentionDefault",

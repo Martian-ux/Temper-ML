@@ -730,7 +730,14 @@ class RetentionService:
                     try:
                         self._verify_group_unchanged(groups[entry.physical_group_id])
                     except ApplicationServiceError as exc:
-                        statuses[entry.entry_id] = CleanupObjectStatus.FAILED
+                        for selected_entry in selected:
+                            if (
+                                selected_entry.physical_group_id
+                                == entry.physical_group_id
+                            ):
+                                statuses[selected_entry.entry_id] = (
+                                    CleanupObjectStatus.AMBIGUOUS
+                                )
                         failure_code = exc.code
                         self._record_failure(intent, failure_code, entry.entry_id)
                         break
@@ -1129,20 +1136,30 @@ class RetentionService:
         first_failure: str | None = None
         availability_updates: list[ArtifactAvailability] = []
         for reference, artifact in self._intent_artifacts(intent):
+            affected = tuple(
+                item
+                for item in intent.objects
+                if item.byte_class is ByteClass.FINAL_ADAPTER
+                and reference in item.subjects
+            )
             removed = any(
-                item.byte_class is ByteClass.FINAL_ADAPTER
-                and reference in item.subjects
-                and statuses[item.entry_id] is CleanupObjectStatus.REMOVED
-                for item in intent.objects
+                statuses[item.entry_id] is CleanupObjectStatus.REMOVED
+                for item in affected
             )
-            uncertain = not removed and any(
-                item.byte_class is ByteClass.FINAL_ADAPTER
-                and reference in item.subjects
-                and statuses[item.entry_id] is CleanupObjectStatus.AMBIGUOUS
-                for item in intent.objects
+            ambiguous = any(
+                statuses[item.entry_id] is CleanupObjectStatus.AMBIGUOUS
+                for item in affected
             )
+            changed = not removed and any(
+                statuses[item.entry_id] is not CleanupObjectStatus.REMOVED
+                and not self._intent_object_still_matches(item)
+                for item in affected
+            )
+            uncertain = not removed and (ambiguous or changed)
             if uncertain:
-                first_failure = first_failure or "cleanup_removal_ambiguous"
+                first_failure = first_failure or (
+                    "cleanup_object_changed" if changed else "cleanup_removal_ambiguous"
+                )
                 update = self._availability_by_id(
                     _availability_id("pending", intent, artifact)
                 )
@@ -1167,8 +1184,17 @@ class RetentionService:
             if statuses[item.entry_id] is CleanupObjectStatus.AMBIGUOUS:
                 first_failure = first_failure or "cleanup_removal_ambiguous"
                 continue
+            if not removed and not self._intent_object_still_matches(item):
+                first_failure = first_failure or "cleanup_object_changed"
+                continue
             for subject in item.subjects:
                 if subject.record_type != "run":
+                    continue
+                try:
+                    if not self._checkpoint_fence_exists(intent, item, subject):
+                        continue
+                except ApplicationServiceError as exc:
+                    first_failure = first_failure or exc.code
                     continue
                 event_type = (
                     "run_checkpoint_removed"
@@ -1200,6 +1226,53 @@ class RetentionService:
                 except EvidenceError as exc:
                     first_failure = first_failure or exc.code
         return tuple(availability_updates), first_failure
+
+    def _intent_object_still_matches(self, item: _CleanupIntentObject) -> bool:
+        path = self._runtime_root().joinpath(*PurePosixPath(item.logical_key).parts)
+        try:
+            snapshot = _stream_file_snapshot(path, chunk_size=self._hash_chunk_size)
+        except (FileNotFoundError, OSError, SafeIoError, UnsafeFilesystemPath):
+            return False
+        return (
+            snapshot.byte_count == item.byte_count
+            and snapshot.content_identity == item.content_identity
+        )
+
+    def _checkpoint_fence_exists(
+        self,
+        intent: _CleanupIntent,
+        item: _CleanupIntentObject,
+        subject: RecordReference,
+    ) -> bool:
+        stream_id = f"run-{subject.logical_id}"
+        try:
+            events = next(
+                (
+                    snapshot.events
+                    for snapshot in self.store.iter_streams()
+                    if snapshot.stream_id == stream_id
+                ),
+                (),
+            )
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        key = f"{intent.execution_id}-{item.entry_id}-pending"
+        matches = tuple(event for event in events if event.idempotency_key == key)
+        expected_payload = {
+            "execution_id": intent.execution_id,
+            "entry_id": item.entry_id,
+            "content_identity": identity_fields(item.content_identity),
+            "resume_available": False,
+        }
+        if not matches:
+            return False
+        if (
+            len(matches) != 1
+            or matches[0].event_type != "run_checkpoint_cleanup_pending"
+            or dict(matches[0].payload) != expected_payload
+        ):
+            raise ApplicationServiceError("cleanup_checkpoint_fence_conflict")
+        return True
 
     def _build_receipt(
         self,
@@ -1470,17 +1543,28 @@ class RetentionService:
             and event.payload.get("failure_code") == "cleanup_object_remove_failed"
             and isinstance((entry_id := event.payload.get("entry_id")), str)
         }
+        changed = {
+            entry_id
+            for event in events
+            if event.event_type == "cleanup_failure_observed"
+            and event.payload.get("failure_code") == "cleanup_object_changed"
+            and isinstance((entry_id := event.payload.get("entry_id")), str)
+        }
         known_ids = set(intent.selected_entry_ids)
         if (
             not deletion_intents <= known_ids
             or not recorded_removed <= known_ids
             or not definitely_retained <= known_ids
+            or not changed <= known_ids
         ):
             raise ApplicationServiceError("cleanup_intent_invalid")
         statuses: dict[str, CleanupObjectStatus] = {}
         for item in intent.objects:
             if item.entry_id in recorded_removed:
                 statuses[item.entry_id] = CleanupObjectStatus.REMOVED
+                continue
+            if item.entry_id in changed:
+                statuses[item.entry_id] = CleanupObjectStatus.AMBIGUOUS
                 continue
             if item.entry_id not in deletion_intents:
                 statuses[item.entry_id] = CleanupObjectStatus.NOT_ATTEMPTED
@@ -1977,6 +2061,8 @@ def _checkpoint_resumable(
         if getattr(snapshot, "stream_id", None) != f"run-{run_id}":
             continue
         resumable = False
+        pending: set[tuple[str, str]] = set()
+        removed = False
         for event in snapshot.events:
             if event.event_type in {
                 "run_checkpoint_cleanup_pending",
@@ -1989,12 +2075,22 @@ def _checkpoint_resumable(
                     and isinstance(observation.get("value"), str)
                     and observation["value"] in name
                 ):
-                    if event.event_type == "run_checkpoint_removed":
+                    execution_id = event.payload.get("execution_id")
+                    entry_id = event.payload.get("entry_id")
+                    if not isinstance(execution_id, str) or not isinstance(
+                        entry_id, str
+                    ):
                         return False
-                    resumable = (
-                        event.event_type == "run_checkpoint_cleanup_cancelled"
-                        and event.payload.get("resume_available") is True
-                    )
+                    key = (execution_id, entry_id)
+                    if event.event_type == "run_checkpoint_cleanup_pending":
+                        pending.add(key)
+                    elif key not in pending:
+                        return False
+                    else:
+                        pending.discard(key)
+                        removed = (
+                            removed or event.event_type == "run_checkpoint_removed"
+                        )
                 continue
             if event.event_type != "run_checkpoint":
                 continue
@@ -2005,7 +2101,7 @@ def _checkpoint_resumable(
                 and identity["value"] in name
             ):
                 resumable = event.payload.get("resume_compatible") is True
-        return resumable
+        return resumable and not removed and not pending
     return False
 
 

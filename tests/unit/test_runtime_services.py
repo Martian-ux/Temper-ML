@@ -26,6 +26,11 @@ from temper_ml.app_services.runs import (
     RunRecoveryRequest,
     RunService,
 )
+from temper_ml.app_services.retention import (
+    ByteClass,
+    CleanupImpact,
+    RetentionService,
+)
 from temper_ml.cli import _FixtureTokenizer, _fixture_workflow
 from temper_ml.domain.artifacts import Artifact, ArtifactAvailability
 from temper_ml.domain.base_models import BaseModelRevision
@@ -48,6 +53,7 @@ from temper_ml.domain.local_use import LocalUseSession
 from temper_ml.domain.projections import ContentIdentity
 from temper_ml.domain.recipes import RecipeResolution
 from temper_ml.domain.records import record_reference
+from temper_ml.domain.retention import CleanupObjectStatus, CleanupOutcome
 from temper_ml.domain.runs import EvaluationMode, ResolvedRuntimeRequest, Run
 from temper_ml.runtime.fixture_adapter import (
     FixtureAdapter,
@@ -350,6 +356,128 @@ def test_interruption_recovery_creates_new_attempt_from_bound_checkpoint(
     assert recovered.artifact is not None
 
 
+def test_failed_checkpoint_cleanup_retains_real_recovery(
+    tmp_path: Path,
+) -> None:
+    foundation = _foundation(tmp_path)
+    interrupted = RunService(tmp_path).launch(
+        foundation.launch(
+            run_id="run-cleanup-retained",
+            request_id="request-cleanup-retained",
+            artifact_id="artifact-cleanup-retained",
+        ),
+        control=FixtureControl(interrupt_after_step=3),
+    )
+    checkpoint = interrupted.checkpoints[-1]
+
+    def retain_file(path: Path) -> None:
+        raise PermissionError(path.name)
+
+    retention = RetentionService(tmp_path, _remove_file=retain_file)
+    entry = next(
+        item
+        for item in retention.inventory().entries
+        if item.byte_class is ByteClass.CHECKPOINT
+        and CleanupImpact.RESUMABILITY in item.impacts
+        and item.content_identity == checkpoint.checkpoint_identity
+        and any(
+            subject.record_type == "run"
+            and subject.logical_id == interrupted.run.run_id
+            for subject in item.subjects
+        )
+    )
+    receipt = retention.execute(
+        retention.plan((entry.entry_id,)),
+        confirm=True,
+    )
+
+    assert receipt.outcome is CleanupOutcome.FAILED
+    assert receipt.objects[0].status is CleanupObjectStatus.RETAINED
+    assert entry._path.exists()
+    recovered = RunService(tmp_path).recover(
+        RunRecoveryRequest(
+            foundation.launch(
+                run_id="run-cleanup-retained-recovery",
+                request_id="request-cleanup-retained-recovery",
+                artifact_id="artifact-cleanup-retained-recovery",
+            ),
+            interrupted.run,
+            checkpoint.checkpoint_identity,
+        )
+    )
+    assert recovered.status is RunLifecycleStatus.COMPLETED
+    assert recovered.runtime_request.starting_step == checkpoint.step
+
+
+def test_removed_checkpoint_does_not_block_recovery_from_another(
+    tmp_path: Path,
+) -> None:
+    foundation = _foundation(tmp_path)
+    resolution = replace(
+        foundation.resolution,
+        resolution_id="resolution-multiple-recovery-checkpoints",
+        training_steps=8,
+        checkpoint_cadence=2,
+    )
+    experiment = replace(
+        foundation.experiment,
+        experiment_id="experiment-multiple-recovery-checkpoints",
+        recipe_resolution=record_reference(resolution),
+    )
+    store = TypedEvidenceStore(tmp_path)
+    store.write_record(resolution)
+    store.write_record(experiment)
+    foundation = replace(
+        foundation,
+        experiment=experiment,
+        resolution=resolution,
+    )
+    interrupted = RunService(tmp_path).launch(
+        foundation.launch(
+            run_id="run-multiple-recovery-checkpoints",
+            request_id="request-multiple-recovery-checkpoints",
+            artifact_id="artifact-multiple-recovery-checkpoints",
+        ),
+        control=FixtureControl(interrupt_after_step=5),
+    )
+    assert len(interrupted.checkpoints) >= 2
+    removed_checkpoint = interrupted.checkpoints[0]
+    retained_checkpoint = interrupted.checkpoints[-1]
+    retention = RetentionService(tmp_path)
+    removed_entry = next(
+        item
+        for item in retention.inventory().entries
+        if item.byte_class is ByteClass.CHECKPOINT
+        and item.content_identity == removed_checkpoint.checkpoint_identity
+        and any(
+            subject.record_type == "run"
+            and subject.logical_id == interrupted.run.run_id
+            for subject in item.subjects
+        )
+    )
+
+    receipt = retention.execute(
+        retention.plan((removed_entry.entry_id,)),
+        confirm=True,
+    )
+
+    assert receipt.outcome is CleanupOutcome.COMPLETED
+    assert not removed_entry._path.exists()
+    recovered = RunService(tmp_path).recover(
+        RunRecoveryRequest(
+            foundation.launch(
+                run_id="run-retained-checkpoint-recovery",
+                request_id="request-retained-checkpoint-recovery",
+                artifact_id="artifact-retained-checkpoint-recovery",
+            ),
+            interrupted.run,
+            retained_checkpoint.checkpoint_identity,
+        )
+    )
+    assert recovered.status is RunLifecycleStatus.COMPLETED
+    assert recovered.runtime_request.starting_step == retained_checkpoint.step
+
+
 def test_recovery_rejects_unrecorded_checkpoint_identity(tmp_path: Path) -> None:
     foundation = _foundation(tmp_path)
     service = RunService(tmp_path)
@@ -401,6 +529,46 @@ def test_completed_run_reopens_exactly_and_conflicting_request_fails_closed(
         service.reopen_completed(
             replace(launch, request_id="request-reopen-conflicting")
         )
+
+
+def test_completed_run_reopens_with_retained_checkpoint_cleanup_observations(
+    tmp_path: Path,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id="run-reopen-after-cleanup",
+        request_id="request-reopen-after-cleanup",
+        artifact_id="artifact-reopen-after-cleanup",
+    )
+    completed = RunService(tmp_path).launch(launch)
+    checkpoint = completed.checkpoints[0]
+
+    def retain_file(path: Path) -> None:
+        raise PermissionError(path.name)
+
+    retention = RetentionService(tmp_path, _remove_file=retain_file)
+    entry = next(
+        item
+        for item in retention.inventory().entries
+        if item.byte_class is ByteClass.CHECKPOINT
+        and item.content_identity == checkpoint.checkpoint_identity
+        and any(
+            subject.record_type == "run" and subject.logical_id == completed.run.run_id
+            for subject in item.subjects
+        )
+    )
+    receipt = retention.execute(
+        retention.plan((entry.entry_id,)),
+        confirm=True,
+    )
+
+    assert receipt.objects[0].status is CleanupObjectStatus.RETAINED
+    reopened = RunService(tmp_path).reopen_completed(launch)
+    assert reopened == completed
+    assert (
+        RunService(tmp_path).status(completed.run.run_id)
+        is RunLifecycleStatus.COMPLETED
+    )
 
 
 @pytest.mark.parametrize("mutation", ["missing", "reordered"])
