@@ -110,6 +110,7 @@ class ReplayReconciliationResult:
             "plan_id": self.plan_id,
             "mode": self.mode.value,
             "status": "ready",
+            "run_id": self.run_id,
         }
         if self.candidate_key is not None:
             plan["candidate_key"] = self.candidate_key
@@ -350,6 +351,7 @@ class ReproductionService:
     def reconcile_plan(
         self,
         plan_id: str,
+        run_id: str,
         *,
         candidate_key: str | None = None,
         mode: str | None = None,
@@ -360,8 +362,16 @@ class ReproductionService:
             require_identifier("plan_id", plan_id)
         except RecordValidationError:
             raise ApplicationServiceError("replay_plan_mismatch") from None
+        try:
+            require_identifier("run_id", run_id)
+        except RecordValidationError:
+            raise ApplicationServiceError("replay_run_plan_mismatch") from None
         results = self.reconcile_pending()
-        matches = tuple(item for item in results if item.plan_id == plan_id)
+        matches = tuple(
+            item
+            for item in results
+            if item.plan_id == plan_id and item.run_id == run_id
+        )
         if len(matches) != 1:
             raise ApplicationServiceError("replay_plan_required")
         result = matches[0]
@@ -495,14 +505,6 @@ class ReproductionService:
         launched = tuple(
             event for event in events if event.event_type == "run_launched"
         )
-        if (
-            len(launched) != 1
-            or _payload_identity(launched[0].payload, "run_identity")
-            != intent.run_identity
-            or _payload_identity(launched[0].payload, "runtime_request_identity")
-            != intent.runtime_request_identity
-        ):
-            raise ApplicationServiceError("replay_execution_evidence_conflict")
         expected_terminal = {
             RunLifecycleStatus.PREFLIGHT_BLOCKED: "run_preflight_blocked",
             RunLifecycleStatus.CANCELLED: "run_cancelled",
@@ -516,6 +518,21 @@ class ReproductionService:
         if len(terminals) != 1:
             raise ApplicationServiceError("replay_execution_evidence_conflict")
         terminal = terminals[0]
+        launch_evidence_failed = (
+            status is RunLifecycleStatus.FAILED
+            and not launched
+            and terminal.payload.get("phase") == "launch_evidence"
+        )
+        if not launch_evidence_failed and (
+            len(launched) != 1
+            or _payload_identity(launched[0].payload, "run_identity")
+            != intent.run_identity
+            or _payload_identity(launched[0].payload, "runtime_request_identity")
+            != intent.runtime_request_identity
+        ):
+            raise ApplicationServiceError("replay_execution_evidence_conflict")
+        if launch_evidence_failed and len(launched) != 0:
+            raise ApplicationServiceError("replay_execution_evidence_conflict")
         failure_code: str | None = None
         if status is RunLifecycleStatus.FAILED:
             raw_failure_code = terminal.payload.get("failure_code")
@@ -557,7 +574,7 @@ class ReproductionService:
         try:
             return run_service.status(run_id)
         except ApplicationServiceError as exc:
-            if exc.code == "run_not_found":
+            if exc.code in {"run_not_found", "run_lifecycle_incomplete"}:
                 return None
             raise
 

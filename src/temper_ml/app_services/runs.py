@@ -465,7 +465,7 @@ class RunService:
             raise ApplicationServiceError("run_not_found")
         if not preflight_result.ready or matching_runs != (run,):
             raise ApplicationServiceError("run_existing_conflict")
-        _, lifecycle_events = _validated_run_lifecycle(events)
+        _, lifecycle_events = validated_run_lifecycle(events)
         try:
             require_no_conflicting_logical_revision(
                 self.store,
@@ -729,7 +729,7 @@ class RunService:
         ):
             raise ApplicationServiceError("run_existing_runtime_mismatch")
         events = self._events(run.run_id)
-        _, lifecycle_events = _validated_run_lifecycle(events)
+        _, lifecycle_events = validated_run_lifecycle(events)
         launched = tuple(
             event for event in lifecycle_events if event.event_type == "run_launched"
         )
@@ -886,7 +886,7 @@ class RunService:
         events = self._events(run_id)
         if not events:
             raise ApplicationServiceError("run_not_found")
-        status, _ = _validated_run_lifecycle(events)
+        status, _ = validated_run_lifecycle(events)
         return status
 
     def reconcile_runtime_controller(self, run_id: str) -> ControllerSnapshot:
@@ -1080,63 +1080,70 @@ class RunService:
         self._persist_launch_records(
             request.hardware_capability_profile, runtime_request, run
         )
-        self._append(
-            request.run_id,
-            "preflight",
-            "run_preflight_succeeded",
-            {
-                "ready": True,
-                "preflight_identity": identity_fields(preflight_identity),
-                "blocking_reasons": [],
-            },
-        )
-        self._append(
-            request.run_id,
-            "request-frozen",
-            "runtime_request_frozen",
-            {
-                "runtime_request_identity": identity_fields(runtime_request.identity),
-                "experiment_manifest_identity": identity_fields(
-                    request.experiment.manifest_identity
-                ),
-                "preflight_identity": identity_fields(preflight_identity),
-                "evaluation_mode": request.evaluation_mode.value,
-                "starting_step": start_step,
-            },
-        )
-        if retry_of is not None and recovery_checkpoint is not None:
+        try:
             self._append(
                 request.run_id,
-                "recovered",
-                "run_recovered",
+                "preflight",
+                "run_preflight_succeeded",
                 {
-                    "prior_run_identity": identity_fields(retry_of.identity),
-                    "checkpoint_identity": identity_fields(
-                        recovery_checkpoint.checkpoint_identity
-                    ),
-                    "training_state_identity": identity_fields(
-                        recovery_checkpoint.training_state_identity
-                    ),
-                    "starting_step": recovery_checkpoint.step,
-                    "resume_compatible": True,
+                    "ready": True,
+                    "preflight_identity": identity_fields(preflight_identity),
+                    "blocking_reasons": [],
                 },
             )
-        launched_payload: dict[str, object] = {
-            "run_identity": identity_fields(run.identity),
-            "runtime_request_identity": identity_fields(runtime_request.identity),
-            "attempt_number": attempt_number,
-            "fixture_runtime": self.adapter.runtime_kind == "fixture",
-        }
-        if self.adapter.runtime_kind != "fixture":
-            launched_payload["runtime_identity"] = identity_fields(
-                self.adapter.runtime_identity
+            self._append(
+                request.run_id,
+                "request-frozen",
+                "runtime_request_frozen",
+                {
+                    "runtime_request_identity": identity_fields(
+                        runtime_request.identity
+                    ),
+                    "experiment_manifest_identity": identity_fields(
+                        request.experiment.manifest_identity
+                    ),
+                    "preflight_identity": identity_fields(preflight_identity),
+                    "evaluation_mode": request.evaluation_mode.value,
+                    "starting_step": start_step,
+                },
             )
-        self._append(
-            request.run_id,
-            "launched",
-            "run_launched",
-            launched_payload,
-        )
+            if retry_of is not None and recovery_checkpoint is not None:
+                self._append(
+                    request.run_id,
+                    "recovered",
+                    "run_recovered",
+                    {
+                        "prior_run_identity": identity_fields(retry_of.identity),
+                        "checkpoint_identity": identity_fields(
+                            recovery_checkpoint.checkpoint_identity
+                        ),
+                        "training_state_identity": identity_fields(
+                            recovery_checkpoint.training_state_identity
+                        ),
+                        "starting_step": recovery_checkpoint.step,
+                        "resume_compatible": True,
+                    },
+                )
+            launched_payload: dict[str, object] = {
+                "run_identity": identity_fields(run.identity),
+                "runtime_request_identity": identity_fields(runtime_request.identity),
+                "attempt_number": attempt_number,
+                "fixture_runtime": self.adapter.runtime_kind == "fixture",
+            }
+            if self.adapter.runtime_kind != "fixture":
+                launched_payload["runtime_identity"] = identity_fields(
+                    self.adapter.runtime_identity
+                )
+            self._append(
+                request.run_id,
+                "launched",
+                "run_launched",
+                launched_payload,
+            )
+        except Exception as exc:
+            self._terminalize_post_launch_failure(
+                request.run_id, "launch_evidence", exc
+            )
         phase = "runtime"
         try:
             adapter_request = FixtureAdapterRequest(
@@ -1758,6 +1765,7 @@ class RunService:
                 "interruption": "run_interruption_persistence_failed",
                 "artifact_ingestion": "artifact_ingestion_failed",
                 "completion": "run_completion_persistence_failed",
+                "launch_evidence": "run_launch_evidence_persistence_failed",
             }.get(phase, "run_post_launch_failed")
         if phase == "artifact_ingestion":
             try:
@@ -1802,7 +1810,7 @@ class RunService:
                 raise SafeIoError("existing runtime output differs")
 
 
-def _validated_run_lifecycle(
+def validated_run_lifecycle(
     events: tuple[StoredEvent, ...],
 ) -> tuple[RunLifecycleStatus, tuple[StoredEvent, ...]]:
     terminal_indexes = tuple(

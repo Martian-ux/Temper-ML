@@ -12,6 +12,7 @@ from temper_ml.app_services.retention import (
     CleanupImpact,
     RetentionService,
 )
+from temper_ml.app_services.runs import RunService
 from temper_ml.domain.artifacts import Artifact, ArtifactAvailability, AvailabilityState
 from temper_ml.domain.records import RecordEnvelope, record_reference
 from temper_ml.domain.retention import (
@@ -20,6 +21,10 @@ from temper_ml.domain.retention import (
     CleanupReceipt,
 )
 from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
+from temper_ml.runtime.ownership import (
+    claim_run_ownership,
+    released_run_claim_identity,
+)
 
 
 def _project(tmp_path: Path, *, launch: bool = False) -> FixtureJourneyService:
@@ -159,6 +164,100 @@ def test_only_terminal_run_staging_is_cleanup_eligible_and_warns_about_cache_los
         "cache_convenience",
         "debugging_evidence",
     }
+
+
+def test_nonterminal_run_outputs_stay_protected_without_cleanup_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journey = _project(tmp_path, launch=True)
+    journey.prepare_replay("ember", "strict_replay")
+    draft = journey._replay_draft
+    assert draft is not None
+    run_id = draft.launch.run_id
+    artifact_id = draft.launch.artifact_id
+    run_service = RunService(tmp_path)
+    original_append = run_service.store.append_event
+
+    def fail_all_run_terminals(stream_id: str, request: object) -> object:
+        if getattr(request, "event_type", None) in {"run_completed", "run_failed"}:
+            raise EvidenceError("fixture_run_terminal_not_committed")
+        return original_append(stream_id, request)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(run_service.store, "append_event", fail_all_run_terminals)
+
+    with pytest.raises(EvidenceError, match="^fixture_run_terminal_not_committed$"):
+        run_service.launch(draft.launch)
+
+    del draft, run_service, journey
+    service = RetentionService(tmp_path)
+    vulnerable = tuple(
+        entry
+        for entry in service.inventory().entries
+        if any(
+            (subject.record_type == "run" and subject.logical_id == run_id)
+            or (subject.record_type == "artifact" and subject.logical_id == artifact_id)
+            for subject in entry.subjects
+        )
+        and entry.byte_class in {ByteClass.CHECKPOINT, ByteClass.FINAL_ADAPTER}
+    )
+
+    assert {entry.byte_class for entry in vulnerable} == {
+        ByteClass.CHECKPOINT,
+        ByteClass.FINAL_ADAPTER,
+    }
+    assert all(not entry.deletable for entry in vulnerable)
+    with pytest.raises(ApplicationServiceError, match="^cleanup_selection_protected$"):
+        service.plan((vulnerable[0].entry_id,))
+    streams = service.store.iter_streams()
+    assert not any(snapshot.stream_id.startswith("cleanup-") for snapshot in streams)
+    run_events = next(
+        snapshot.events for snapshot in streams if snapshot.stream_id == f"run-{run_id}"
+    )
+    assert not any(
+        event.event_type == "run_checkpoint_cleanup_pending" for event in run_events
+    )
+    run_view = next(
+        item
+        for item in FixtureJourneyService(tmp_path).workspace()["runs"]
+        if item["run_id"] == run_id
+    )
+    assert run_view["status"] == "running"
+
+
+def test_cleanup_claims_released_producer_before_starting_evidence(
+    tmp_path: Path,
+) -> None:
+    _project(tmp_path, launch=True)
+    service = RetentionService(tmp_path)
+    entry = next(
+        item
+        for item in service.inventory().entries
+        if item.byte_class is ByteClass.CHECKPOINT
+    )
+    run_id = next(
+        subject.logical_id for subject in entry.subjects if subject.record_type == "run"
+    )
+    plan = service.plan((entry.entry_id,))
+    runtime_root = (tmp_path / retention_module.RUNTIME_OUTPUT_DIRECTORY).absolute()
+    claim_identity = released_run_claim_identity(runtime_root, run_id)
+
+    with claim_run_ownership(runtime_root, run_id, claim_identity):
+        with pytest.raises(ApplicationServiceError) as caught:
+            service.execute(plan, confirm=True)
+    assert caught.value.code in {
+        "cleanup_producer_ownership_unavailable",
+        "storage_inventory_unstable",
+    }
+
+    streams = service.store.iter_streams()
+    assert not any(snapshot.stream_id.startswith("cleanup-") for snapshot in streams)
+    run_events = next(
+        snapshot.events for snapshot in streams if snapshot.stream_id == f"run-{run_id}"
+    )
+    assert not any(
+        event.event_type == "run_checkpoint_cleanup_pending" for event in run_events
+    )
 
 
 def test_cleanup_removes_selected_artifact_bytes_and_supersedes_availability(
@@ -321,6 +420,47 @@ def test_failed_artifact_unlink_restores_verified_availability(
     assert current.available_byte_classes == before.available_byte_classes
     assert current.storage_references == before.storage_references
     assert current.checkpoint_resumable == before.checkpoint_resumable
+
+
+def test_failed_selected_unlink_does_not_restore_a_changed_unselected_member(
+    tmp_path: Path,
+) -> None:
+    _project(tmp_path, launch=True)
+    base_service = RetentionService(tmp_path)
+    artifact = next(
+        stored.record
+        for stored in base_service.store.iter_records()
+        if isinstance(stored.record, Artifact)
+        and stored.record.artifact_id == "artifact-fixture-runtime"
+    )
+    artifact_entries = tuple(
+        entry
+        for entry in base_service.inventory().entries
+        if entry.byte_class is ByteClass.FINAL_ADAPTER
+        and record_reference(artifact) in entry.subjects
+    )
+    selected = next(
+        entry for entry in artifact_entries if entry.logical_key.endswith("adapter.bin")
+    )
+    unselected = next(entry for entry in artifact_entries if entry != selected)
+
+    def change_unselected_then_retain(path: Path) -> None:
+        assert path == selected._path
+        unselected._path.write_bytes(b"changed unselected bundle member")
+        raise PermissionError(path.name)
+
+    service = RetentionService(tmp_path, _remove_file=change_unselected_then_retain)
+    plan = service.plan((selected.entry_id,))
+
+    receipt = service.execute(plan, confirm=True)
+
+    assert receipt.outcome is CleanupOutcome.FAILED
+    assert receipt.objects[0].status is CleanupObjectStatus.RETAINED
+    assert selected._path.exists()
+    current = _current_artifact_availability(service.store, artifact)
+    assert current.state is AvailabilityState.UNAVAILABLE
+    assert current.available_byte_classes == ()
+    assert current.storage_references == ()
 
 
 def test_artifact_changed_after_safety_fence_remains_unavailable(

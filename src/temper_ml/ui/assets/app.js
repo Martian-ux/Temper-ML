@@ -108,7 +108,7 @@ const actions = {
   },
   "replay-execute": () => {
     const plan = workspace?.reproduction?.active_plan;
-    if (!plan?.plan_id) throw new Error("replay_plan_required");
+    if (!plan?.plan_id || !plan?.run_id) throw new Error("replay_plan_required");
     const candidateKey = value("replay-candidate");
     const mode = value("replay-mode");
     if (candidateKey !== plan.candidate_key || mode !== plan.mode) {
@@ -116,6 +116,7 @@ const actions = {
     }
     return post("/api/v1/replays/execute", {
       plan_id: plan.plan_id,
+      run_id: plan.run_id,
       candidate_key: candidateKey,
       mode,
     });

@@ -263,9 +263,10 @@ class TemperUiHandler(BaseHTTPRequestHandler):
                 _required_text(body, "mode"),
             )
         if path == "/api/v1/replays/execute":
-            _require_fields(body, ("plan_id", "candidate_key", "mode"))
+            _require_fields(body, ("plan_id", "run_id", "candidate_key", "mode"))
             return journey.execute_replay(
                 _required_text(body, "plan_id"),
+                run_id=_required_text(body, "run_id"),
                 candidate_key=_required_text(body, "candidate_key"),
                 mode=_required_text(body, "mode"),
             )
@@ -393,8 +394,10 @@ def create_ui_server(
             (TemperUiServer,),
             {"address_family": socket.AF_INET6},
         )
+    journey = FixtureJourneyService(project_root)
+    journey.reconcile_pending_operations()
     server = server_type((host, port), TemperUiHandler)
-    server.journey = FixtureJourneyService(project_root)
+    server.journey = journey
     server.csrf_token = secrets.token_urlsafe(32)
     server.public_host = host
     return server

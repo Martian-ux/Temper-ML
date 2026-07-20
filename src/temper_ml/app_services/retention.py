@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -22,6 +22,11 @@ from temper_ml.app_services._records import (
     write_record_idempotently,
 )
 from temper_ml.app_services.errors import ApplicationServiceError
+from temper_ml.app_services.runs import validated_run_lifecycle
+from temper_ml.domain.base_models import BaseModelRevision
+from temper_ml.domain.compatibility import CompatibilityGroup
+from temper_ml.domain.datasets import DatasetVersion
+from temper_ml.domain.experiments import Experiment
 from temper_ml.domain.artifacts import (
     Artifact,
     ArtifactAvailability,
@@ -52,7 +57,8 @@ from temper_ml.domain.retention import (
     CleanupReceipt,
     require_cleanup_logical_key,
 )
-from temper_ml.domain.runs import Run
+from temper_ml.domain.recipes import RecipeResolution
+from temper_ml.domain.runs import ResolvedRuntimeRequest, Run
 from temper_ml.filesystem import (
     UnsafeFilesystemPath,
     ensure_safe_directory,
@@ -66,10 +72,18 @@ from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
 from temper_ml.store.event_stream import EventRequest
 from temper_ml.store.safe_io import SafeIoError
 from temper_ml.runtime.artifact_integrity import (
+    ArtifactIntegrityError,
+    ArtifactIntegrityExpectation,
     EXPORT_BUNDLE_PREFIX,
     EXPORT_MANIFEST_MEMBER,
+    verify_artifact_bundle,
 )
 from temper_ml.runtime.fixture_adapter import FIXTURE_ARTIFACT_MEMBERS
+from temper_ml.runtime.ownership import (
+    RunOwnershipError,
+    claim_released_run_ownership,
+    released_run_claim_identity,
+)
 
 
 RUNTIME_OUTPUT_DIRECTORY = ".temper-fixture-output"
@@ -474,10 +488,11 @@ class RetentionService:
                 except OSError:
                     pass
 
-    def inventory(self) -> StorageInventory:
+    def inventory(self, *, reconcile_pending: bool = True) -> StorageInventory:
         """Build one link-safe, content-verified snapshot of all runtime bytes."""
 
-        self._reconcile_pending()
+        if reconcile_pending:
+            self._reconcile_pending()
         try:
             self.store.verify()
             records = tuple(stored.record for stored in self.store.iter_records())
@@ -486,6 +501,7 @@ class RetentionService:
         except EvidenceError as exc:
             raise ApplicationServiceError(exc.code) from None
         root = self._runtime_root()
+        released_run_ids = self._released_run_ids(records)
         try:
             if safe_path_stat(root, allow_missing=True) is None:
                 identity = content_identity(INVENTORY_PROJECTION, {"entries": []})
@@ -497,7 +513,15 @@ class RetentionService:
                 if path.relative_to(root).as_posix() != CLEANUP_LOCK_LOGICAL_KEY
             )
             observations = tuple(
-                self._observe(path, root, records, streams, manifests) for path in paths
+                self._observe(
+                    path,
+                    root,
+                    records,
+                    streams,
+                    manifests,
+                    released_run_ids,
+                )
+                for path in paths
             )
         except ApplicationServiceError:
             raise
@@ -677,7 +701,7 @@ class RetentionService:
             ):
                 raise ApplicationServiceError("cleanup_execution_conflict")
             return existing
-        current = self.inventory()
+        current = self.inventory(reconcile_pending=False)
         if current.inventory_identity != plan.inventory.inventory_identity:
             raise ApplicationServiceError("cleanup_plan_stale")
         current_by_id = {entry.entry_id: entry for entry in current.entries}
@@ -691,6 +715,15 @@ class RetentionService:
             for entry in selected
         ):
             raise ApplicationServiceError("cleanup_plan_stale")
+        with self._claim_producer_ownership(selected):
+            return self._execute_owned(plan, current, selected)
+
+    def _execute_owned(
+        self,
+        plan: CleanupPlan,
+        current: StorageInventory,
+        selected: tuple[InventoryEntry, ...],
+    ) -> CleanupReceipt:
         intent = self._intent_from_plan(plan, selected)
         self._append_cleanup(
             intent.stream_id,
@@ -783,8 +816,9 @@ class RetentionService:
             raise ApplicationServiceError("cleanup_reconciliation_required")
         return self._finalize_execution(intent, statuses, failure_code)
 
-    def receipts(self) -> tuple[CleanupReceipt, ...]:
-        self._reconcile_pending()
+    def receipts(self, *, reconcile_pending: bool = True) -> tuple[CleanupReceipt, ...]:
+        if reconcile_pending:
+            self._reconcile_pending()
         try:
             return tuple(
                 stored.record
@@ -794,6 +828,22 @@ class RetentionService:
         except EvidenceError as exc:
             raise ApplicationServiceError(exc.code) from None
 
+    def reconcile_pending(self) -> tuple[CleanupReceipt, ...]:
+        """Recover interrupted cleanup only at an explicit mutation boundary."""
+
+        try:
+            self._reconcile_pending()
+        except ApplicationServiceError as exc:
+            if exc.code in {
+                "project_not_found",
+                "store_missing",
+                "store_not_found",
+                "store_root_missing",
+            }:
+                return ()
+            raise
+        return self.receipts(reconcile_pending=False)
+
     def _observe(
         self,
         path: Path,
@@ -801,6 +851,7 @@ class RetentionService:
         records: tuple[TypedRecord, ...],
         streams: tuple[Any, ...],
         manifests: tuple[BundleManifest, ...],
+        released_run_ids: frozenset[str],
     ) -> _ObservedFile:
         try:
             snapshot = _stream_file_snapshot(path, chunk_size=self._hash_chunk_size)
@@ -813,6 +864,7 @@ class RetentionService:
             streams,
             manifests,
             snapshot.content_identity,
+            released_run_ids,
         )
         try:
             require_cleanup_logical_key(logical_key)
@@ -1033,6 +1085,8 @@ class RetentionService:
             if removed:
                 raise ApplicationServiceError("cleanup_artifact_fence_missing")
             return None
+        if not removed:
+            self._verify_complete_artifact_bundle(artifact)
         disposition = "removed" if removed else "restored"
         availability_id = _availability_id(disposition, intent, artifact)
         existing = self._availability_by_id(availability_id)
@@ -1079,6 +1133,72 @@ class RetentionService:
             conflict_code="cleanup_availability_conflict",
         )
         return update
+
+    def _verify_complete_artifact_bundle(self, artifact: Artifact) -> None:
+        run = self._read_exact_record(
+            artifact.producing_run, Run, "cleanup_artifact_integrity_mismatch"
+        )
+        runtime_request = self._record_by_identity(
+            ResolvedRuntimeRequest,
+            run.request_identity,
+            "cleanup_artifact_integrity_mismatch",
+        )
+        experiment = self._read_exact_record(
+            run.experiment, Experiment, "cleanup_artifact_integrity_mismatch"
+        )
+        resolution = self._read_exact_record(
+            runtime_request.recipe_resolution,
+            RecipeResolution,
+            "cleanup_artifact_integrity_mismatch",
+        )
+        dataset = self._record_by_identity(
+            DatasetVersion,
+            runtime_request.dataset_version_identity,
+            "cleanup_artifact_integrity_mismatch",
+        )
+        model = self._read_exact_record(
+            artifact.base_model_revision,
+            BaseModelRevision,
+            "cleanup_artifact_integrity_mismatch",
+        )
+        group = self._read_exact_record(
+            experiment.compatibility_group,
+            CompatibilityGroup,
+            "cleanup_artifact_integrity_mismatch",
+        )
+        if (
+            experiment.compatibility_group not in artifact.compatibility_groups
+            or artifact.tokenizer_identity != model.tokenizer_identity
+        ):
+            raise ApplicationServiceError("cleanup_artifact_integrity_mismatch")
+        try:
+            expectation = ArtifactIntegrityExpectation(
+                bundle_identity=artifact.content_identity,
+                producing_run=run,
+                runtime_request=runtime_request,
+                experiment=experiment,
+                recipe_resolution=resolution,
+                dataset_version=dataset,
+                base_model_revision=model,
+                compatibility_group=group,
+            )
+            integrity = verify_artifact_bundle(
+                self._runtime_root() / "artifacts" / artifact.artifact_id,
+                expectation,
+            )
+            stored_manifest = self.store.read_bundle_manifest(artifact.content_identity)
+        except ArtifactIntegrityError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        except EvidenceError:
+            raise ApplicationServiceError(
+                "cleanup_artifact_integrity_mismatch"
+            ) from None
+        if (
+            integrity.bundle_manifest != stored_manifest
+            or integrity.evidence_identity != artifact.integrity_evidence
+            or integrity.provenance_identity != artifact.provenance
+        ):
+            raise ApplicationServiceError("cleanup_artifact_integrity_mismatch")
 
     def _finalize_execution(
         self,
@@ -1489,35 +1609,43 @@ class RetentionService:
                 raise ApplicationServiceError("cleanup_intent_invalid") from None
             if snapshot.stream_id != intent.stream_id:
                 raise ApplicationServiceError("cleanup_intent_invalid")
-            existing = self._receipt_by_id(intent.receipt_id)
-            if existing is not None:
-                if (
-                    existing.execution_id != intent.execution_id
-                    or existing.plan_identity != intent.plan_identity
-                    or existing.inventory_identity != intent.inventory_identity
-                ):
-                    raise ApplicationServiceError("cleanup_execution_conflict")
-                statuses = {item.entry_id: item.status for item in existing.objects}
-                _, safety_failure = self._settle_safety_fences(intent, statuses)
-                if safety_failure is not None:
-                    self._record_failure(intent, safety_failure)
-                try:
-                    self._append_terminal(intent, existing)
-                except ApplicationServiceError:
-                    pass
-                continue
-            statuses = self._reconciled_statuses(intent, snapshot.events)
-            failure_code = next(
-                (
-                    value
-                    for event in reversed(snapshot.events)
-                    if event.event_type == "cleanup_failure_observed"
-                    and isinstance((value := event.payload.get("failure_code")), str)
-                    and value
-                ),
-                "cleanup_reconciled_after_interruption",
-            )
-            self._finalize_execution(intent, statuses, failure_code)
+            with self._claim_producer_ownership(intent.objects):
+                self._reconcile_intent(intent, snapshot.events)
+
+    def _reconcile_intent(
+        self,
+        intent: _CleanupIntent,
+        events: tuple[Any, ...],
+    ) -> None:
+        existing = self._receipt_by_id(intent.receipt_id)
+        if existing is not None:
+            if (
+                existing.execution_id != intent.execution_id
+                or existing.plan_identity != intent.plan_identity
+                or existing.inventory_identity != intent.inventory_identity
+            ):
+                raise ApplicationServiceError("cleanup_execution_conflict")
+            statuses = {item.entry_id: item.status for item in existing.objects}
+            _, safety_failure = self._settle_safety_fences(intent, statuses)
+            if safety_failure is not None:
+                self._record_failure(intent, safety_failure)
+            try:
+                self._append_terminal(intent, existing)
+            except ApplicationServiceError:
+                pass
+            return
+        statuses = self._reconciled_statuses(intent, events)
+        failure_code = next(
+            (
+                value
+                for event in reversed(events)
+                if event.event_type == "cleanup_failure_observed"
+                and isinstance((value := event.payload.get("failure_code")), str)
+                and value
+            ),
+            "cleanup_reconciled_after_interruption",
+        )
+        self._finalize_execution(intent, statuses, failure_code)
 
     def _reconciled_statuses(
         self,
@@ -1602,6 +1730,118 @@ class RetentionService:
             )
         except EvidenceError as exc:
             raise ApplicationServiceError(exc.code) from None
+
+    def _released_run_ids(self, records: tuple[TypedRecord, ...]) -> frozenset[str]:
+        released: set[str] = set()
+        root = self._runtime_root()
+        for record in records:
+            if not isinstance(record, Run):
+                continue
+            try:
+                released_run_claim_identity(root, record.run_id)
+            except RunOwnershipError:
+                continue
+            released.add(record.run_id)
+        return frozenset(released)
+
+    @contextmanager
+    def _claim_producer_ownership(self, objects: Iterable[Any]) -> Iterator[None]:
+        run_ids = self._producer_run_ids(objects)
+        claims: list[tuple[str, ContentIdentity]] = []
+        try:
+            for run_id in run_ids:
+                claims.append(
+                    (
+                        run_id,
+                        released_run_claim_identity(self._runtime_root(), run_id),
+                    )
+                )
+            with ExitStack() as stack:
+                for run_id, claim_identity in claims:
+                    stack.enter_context(
+                        claim_released_run_ownership(
+                            self._runtime_root(), run_id, claim_identity
+                        )
+                    )
+                yield
+        except RunOwnershipError:
+            raise ApplicationServiceError(
+                "cleanup_producer_ownership_unavailable"
+            ) from None
+
+    def _producer_run_ids(self, objects: Iterable[Any]) -> tuple[str, ...]:
+        run_ids: set[str] = set()
+
+        def add_run(reference: RecordReference) -> None:
+            run = self._read_exact_record(
+                reference, Run, "cleanup_producer_evidence_invalid"
+            )
+            run_ids.add(run.run_id)
+
+        for item in objects:
+            byte_class = getattr(item, "byte_class", None)
+            subjects = getattr(item, "subjects", ())
+            if not isinstance(subjects, tuple):
+                raise ApplicationServiceError("cleanup_producer_evidence_invalid")
+            if byte_class in {ByteClass.CHECKPOINT, ByteClass.STAGING_CACHE}:
+                for subject in subjects:
+                    if subject.record_type == "run":
+                        add_run(subject)
+            elif byte_class is ByteClass.FINAL_ADAPTER:
+                for subject in subjects:
+                    if subject.record_type != "artifact":
+                        continue
+                    artifact = self._read_exact_record(
+                        subject, Artifact, "cleanup_producer_evidence_invalid"
+                    )
+                    add_run(artifact.producing_run)
+            elif byte_class is ByteClass.EXPORT_BUNDLE:
+                for subject in subjects:
+                    if subject.record_type != "adapter_export":
+                        continue
+                    exported = self._read_exact_record(
+                        subject, AdapterExport, "cleanup_producer_evidence_invalid"
+                    )
+                    artifact = self._read_exact_record(
+                        exported.artifact,
+                        Artifact,
+                        "cleanup_producer_evidence_invalid",
+                    )
+                    add_run(artifact.producing_run)
+        return tuple(sorted(run_ids))
+
+    def _read_exact_record(
+        self,
+        reference: RecordReference,
+        kind: type[Any],
+        code: str,
+    ) -> Any:
+        try:
+            record = self.store.read_record(reference).record
+        except EvidenceError:
+            raise ApplicationServiceError(code) from None
+        if not isinstance(record, kind):
+            raise ApplicationServiceError(code)
+        return record
+
+    def _record_by_identity(
+        self,
+        kind: type[Any],
+        identity: ContentIdentity,
+        code: str,
+    ) -> Any:
+        try:
+            matches = tuple(
+                stored.record
+                for stored in self.store.iter_records()
+                if isinstance(stored.record, kind)
+                and stored.record.identity == identity
+            )
+        except EvidenceError:
+            raise ApplicationServiceError(code) from None
+        if len(matches) != 1:
+            raise ApplicationServiceError(code)
+        return matches[0]
 
     def _project(self) -> Project:
         projects = tuple(
@@ -1898,6 +2138,7 @@ def _classify(
     streams: tuple[Any, ...],
     manifests: tuple[BundleManifest, ...],
     observed_identity: ContentIdentity,
+    released_run_ids: frozenset[str],
 ) -> tuple[
     ByteClass,
     tuple[RecordReference, ...],
@@ -1913,14 +2154,18 @@ def _classify(
             for record in records
             if isinstance(record, Artifact) and record.artifact_id == parts[1]
         )
-        known_member = any(
-            manifest.identity == artifact.content_identity
+        known_member = len(artifacts) == 1 and any(
+            manifest.identity == artifacts[0].content_identity
             and any(member.path == relative for member in manifest.members)
-            for artifact in artifacts
             for manifest in manifests
         )
-        if not subjects or not known_member:
+        if not subjects or not known_member or len(artifacts) != 1:
             return _protected_unknown(subjects)
+        producer_settled = _run_output_settled(
+            artifacts[0].producing_run.logical_id,
+            streams,
+            released_run_ids,
+        )
         return (
             ByteClass.FINAL_ADAPTER,
             subjects,
@@ -1928,13 +2173,19 @@ def _classify(
                 CleanupImpact.FINAL_ARTIFACT_AVAILABILITY,
                 CleanupImpact.INSPECTABILITY,
             ),
-            bool(subjects),
+            bool(subjects) and producer_settled,
         )
     if len(parts) >= 3 and parts[0] == "checkpoints":
         subjects = _records_by_id(records, Run, parts[1])
+        runs = tuple(
+            record
+            for record in records
+            if isinstance(record, Run) and record.run_id == parts[1]
+        )
         checkpoint_identity = _checkpoint_identity(parts[1], logical_key, streams)
         if (
             not subjects
+            or len(runs) != 1
             or checkpoint_identity is None
             or checkpoint_identity != observed_identity
         ):
@@ -1946,10 +2197,15 @@ def _classify(
             ByteClass.CHECKPOINT,
             subjects,
             tuple(sorted(impacts, key=lambda item: item.value)),
-            bool(subjects),
+            bool(subjects) and _run_output_settled(parts[1], streams, released_run_ids),
         )
     if len(parts) >= 3 and parts[0] == "exports":
         subjects = _records_by_id(records, AdapterExport, parts[1])
+        exports = tuple(
+            record
+            for record in records
+            if isinstance(record, AdapterExport) and record.export_id == parts[1]
+        )
         relative = PurePosixPath(*parts[2:]).as_posix()
         known_members = {
             EXPORT_MANIFEST_MEMBER,
@@ -1958,13 +2214,21 @@ def _classify(
                 for member in FIXTURE_ARTIFACT_MEMBERS
             ),
         }
-        if not subjects or relative not in known_members:
+        if not subjects or len(exports) != 1 or relative not in known_members:
+            return _protected_unknown(subjects)
+        artifact = _record_for_reference(records, exports[0].artifact, Artifact)
+        if artifact is None:
             return _protected_unknown(subjects)
         return (
             ByteClass.EXPORT_BUNDLE,
             subjects,
             (CleanupImpact.INSPECTABILITY,),
-            bool(subjects),
+            bool(subjects)
+            and _run_output_settled(
+                artifact.producing_run.logical_id,
+                streams,
+                released_run_ids,
+            ),
         )
     if parts and parts[0] == "runtime-ownership":
         subjects = _records_by_id(records, Run, parts[1]) if len(parts) > 1 else ()
@@ -1976,11 +2240,18 @@ def _classify(
         )
     if parts and parts[0] == "library-staging":
         subjects = _records_by_id(records, Run, parts[1]) if len(parts) > 1 else ()
+        runs = tuple(
+            record
+            for record in records
+            if isinstance(record, Run) and len(parts) > 1 and record.run_id == parts[1]
+        )
         return (
             ByteClass.STAGING_CACHE,
             subjects,
             (CleanupImpact.CACHE_CONVENIENCE, CleanupImpact.DEBUGGING_EVIDENCE),
-            bool(subjects) and _run_terminal(parts[1], streams),
+            bool(subjects)
+            and len(runs) == 1
+            and _run_output_settled(parts[1], streams, released_run_ids),
         )
     if parts and parts[0] == "logs":
         return (
@@ -2013,6 +2284,19 @@ def _records_by_id(
         and getattr(record, _logical_id_field(record), None) == logical_id
     )
     return _sorted_references(matches)
+
+
+def _record_for_reference(
+    records: tuple[TypedRecord, ...],
+    reference: RecordReference,
+    kind: type[Any],
+) -> Any | None:
+    matches = tuple(
+        record
+        for record in records
+        if isinstance(record, kind) and record_reference(record) == reference
+    )
+    return matches[0] if len(matches) == 1 else None
 
 
 def _logical_id_field(record: TypedRecord) -> str:
@@ -2105,18 +2389,25 @@ def _checkpoint_resumable(
     return False
 
 
-def _run_terminal(run_id: str, streams: tuple[Any, ...]) -> bool:
-    terminal = {
-        "run_preflight_blocked",
-        "run_cancelled",
-        "run_interrupted",
-        "run_completed",
-        "run_failed",
-    }
-    return any(
-        snapshot.stream_id == f"run-{run_id}"
-        and any(event.event_type in terminal for event in snapshot.events)
-        for snapshot in streams
+def _run_output_settled(
+    run_id: str,
+    streams: tuple[Any, ...],
+    released_run_ids: frozenset[str],
+) -> bool:
+    if run_id not in released_run_ids:
+        return False
+    matches = tuple(
+        snapshot for snapshot in streams if snapshot.stream_id == f"run-{run_id}"
+    )
+    if len(matches) != 1:
+        return False
+    try:
+        status, lifecycle = validated_run_lifecycle(matches[0].events)
+    except ApplicationServiceError:
+        return False
+    return (
+        status.terminal
+        and sum(event.event_type == "run_launched" for event in lifecycle) == 1
     )
 
 

@@ -205,7 +205,11 @@ class _FixtureReplayDraft:
     candidate_key: str
 
     def to_view(self) -> dict[str, object]:
-        return {**self.plan.to_view(), "candidate_key": self.candidate_key}
+        return {
+            **self.plan.to_view(),
+            "candidate_key": self.candidate_key,
+            "run_id": self.launch.run_id,
+        }
 
 
 class FixtureJourneyService:
@@ -926,7 +930,6 @@ class FixtureJourneyService:
         }
 
     def workspace(self) -> dict[str, object]:
-        ReproductionService(self.project_root).reconcile_pending()
         previews = (
             [preview.to_dict() for preview in self.state.prepared.previews]
             if self.state.prepared is not None
@@ -946,7 +949,21 @@ class FixtureJourneyService:
     def storage_inventory(self) -> dict[str, object]:
         """Return the complete fixed-root inventory without implicit selection."""
 
-        return RetentionService(self.project_root).inventory().to_view()
+        return (
+            RetentionService(self.project_root)
+            .inventory(reconcile_pending=False)
+            .to_view()
+        )
+
+    def reconcile_pending_operations(self) -> dict[str, object]:
+        """Recover interrupted mutations at an explicit controlled boundary."""
+
+        replay = ReproductionService(self.project_root).reconcile_pending()
+        cleanup = RetentionService(self.project_root).reconcile_pending()
+        return {
+            "replay_execution_count": len(replay),
+            "cleanup_receipt_count": len(cleanup),
+        }
 
     def preview_cleanup(self, entry_ids: tuple[str, ...]) -> dict[str, object]:
         """Cache one exact cleanup plan for a later explicit confirmation."""
@@ -1112,6 +1129,7 @@ class FixtureJourneyService:
         self,
         plan_id: str,
         *,
+        run_id: str,
         candidate_key: str | None = None,
         mode: str | None = None,
     ) -> dict[str, object]:
@@ -1123,6 +1141,7 @@ class FixtureJourneyService:
                 ReproductionService(self.project_root)
                 .reconcile_plan(
                     plan_id,
+                    run_id,
                     candidate_key=candidate_key,
                     mode=mode,
                 )
@@ -1130,6 +1149,8 @@ class FixtureJourneyService:
             )
         if not isinstance(plan_id, str) or plan_id != draft.plan.plan_id:
             raise ApplicationServiceError("replay_plan_mismatch")
+        if not isinstance(run_id, str) or run_id != draft.launch.run_id:
+            raise ApplicationServiceError("replay_run_plan_mismatch")
         if candidate_key is not None and candidate_key != draft.candidate_key:
             raise ApplicationServiceError("replay_candidate_plan_mismatch")
         if mode is not None and mode != draft.plan.mode.value:
@@ -1330,7 +1351,11 @@ class WorkspaceQueryService:
         store = TypedEvidenceStore(self.project_root)
         try:
             store.verify()
-            inventory = RetentionService(self.project_root).inventory().to_view()
+            inventory = (
+                RetentionService(self.project_root)
+                .inventory(reconcile_pending=False)
+                .to_view()
+            )
             checkpoint_identities = _verified_checkpoint_identities(inventory)
             verification = store.verify()
             stored = store.iter_records()
@@ -2046,10 +2071,16 @@ def _replay_execution_views(streams: tuple[Any, ...]) -> list[dict[str, object]]
         )
         mode = started.payload.get("mode")
         run_id = started.payload.get("run_id")
+        plan_id = started.payload.get("plan_id")
+        candidate_key = started.payload.get("candidate_key")
         views.append(
             {
                 "mode": mode if isinstance(mode, str) else "unknown",
                 "run_id": run_id if isinstance(run_id, str) else None,
+                "plan_id": plan_id if isinstance(plan_id, str) else None,
+                "candidate_key": (
+                    candidate_key if isinstance(candidate_key, str) else None
+                ),
                 "status": (
                     str(terminal.payload.get("run_status", "failed"))
                     if terminal is not None
