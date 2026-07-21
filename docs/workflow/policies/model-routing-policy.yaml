@@ -58,6 +58,12 @@ route_record:
     matched_run_requirement: "CONTROL and EXPERIMENTAL require predeclared=true plus trial_id, pair_id, run_id, protocol_ref, frozen_task_identity, isolation_ref, and task_mix."
     matched_result_runtime_requirement: "Every run in a MATCHED_TRIAL must have supported OBSERVED runtime model/effort, exact agreement with the declaration, and PASS declared-route compliance."
     observational_rule: "Any comparison that was not predeclared or did not use the same frozen task in isolated worktrees is OBSERVATIONAL and cannot establish a default route."
+  maintainer_exception:
+    rule: "A selected-route mismatch is valid only with an explicit approved maintainer exception bound to the exact task key, base, subject, complete owned-path set, selected model and effort, and the same authority reference as the task authorization."
+    required: [actor, approved, task_key, exact_base, subject, owned_paths, authorized_selection, authority_reference, reason, public_policy_change, precedent]
+    constraints: {actor: maintainer, approved: true, public_policy_change: false, precedent: false}
+    experiment_rule: "A route exception is forbidden for CONTROL, EXPERIMENTAL, and OBSERVATIONAL records and is never matched-trial or route-default evidence."
+    enforcement_rule: "The exception permits only the identity-bound root task to continue; it does not change the declared route, compliance result, normal route defaults, reviewer route, or worker-count policy."
 
 selection_mechanisms:
   host_controls: {model_selector: model, effort_selector: reasoning_effort, context_field: control_surface}

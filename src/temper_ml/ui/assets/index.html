@@ -4,9 +4,9 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="temper-csrf" content="{{CSRF_TOKEN}}">
-    <title>Temper ML - Local evaluation lab</title>
-    <link rel="stylesheet" href="/assets/app.css?v=storage-v6">
-    <script src="/assets/app.js?v=storage-v6" defer></script>
+    <title>Temper ML - Local training workspace</title>
+    <link rel="stylesheet" href="/assets/app.css?v=consumer-v2">
+    <script src="/assets/app.js?v=consumer-v2" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#primary-workspace">Skip to workspace</a>
@@ -18,7 +18,7 @@
           <span class="brand-name">TEMPER ML</span>
         </div>
 
-        <nav class="workflow-rail" aria-label="Fixture workflow">
+        <nav class="workflow-rail" aria-label="Local training workflow">
           <p class="nav-label">Workspace</p>
           <ol id="workflow-steps" class="workflow-steps">
             <li>
@@ -49,7 +49,7 @@
                 <span class="nav-state" aria-hidden="true"></span>
               </button>
             </li>
-            <li>
+            <li data-fixture-only>
               <button type="button" data-stage="evaluate">
                 <span class="nav-index">05</span>
                 <span class="nav-copy"><strong>Evaluate</strong><small>Compare and review</small></span>
@@ -63,7 +63,7 @@
                 <span class="nav-state" aria-hidden="true"></span>
               </button>
             </li>
-            <li>
+            <li data-fixture-only>
               <button type="button" data-stage="storage">
                 <span class="nav-index">07</span>
                 <span class="nav-copy"><strong>Storage</strong><small>Cleanup and replay</small></span>
@@ -80,7 +80,7 @@
           </div>
           <div class="system-tile">
             <span class="system-dot" aria-hidden="true"></span>
-            <span><strong>Fixture runtime</strong><small>Offline and deterministic</small></span>
+            <span><strong id="runtime-label">Choose a mode</strong><small id="runtime-detail">Fixture demo or real local training</small></span>
           </div>
         </div>
       </aside>
@@ -99,30 +99,48 @@
             </div>
             <div class="context-pill">
               <span>Execution</span>
-              <strong>Fixture CPU / offline</strong>
+              <strong id="execution-context">Fixture demo / offline</strong>
             </div>
           </div>
         </header>
 
         <div class="content-grid">
           <main id="primary-workspace" class="workspace" tabindex="-1">
+            <div id="mode-banner" class="mode-banner is-unconfigured" role="status">
+              <strong>CHOOSE A MODE</strong>
+              <span>Select the unmistakable fixture demo or configure genuine real local training.</span>
+            </div>
             <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
 
             <section class="stage-panel is-active" data-panel="setup" aria-labelledby="setup-title">
               <header class="panel-heading panel-heading-overview">
                 <div>
-                  <p class="eyebrow">Fixture journey</p>
-                  <h2 id="setup-title" data-panel-title tabindex="-1">Build evidence you can inspect.</h2>
-                  <p class="lead">Move from a synthetic project to two verified candidates, an honest recommendation, and focused local use.</p>
+                  <p class="eyebrow">Local training journey</p>
+                  <h2 id="setup-title" data-panel-title tabindex="-1">Choose an honest execution mode.</h2>
+                  <p class="lead">Use the unmistakable fixture demo, or point Temper at a complete local model and tokenizer for genuine library-backed LoRA training.</p>
                 </div>
                 <span class="stage-state" data-stage-state="setup">Pending</span>
               </header>
+
+              <section class="dashboard-card setup-card" aria-labelledby="mode-title">
+                <div class="card-heading"><div><p class="card-kicker">Execution contract</p><h3 id="mode-title">Mode and local sources</h3></div></div>
+                <div class="setup-grid">
+                  <label>Mode<select id="training-mode"><option value="fixture_demo">Fixture demo — trains nothing</option><option value="real_local">Real local LoRA training</option></select></label>
+                  <label>Target<select id="execution-target"><option value="native_local">Native local runtime</option><option value="wsl_rocm">WSL / ROCm worker (explicitly configured)</option></select></label>
+                  <label class="wide-field">Local model directory<input id="model-source" autocomplete="off" placeholder="Absolute path to a complete local model snapshot"></label>
+                  <label class="wide-field">Local tokenizer directory<input id="tokenizer-source" autocomplete="off" placeholder="Absolute path to a complete local tokenizer snapshot"></label>
+                  <label>Display name<input id="model-display-name" value="Local model" autocomplete="off"></label>
+                  <label>Revision label<input id="model-revision" value="local-revision" autocomplete="off"></label>
+                </div>
+                <p class="field-help">Paths stay private and must already exist. Native mode reports CPU/CUDA/ROCm exactly as observed; WSL/ROCm never silently falls back.</p>
+                <button class="primary-action" type="button" data-action="setup">Open workspace</button>
+              </section>
 
               <section class="dashboard-card status-board" aria-labelledby="status-board-title">
                 <div class="card-heading">
                   <div>
                     <p class="card-kicker">Current candidate</p>
-                    <h3 id="status-board-title">Fixture workspace status</h3>
+                    <h3 id="status-board-title">Workspace status</h3>
                   </div>
                   <span id="overview-status-badge" class="status-badge">Ready to begin</span>
                 </div>
@@ -153,16 +171,16 @@
                 <div class="card-heading">
                   <div>
                     <p class="card-kicker">Workflow</p>
-                    <h3 id="workflow-board-title">Fixture execution timeline</h3>
+                    <h3 id="workflow-board-title">Execution timeline</h3>
                     <p>Every stage records deterministic evidence before the next one becomes meaningful.</p>
                   </div>
                 </div>
                 <ol class="journey-line">
                   <li data-journey-step="setup"><span class="journey-node">01</span><strong>Project</strong><small>Policy and task</small></li>
                   <li data-journey-step="data"><span class="journey-node">02</span><strong>Data</strong><small>Frozen version</small></li>
-                  <li data-journey-step="recipe"><span class="journey-node">03</span><strong>Resolve</strong><small>Two manifests</small></li>
-                  <li data-journey-step="run"><span class="journey-node">04</span><strong>Run</strong><small>Verified artifacts</small></li>
-                  <li data-journey-step="evaluate"><span class="journey-node">05</span><strong>Review</strong><small>Policy evidence</small></li>
+                  <li data-journey-step="recipe"><span class="journey-node">03</span><strong>Resolve</strong><small>Preflighted settings</small></li>
+                  <li data-journey-step="run"><span class="journey-node">04</span><strong>Run</strong><small>Verified outputs</small></li>
+                  <li data-journey-step="evaluate" data-fixture-only><span class="journey-node">05</span><strong>Review</strong><small>Policy evidence</small></li>
                   <li data-journey-step="use"><span class="journey-node">06</span><strong>Use</strong><small>Local only</small></li>
                 </ol>
                 <div class="next-action">
@@ -202,15 +220,45 @@
               <section class="dashboard-card data-card">
                 <div class="split-layout">
                   <div class="form-stack">
-                    <label for="dataset-format">Source format</label>
+                    <label for="dataset-source-kind">Source</label>
+                    <select id="dataset-source-kind">
+                      <option value="fixture">Built-in fixture demo</option>
+                      <option value="hugging_face">Hugging Face dataset</option>
+                      <option value="local_file">Local file (up to 256 MiB)</option>
+                      <option value="paste">Paste small source</option>
+                    </select>
+                    <label for="dataset-format">Format</label>
                     <select id="dataset-format">
-                      <option value="fixture">Built-in synthetic fixture</option>
-                      <option value="json">JSON</option>
                       <option value="jsonl">JSONL</option>
+                      <option value="json">JSON</option>
                       <option value="csv">CSV</option>
                     </select>
-                    <label for="dataset-source">Local source</label>
-                    <textarea id="dataset-source" rows="10" spellcheck="false" placeholder="Paste local JSON, JSONL, or CSV. The built-in fixture needs no source text."></textarea>
+                    <label for="dataset-file">Local file</label>
+                    <input id="dataset-file" type="file" accept=".json,.jsonl,.csv,application/json,text/csv">
+                    <label for="dataset-source">Pasted source</label>
+                    <textarea id="dataset-source" rows="5" spellcheck="false" placeholder="Small JSON, JSONL, or CSV sources only."></textarea>
+                    <div class="subform">
+                      <label>Hugging Face URL<input id="hf-url" value="https://huggingface.co/datasets/Glint-Research/Fable-5-traces" autocomplete="off"></label>
+                      <label>Hugging Face source<select id="hf-source-mode"><option value="config_split">Config + split rows</option><option value="repository_file">Repository file</option></select></label>
+                      <label data-hf-mode="repository_file" hidden>Repository file<input id="hf-file" placeholder="fable5_cot_merged.jsonl" autocomplete="off"></label>
+                      <label data-hf-mode="config_split">Config<input id="hf-config" value="pi_agent" autocomplete="off"></label>
+                      <label data-hf-mode="config_split">Split<input id="hf-split" value="train" autocomplete="off"></label>
+                    </div>
+                    <details open><summary>Field mapping and sequence policy</summary>
+                      <p class="field-help">Defaults match the Fable-5 <code>pi_agent</code> viewer rows: <code>prompt</code> + <code>trace</code> with structured <code>messages</code> output. The repository-file training JSONL instead uses <code>context</code>, <code>completion</code>, <code>cot</code>, and <code>output</code>. Fixture demo rows ignore these controls.</p>
+                      <div class="compact-grid">
+                        <label>Context<input id="field-context" value="prompt"></label>
+                        <label>Completion<input id="field-completion" value="trace"></label>
+                        <label>Chain of thought<input id="field-cot" placeholder="Optional; flat-file field: cot"></label>
+                        <label>Output<input id="field-output" value="messages" placeholder="Optional text or JSON structure"></label>
+                        <label>Renderer<select id="dataset-renderer"><option value="trace_completion">Context + completion</option><option value="trace_components" selected>Context + completion + CoT + output</option><option value="instruction_response">Instruction + response</option></select></label>
+                        <label>Max source rows<input id="dataset-row-limit" type="number" min="1" max="10000" value="4"></label>
+                        <label>Max tokens / row<input id="dataset-max-tokens" type="number" min="1" value="32768"></label>
+                        <label>Max characters / row<input id="dataset-max-characters" type="number" min="1" placeholder="No limit"></label>
+                        <label>Train weight<input id="train-weight" type="number" min="1" value="9"></label>
+                        <label>Validation weight<input id="validation-weight" type="number" min="1" value="1"></label>
+                      </div>
+                    </details>
                     <button class="primary-action" type="button" data-action="import">Import and inspect</button>
                   </div>
                   <div class="metric-ledger" id="dataset-ledger" aria-label="Dataset statistics">
@@ -220,6 +268,7 @@
                     <div><span>Rendered bytes</span><strong>-</strong></div>
                   </div>
                 </div>
+                <div id="dataset-analysis" class="dataset-analysis" aria-live="polite"></div>
                 <div id="dataset-previews" class="preview-list" aria-label="Private dataset previews"></div>
               </section>
             </section>
@@ -229,14 +278,22 @@
                 <div>
                   <p class="eyebrow">03 / Recipe resolution</p>
                   <h2 id="recipe-title" data-panel-title tabindex="-1">Compare manifests before execution.</h2>
-                  <p class="lead">Two bounded LoRA fixture recipes share one task and runtime target while keeping every material setting visible.</p>
+                  <p id="recipe-lead" class="lead">Bounded LoRA settings keep every material choice visible before execution.</p>
                 </div>
                 <span class="stage-state" data-stage-state="recipe">Pending</span>
               </header>
               <section class="dashboard-card">
                 <div class="section-toolbar">
-                  <div><span>Resolution target</span><strong>Portable fixture CPU / fp32</strong></div>
+                  <div><span>Resolution target</span><strong id="resolution-target-label">Selected runtime / explicit fallback policy</strong></div>
                   <button class="primary-action" type="button" data-action="resolve">Resolve and preflight</button>
+                </div>
+                <div class="compact-grid recipe-controls">
+                  <label>Sequence length<input id="recipe-sequence-length" type="number" min="8" value="256"></label>
+                  <label>Training steps<input id="recipe-training-steps" type="number" min="1" max="100" value="2"></label>
+                  <label>LoRA rank<input id="recipe-rank" type="number" min="1" value="4"></label>
+                  <label>LoRA alpha<input id="recipe-alpha" type="number" min="1" value="8"></label>
+                  <label>Target modules<input id="recipe-target-modules" value="c_attn"></label>
+                  <label>Precision<select id="recipe-precision"><option value="fp32">fp32</option><option value="fp16">fp16</option><option value="bf16">bf16</option></select></label>
                 </div>
                 <div id="candidate-resolution" class="candidate-columns" aria-live="polite">
                   <div class="empty-state"><strong>No manifests yet</strong><span>Resolve candidates to inspect rank, alpha, seed, estimates, and preflight evidence.</span></div>
@@ -248,23 +305,24 @@
               <header class="panel-heading">
                 <div>
                   <p class="eyebrow">04 / Runtime</p>
-                  <h2 id="run-title" data-panel-title tabindex="-1">Run candidates and inspect artifacts.</h2>
-                  <p class="lead">The fixture runtime keeps progress, logs, checkpoints, terminal state, and byte-level integrity evidence together.</p>
+                  <h2 id="run-title" data-panel-title tabindex="-1">Run candidates and inspect outputs.</h2>
+                  <p id="run-lead" class="lead">Progress, logs, checkpoints, terminal state, and byte-level integrity evidence stay together.</p>
                 </div>
                 <span class="stage-state" data-stage-state="run">Pending</span>
               </header>
               <section class="dashboard-card">
                 <div class="section-toolbar run-control">
-                  <div><span>Fixture runtime</span><strong>Two candidates / serialized canonical writes</strong></div>
-                  <button class="primary-action" type="button" data-action="launch">Launch both runs</button>
+                  <div><span id="run-kind-label">Selected runtime</span><strong id="operation-summary">Ready after preflight</strong></div>
+                  <div class="button-row"><button class="secondary-action" type="button" data-action="cancel">Cancel run</button><button id="launch-action" class="primary-action" type="button" data-action="launch">Run demo</button></div>
                 </div>
+                <div id="operation-rail" class="operation-rail" aria-live="polite"><span class="operation-dot" aria-hidden="true"></span><strong>Idle</strong><span>No long operation is active.</span></div>
                 <div id="run-timelines" class="run-timelines">
                   <div class="empty-state"><strong>No runtime evidence yet</strong><span>Progress, public-safe logs, checkpoints, and integrity receipts will appear here.</span></div>
                 </div>
               </section>
             </section>
 
-            <section class="stage-panel" data-panel="evaluate" aria-labelledby="evaluate-title" hidden>
+            <section class="stage-panel" data-panel="evaluate" data-fixture-only aria-labelledby="evaluate-title" hidden>
               <header class="panel-heading">
                 <div>
                   <p class="eyebrow">05 / Evaluation playground</p>
@@ -328,20 +386,20 @@
                 <div>
                   <p class="eyebrow">06 / Local use</p>
                   <h2 id="use-title" data-panel-title tabindex="-1">Select deliberately. Use locally.</h2>
-                  <p class="lead">Record a decision separately from evidence, then run focused or batch inference without creating a chat surface or deployment.</p>
+                  <p id="use-lead" class="lead">Record a decision separately from evidence, then run focused or batch local use without creating a chat surface or deployment.</p>
                 </div>
                 <span class="stage-state" data-stage-state="use">Pending</span>
               </header>
 
               <section class="dashboard-card">
                 <div class="selection-row">
-                  <div><span>Registry decision</span><strong>Choose the candidate authorized for local use</strong></div>
+                  <div><span>Registry decision</span><strong id="selection-copy">Choose the candidate authorized for local use</strong></div>
                   <label class="sr-only" for="candidate-selection">Candidate</label>
                   <select id="candidate-selection">
                     <option value="ember">Ember / balanced</option>
                     <option value="slate">Slate / capacity</option>
                   </select>
-                  <button class="primary-action" type="button" data-action="select">Record selection</button>
+                  <button class="primary-action" type="button" data-action="select" data-fixture-only>Record selection</button>
                 </div>
               </section>
 
@@ -356,7 +414,7 @@
                 <section class="dashboard-card" aria-labelledby="batch-title">
                   <p class="card-kicker">Local batch</p>
                   <h3 id="batch-title">Shared deterministic settings.</h3>
-                  <p>Run one local input per line against the selected adapter.</p>
+                  <p id="batch-lead">Run one local input per line against the selected output.</p>
                   <textarea id="batch-prompts" rows="5">Synthetic batch prompt one&#10;Synthetic batch prompt two</textarea>
                   <button type="button" data-action="batch">Run batch</button>
                 </section>
@@ -364,7 +422,7 @@
               <div id="local-output" class="dashboard-card local-output"></div>
               <section class="dashboard-card export-row">
                 <div>
-                  <span>Portable adapter bundle</span>
+                  <span id="export-kind">Fixture payload manifest</span>
                   <strong>Integrity manifest + compatibility requirements + provenance</strong>
                   <small>Export is not deployment readiness.</small>
                 </div>
@@ -372,7 +430,7 @@
               </section>
             </section>
 
-            <section class="stage-panel" data-panel="storage" aria-labelledby="storage-title" hidden>
+            <section class="stage-panel" data-panel="storage" data-fixture-only aria-labelledby="storage-title" hidden>
               <header class="panel-heading storage-heading">
                 <div>
                   <p class="eyebrow">07 / Storage and reproduction</p>
@@ -460,7 +518,7 @@
               <summary>Inspect exact response</summary>
               <pre id="raw-evidence">No evidence yet.</pre>
             </details>
-            <p class="inspector-footnote">Canonical records remain immutable. This workspace is local, offline, and rebuildable from evidence.</p>
+            <p id="inspector-footnote" class="inspector-footnote">Canonical records remain immutable. Choose a mode to begin.</p>
           </aside>
         </div>
       </div>

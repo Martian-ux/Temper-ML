@@ -65,6 +65,35 @@ def route(task_class="normal_implementation"):
     }
 
 
+def authorize_route_exception(value):
+    task_route = value["route"]
+    task_route.update(
+        {
+            "selected_model": "gpt-5.6-sol",
+            "selected_effort": "xhigh",
+            "maintainer_exception": {
+                "actor": "maintainer",
+                "approved": True,
+                "task_key": value["task_key"],
+                "exact_base": value["exact_base"],
+                "subject": copy.deepcopy(value["subject"]),
+                "owned_paths": copy.deepcopy(value["owned_paths"]),
+                "authorized_selection": {
+                    "model": "gpt-5.6-sol",
+                    "effort": "xhigh",
+                },
+                "authority_reference": value["maintainer_authorization"][
+                    "authority_reference"
+                ],
+                "reason": "Exact-task maintainer route exception.",
+                "public_policy_change": False,
+                "precedent": False,
+            },
+        }
+    )
+    return value
+
+
 def task(key="task-one", paths=None, task_class="normal_implementation"):
     subject = {"type": "patch", "base": BASE, "patch": f"sha256:synthetic-{key}"}
     return {
@@ -1000,6 +1029,89 @@ def test_route_selection_rejects_prompt_or_unknown_mechanisms():
     del missing_selector["route"]["selection_mechanism"]["effort_selector"]
     with pytest.raises(workflow.WorkflowError, match="executable"):
         workflow.validate_task(missing_selector, exact_base=BASE)
+
+
+def test_route_exception_is_strictly_identity_bound_and_non_precedential():
+    workflow = load_workflow_module()
+    accepted = authorize_route_exception(task())
+    assert workflow.validate_task(accepted, exact_base=BASE)["task_key"] == "task-one"
+
+    for field, replacement in (
+        ("task_key", "other-task"),
+        ("exact_base", "other-base"),
+        ("authority_reference", "authority:other"),
+        ("approved", False),
+        ("public_policy_change", True),
+        ("precedent", True),
+    ):
+        invalid = authorize_route_exception(task())
+        invalid["route"]["maintainer_exception"][field] = replacement
+        with pytest.raises(workflow.WorkflowError, match="route exception"):
+            workflow.validate_task(invalid, exact_base=BASE)
+
+    invalid = authorize_route_exception(task())
+    invalid["route"]["maintainer_exception"]["owned_paths"] = ["other.py"]
+    with pytest.raises(workflow.WorkflowError, match="route exception"):
+        workflow.validate_task(invalid, exact_base=BASE)
+
+    invalid = authorize_route_exception(task())
+    invalid["route"]["maintainer_exception"]["authorized_selection"]["effort"] = "high"
+    with pytest.raises(workflow.WorkflowError, match="route exception"):
+        workflow.validate_task(invalid, exact_base=BASE)
+
+
+def test_route_exception_can_authorize_observed_mismatch_for_root_only():
+    workflow = load_workflow_module()
+    exceptional = authorize_route_exception(task())
+    exceptional["route"]["runtime_observation"] = {
+        "availability": "OBSERVED",
+        "source": "host_task_metadata",
+        "model": "gpt-5.6-sol",
+        "effort": "xhigh",
+    }
+    exceptional["route"]["declared_route_compliance"] = "FAIL"
+    value = state(workflow)
+    workflow.register_task(value, exceptional)
+    to_plan(workflow, value)
+    workflow.acquire_ownership(
+        value, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+    )
+    worker = workflow._activate_root_writer(value, exceptional, {})
+    assert worker["execution_mode"] == "root"
+    assert worker["route"]["declared_route_compliance"] == "FAIL"
+
+    dispatch_state = state(workflow)
+    unobserved = authorize_route_exception(task())
+    workflow.register_task(dispatch_state, unobserved)
+    to_plan(workflow, dispatch_state)
+    workflow.acquire_ownership(
+        dispatch_state, {"task_key": "task-one", "paths": ["scripts/example.py"]}
+    )
+    writer_decision = writer_exception_decision(dispatch_state, "task-one")
+    workflow.record_evidence(dispatch_state, writer_decision)
+    with pytest.raises(workflow.WorkflowError, match="only to the root task"):
+        workflow._create_dispatch_intent(
+            dispatch_state,
+            unobserved,
+            {"writer_exception_reference": writer_decision["reference"]},
+        )
+
+
+def test_route_exception_is_rejected_when_unneeded_or_experimental():
+    workflow = load_workflow_module()
+    unneeded = authorize_route_exception(task())
+    unneeded["route"]["selected_model"] = unneeded["route"]["declared_model"]
+    unneeded["route"]["selected_effort"] = unneeded["route"]["declared_effort"]
+    with pytest.raises(workflow.WorkflowError, match="forbidden"):
+        workflow.validate_task(unneeded, exact_base=BASE)
+
+    experimental = authorize_route_exception(task())
+    experimental["route"]["experiment"] = {
+        "label": "OBSERVATIONAL",
+        "predeclared": False,
+    }
+    with pytest.raises(workflow.WorkflowError, match="route experiments"):
+        workflow.validate_task(experimental, exact_base=BASE)
 
 
 def test_matched_experiment_label_requires_predeclared_pair_metadata():

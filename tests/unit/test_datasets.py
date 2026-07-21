@@ -8,6 +8,7 @@ import pytest
 from temper_ml.app_services.datasets import (
     CsvDatasetAdapter,
     DatasetAdapterError,
+    DatasetPreflightError,
     DatasetImportRequest,
     DatasetService,
     HuggingFaceRowsDatasetAdapter,
@@ -26,6 +27,7 @@ from temper_ml.domain.datasets import (
     FieldMapping,
     FilterRule,
     RendererSpec,
+    RendererKind,
     SourceDescriptor,
     SplitPart,
     SplitRule,
@@ -189,6 +191,85 @@ def test_all_explicit_local_adapters_produce_supported_versions(tmp_path: Path) 
     )
     rows[0]["prompt"] = "Mutated after import"
     assert b"Mutated after import" not in hf_result.rendered_bytes
+
+
+def test_trace_mapping_supports_completion_and_component_rendering(
+    tmp_path: Path,
+) -> None:
+    source = json.dumps(
+        [
+            {
+                "context": "User context",
+                "completion": "Full completion",
+                "cot": "Reasoning trace",
+                "output": {"action": "submit", "ok": True},
+            }
+        ]
+    ).encode()
+    mapping = FieldMapping(
+        "context",
+        "completion",
+        cot_field="cot",
+        output_field="output",
+    )
+    completion_request = replace(
+        _request("dataset-trace-completion", mapping=mapping),
+        renderer=RendererSpec(RendererKind.TRACE_COMPLETION),
+    )
+    component_request = replace(
+        _request("dataset-trace-components", mapping=mapping),
+        renderer=RendererSpec(RendererKind.TRACE_COMPONENTS),
+    )
+
+    completion = DatasetService(tmp_path / "completion").import_json(
+        source, completion_request
+    )
+    components = DatasetService(tmp_path / "components").import_json(
+        source, component_request
+    )
+
+    assert "### Completion\nFull completion" in completion.previews[0].text
+    assert "Reasoning trace" not in completion.previews[0].text
+    assert "### Completion\nFull completion" in components.previews[0].text
+    assert "### Reasoning\nReasoning trace" in components.previews[0].text
+    assert '### Output\n{"action":"submit","ok":true}' in components.previews[0].text
+    assert mapping.to_dict()["cot_field"] == "cot"
+    assert mapping.to_dict()["output_field"] == "output"
+
+
+def test_required_training_split_fails_with_bounded_exclusion_diagnostics(
+    tmp_path: Path,
+) -> None:
+    source = b'[{"instruction":"One","response":"First"}]'
+    request = replace(
+        _request(
+            "dataset-empty-train",
+            mapping=FieldMapping("instruction", "response"),
+            split_rule=SplitRule(
+                17, (SplitPart("validation", 1), SplitPart("train", 1))
+            ),
+        ),
+        required_non_empty_splits=("train",),
+    )
+    identity = renderer_identity(request.field_mapping, request.renderer)
+    while True:
+        candidate = json.dumps(
+            [{"instruction": identity.value, "response": "First"}]
+        ).encode()
+        analysis = DatasetService(tmp_path).analyze_source(
+            JsonDatasetAdapter().load(candidate), request
+        )
+        if {item.split: item.count for item in analysis.split_counts}["train"] == 0:
+            source = candidate
+            break
+        identity = _identity(identity.value)
+
+    with pytest.raises(DatasetPreflightError) as captured:
+        DatasetService(tmp_path).import_json(source, request)
+    assert captured.value.code == "dataset_required_split_empty"
+    view = captured.value.analysis.to_view(exclusion_limit=1)
+    assert view["accepted_rows"] == 1
+    assert {item["split"]: item["count"] for item in view["split_counts"]}["train"] == 0
 
 
 def test_import_source_rejects_descriptor_and_row_provenance_mismatches(

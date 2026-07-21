@@ -39,6 +39,8 @@ class RendererKind(str, Enum):
     """Temper-owned deterministic renderer contracts."""
 
     INSTRUCTION_RESPONSE = "instruction_response"
+    TRACE_COMPLETION = "trace_completion"
+    TRACE_COMPONENTS = "trace_components"
 
 
 class DeduplicationMode(str, Enum):
@@ -68,18 +70,26 @@ class FieldMapping:
     instruction_field: str
     response_field: str
     context_field: str | None = None
+    cot_field: str | None = None
+    output_field: str | None = None
 
     def __post_init__(self) -> None:
         require_identifier("instruction_field", self.instruction_field)
         require_identifier("response_field", self.response_field)
         if self.context_field is not None:
             require_identifier("context_field", self.context_field)
+        if self.cot_field is not None:
+            require_identifier("cot_field", self.cot_field)
+        if self.output_field is not None:
+            require_identifier("output_field", self.output_field)
         fields = tuple(
             field
             for field in (
                 self.instruction_field,
                 self.context_field,
                 self.response_field,
+                self.cot_field,
+                self.output_field,
             )
             if field is not None
         )
@@ -87,11 +97,16 @@ class FieldMapping:
             raise RecordValidationError("field mapping source fields must be unique")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "instruction_field": self.instruction_field,
             "response_field": self.response_field,
             "context_field": self.context_field,
         }
+        if self.cot_field is not None:
+            value["cot_field"] = self.cot_field
+        if self.output_field is not None:
+            value["output_field"] = self.output_field
+        return value
 
 
 @dataclass(frozen=True)
