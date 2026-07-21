@@ -1025,6 +1025,67 @@ def test_cleanup_process_lease_blocks_recovery_and_releases_for_restart(
             owner.wait(timeout=10)
 
 
+def test_restart_reconciles_pre_control_namespace_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project(tmp_path)
+    payload = b"legacy cleanup quarantine bytes"
+    selected_path = _write_debug_file(tmp_path, "legacy-quarantine.log", payload)
+    planner = RetentionService(tmp_path)
+    entry = next(
+        item
+        for item in planner.inventory().entries
+        if item.logical_key.endswith("legacy-quarantine.log")
+    )
+    plan = planner.plan((entry.entry_id,))
+
+    def lose_process_in_quarantine(_target: Path) -> None:
+        raise SystemExit("synthetic pre-upgrade cleanup loss")
+
+    with monkeypatch.context() as pre_upgrade:
+        pre_upgrade.setattr(
+            retention_module,
+            "CLEANUP_QUARANTINE_ROOT",
+            retention_module.LEGACY_CLEANUP_QUARANTINE_ROOT,
+        )
+        interrupted = RetentionService(
+            tmp_path,
+            _remove_file=lose_process_in_quarantine,
+        )
+        with pytest.raises(SystemExit, match="pre-upgrade cleanup loss"):
+            interrupted.execute(plan, confirm=True)
+
+    legacy_quarantine = (
+        tmp_path
+        / ".temper-fixture-output"
+        / retention_module.LEGACY_CLEANUP_QUARANTINE_ROOT
+        / plan.execution_id
+        / entry.entry_id
+        / selected_path.name
+    )
+    current_quarantine = (
+        tmp_path
+        / ".temper-fixture-output"
+        / retention_module.CLEANUP_QUARANTINE_ROOT
+        / plan.execution_id
+        / entry.entry_id
+        / selected_path.name
+    )
+    assert not selected_path.exists()
+    assert legacy_quarantine.read_bytes() == payload
+    assert not current_quarantine.exists()
+
+    receipts = RetentionService(tmp_path).reconcile_pending()
+
+    assert len(receipts) == 1
+    assert receipts[0].objects[0].status is CleanupObjectStatus.REMOVED
+    assert receipts[0].logical_bytes_removed == len(payload)
+    assert receipts[0].physical_bytes_freed == len(payload)
+    assert not legacy_quarantine.exists()
+    assert not current_quarantine.exists()
+
+
 def test_cleanup_never_deletes_a_replacement_substituted_before_quarantine(
     tmp_path: Path,
 ) -> None:

@@ -12,6 +12,7 @@ from temper_ml.app_services._records import (
     write_record_idempotently,
 )
 from temper_ml.app_services.errors import ApplicationServiceError
+from temper_ml.app_services.runs import RunLifecycleStatus, validated_run_lifecycle
 from temper_ml.domain.artifacts import (
     Artifact,
     ArtifactAvailability,
@@ -34,6 +35,7 @@ from temper_ml.domain.records import (
     RecordValidationError,
     TypedRecord,
     identity_fields,
+    parse_identity,
     record_reference,
     require_identifier,
     thaw_json,
@@ -527,6 +529,65 @@ class LocalUseService:
             raise ApplicationServiceError("local_use_adapter_config_invalid")
         return value
 
+    def _require_completed_producer(self, artifact: Artifact, run: Run) -> None:
+        """Bind artifact consumption to one exact completed producing lifecycle."""
+
+        def event_identity(
+            payload: Mapping[str, object], field: str
+        ) -> ContentIdentity:
+            raw = payload.get(field)
+            if not isinstance(raw, Mapping):
+                raise RecordValidationError(f"{field} is invalid")
+            return parse_identity(raw, field=field)
+
+        try:
+            streams = tuple(
+                snapshot
+                for snapshot in self.store.iter_streams()
+                if snapshot.stream_id == f"run-{run.run_id}"
+            )
+            if len(streams) != 1:
+                raise ApplicationServiceError("local_use_artifact_unavailable")
+            status, lifecycle = validated_run_lifecycle(streams[0].events)
+            launched = tuple(
+                event for event in lifecycle if event.event_type == "run_launched"
+            )
+            completed = tuple(
+                event for event in lifecycle if event.event_type == "run_completed"
+            )
+            if (
+                status is not RunLifecycleStatus.COMPLETED
+                or len(launched) != 1
+                or len(completed) != 1
+                or lifecycle[-1] != completed[0]
+                or launched[0].payload.get("attempt_number") != run.attempt_number
+                or completed[0].payload.get("terminal") is not True
+                or completed[0].payload.get("verified_artifact") is not True
+            ):
+                raise ApplicationServiceError("local_use_artifact_unavailable")
+            launched_run = event_identity(launched[0].payload, "run_identity")
+            launched_request = event_identity(
+                launched[0].payload,
+                "runtime_request_identity",
+            )
+            completed_artifact = event_identity(
+                completed[0].payload,
+                "artifact_identity",
+            )
+            completed_integrity = event_identity(
+                completed[0].payload,
+                "integrity_evidence",
+            )
+            if (
+                launched_run != run.identity
+                or launched_request != run.request_identity
+                or completed_artifact != artifact.identity
+                or completed_integrity != artifact.integrity_evidence
+            ):
+                raise ApplicationServiceError("local_use_artifact_unavailable")
+        except (EvidenceError, RecordValidationError, ApplicationServiceError):
+            raise ApplicationServiceError("local_use_artifact_unavailable") from None
+
     def _verified_artifact(
         self,
         artifact: Artifact,
@@ -576,6 +637,7 @@ class LocalUseService:
         ):
             raise ApplicationServiceError("local_use_artifact_storage_invalid")
         run = self._resolve(exact_artifact.producing_run, Run)
+        self._require_completed_producer(exact_artifact, run)
         runtime_request = self._runtime_request(run.request_identity)
         experiment = self._resolve(run.experiment, Experiment)
         resolution = self._resolve(runtime_request.recipe_resolution, RecipeResolution)

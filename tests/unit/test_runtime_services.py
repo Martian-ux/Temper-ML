@@ -32,7 +32,11 @@ from temper_ml.app_services.retention import (
     RetentionService,
 )
 from temper_ml.cli import _FixtureTokenizer, _fixture_workflow
-from temper_ml.domain.artifacts import Artifact, ArtifactAvailability
+from temper_ml.domain.artifacts import (
+    Artifact,
+    ArtifactAvailability,
+    AvailabilityState,
+)
 from temper_ml.domain.base_models import BaseModelRevision
 from temper_ml.domain.compatibility import CompatibilityGroup
 from temper_ml.domain.datasets import (
@@ -50,9 +54,9 @@ from temper_ml.domain.hardware import (
     HardwareRequirements,
 )
 from temper_ml.domain.local_use import LocalUseSession
-from temper_ml.domain.projections import ContentIdentity
+from temper_ml.domain.projections import ContentIdentity, content_identity
 from temper_ml.domain.recipes import RecipeResolution
-from temper_ml.domain.records import record_reference
+from temper_ml.domain.records import identity_fields, record_reference
 from temper_ml.domain.retention import CleanupObjectStatus, CleanupOutcome
 from temper_ml.domain.runs import EvaluationMode, ResolvedRuntimeRequest, Run
 from temper_ml.runtime.fixture_adapter import (
@@ -77,6 +81,12 @@ from temper_ml.runtime.library_backend import (
     LibraryTrainingResult,
 )
 from temper_ml.runtime.library_double import DeterministicLibraryBackend
+from temper_ml.runtime.ownership import (
+    RunOwnershipError,
+    RunOwnershipLease,
+    claim_run_ownership,
+    released_run_claim_identity,
+)
 from temper_ml.runtime.preflight import EstimateComponents, estimate_resources
 from temper_ml.runtime.protocol import RuntimeOperation
 from temper_ml.store.canonical_json import (
@@ -678,6 +688,341 @@ def test_preflight_blocks_before_request_freeze_or_launch(tmp_path: Path) -> Non
     )
 
 
+def test_startup_releases_event_only_preflight_blocked_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id="run-preflight-restart",
+        request_id="request-preflight-restart",
+        artifact_id="artifact-preflight-restart",
+    )
+    blocked = replace(
+        launch, estimate=replace(launch.estimate, accelerator_memory_bytes=1)
+    )
+    service = RunService(tmp_path)
+    claim = service.planned_first_attempt_ownership(blocked)
+
+    def fail_resolution(_lease: RunOwnershipLease) -> None:
+        raise RunOwnershipError("run_ownership_resolution_failed")
+
+    with monkeypatch.context() as resolution_failure:
+        resolution_failure.setattr(RunOwnershipLease, "resolve", fail_resolution)
+        with pytest.raises(
+            ApplicationServiceError, match="^run_ownership_resolution_failed$"
+        ):
+            service.launch(blocked)
+
+    assert service.status(blocked.run_id) is RunLifecycleStatus.PREFLIGHT_BLOCKED
+    assert RunService(tmp_path).reconcile_abandoned_runs() == (blocked.run_id,)
+    assert (
+        released_run_claim_identity(
+            (tmp_path / ".temper-fixture-output").resolve(), blocked.run_id
+        )
+        == claim
+    )
+    assert service.status(blocked.run_id) is RunLifecycleStatus.PREFLIGHT_BLOCKED
+
+
+@pytest.mark.parametrize("lost_after", [ResolvedRuntimeRequest, Run])
+def test_startup_terminalizes_claim_bound_prelaunch_record_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lost_after: type[ResolvedRuntimeRequest] | type[Run],
+) -> None:
+    foundation = _foundation(tmp_path)
+    suffix = lost_after.RECORD_TYPE
+    launch = foundation.launch(
+        run_id=f"run-prelaunch-loss-{suffix}",
+        request_id=f"request-prelaunch-loss-{suffix}",
+        artifact_id=f"artifact-prelaunch-loss-{suffix}",
+    )
+    service = RunService(tmp_path)
+    claim = service.planned_first_attempt_ownership(launch)
+    original_write = runs_module.write_record_idempotently
+    lost = False
+
+    def write_then_lose_process(*args: object, **kwargs: object) -> None:
+        nonlocal lost
+        original_write(*args, **kwargs)  # type: ignore[arg-type]
+        record = args[1] if len(args) > 1 else kwargs.get("record")
+        if isinstance(record, lost_after) and not lost:
+            lost = True
+            raise SystemExit("synthetic process loss during launch records")
+
+    with monkeypatch.context() as process_loss:
+        process_loss.setattr(
+            runs_module, "write_record_idempotently", write_then_lose_process
+        )
+        with pytest.raises(SystemExit, match="during launch records"):
+            service.launch(launch)
+
+    assert lost is True
+    assert service._events(launch.run_id) == ()
+    restarted = RunService(tmp_path)
+    assert restarted.reconcile_abandoned_runs() == (launch.run_id,)
+    assert restarted.status(launch.run_id) is RunLifecycleStatus.FAILED
+    run = next(
+        stored.record
+        for stored in restarted.store.iter_records()
+        if isinstance(stored.record, Run) and stored.record.run_id == launch.run_id
+    )
+    assert run.request_identity == next(
+        stored.record.identity
+        for stored in restarted.store.iter_records()
+        if isinstance(stored.record, ResolvedRuntimeRequest)
+        and stored.record.request_id == launch.request_id
+    )
+    terminal = restarted._events(launch.run_id)[-1]
+    assert terminal.event_type == "run_failed"
+    assert terminal.payload.get("phase") == "launch_records"
+    assert (
+        terminal.payload.get("failure_code") == "run_launch_record_persistence_failed"
+    )
+    assert (
+        released_run_claim_identity(
+            (tmp_path / ".temper-fixture-output").resolve(), launch.run_id
+        )
+        == claim
+    )
+
+
+def test_launch_record_failure_never_terminalizes_without_a_durable_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id="run-record-write-before-commit",
+        request_id="request-record-write-before-commit",
+        artifact_id="artifact-record-write-before-commit",
+    )
+    service = RunService(tmp_path)
+    original_write = runs_module.write_record_idempotently
+
+    def fail_run_before_commit(*args: object, **kwargs: object) -> None:
+        record = args[1] if len(args) > 1 else kwargs.get("record")
+        if isinstance(record, Run) and record.run_id == launch.run_id:
+            raise EvidenceError("synthetic_run_record_write_failed")
+        original_write(*args, **kwargs)  # type: ignore[arg-type]
+
+    with monkeypatch.context() as record_failure:
+        record_failure.setattr(
+            runs_module, "write_record_idempotently", fail_run_before_commit
+        )
+        with pytest.raises(
+            ApplicationServiceError, match="^synthetic_run_record_write_failed$"
+        ):
+            service.launch(launch)
+
+    assert service._events(launch.run_id) == ()
+    assert not any(
+        isinstance(stored.record, Run) and stored.record.run_id == launch.run_id
+        for stored in service.store.iter_records()
+    )
+    assert any(
+        isinstance(stored.record, ResolvedRuntimeRequest)
+        and stored.record.request_id == launch.request_id
+        for stored in service.store.iter_records()
+    )
+
+    restarted = RunService(tmp_path)
+    assert restarted.reconcile_abandoned_runs() == (launch.run_id,)
+    assert restarted.status(launch.run_id) is RunLifecycleStatus.FAILED
+    assert (
+        sum(
+            event.event_type == "run_failed"
+            for event in restarted._events(launch.run_id)
+        )
+        == 1
+    )
+    assert (
+        sum(
+            isinstance(stored.record, Run) and stored.record.run_id == launch.run_id
+            for stored in restarted.store.iter_records()
+        )
+        == 1
+    )
+
+
+def test_prelaunch_recovery_releases_claim_after_second_process_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id="run-prelaunch-recovery-second-loss",
+        request_id="request-prelaunch-recovery-second-loss",
+        artifact_id="artifact-prelaunch-recovery-second-loss",
+    )
+    service = RunService(tmp_path)
+    claim = service.planned_first_attempt_ownership(launch)
+    original_write = runs_module.write_record_idempotently
+
+    def write_request_then_lose_process(*args: object, **kwargs: object) -> None:
+        original_write(*args, **kwargs)  # type: ignore[arg-type]
+        record = args[1] if len(args) > 1 else kwargs.get("record")
+        if (
+            isinstance(record, ResolvedRuntimeRequest)
+            and record.request_id == launch.request_id
+        ):
+            raise SystemExit("synthetic first prelaunch process loss")
+
+    with monkeypatch.context() as first_loss:
+        first_loss.setattr(
+            runs_module, "write_record_idempotently", write_request_then_lose_process
+        )
+        with pytest.raises(SystemExit, match="first prelaunch process loss"):
+            service.launch(launch)
+
+    original_append = RunService._append
+
+    def append_failure_then_lose_process(
+        run_service: RunService,
+        run_id: str,
+        key: str,
+        event_type: str,
+        payload: object,
+    ) -> object:
+        event = original_append(
+            run_service,
+            run_id,
+            key,
+            event_type,
+            payload,  # type: ignore[arg-type]
+        )
+        if run_id == launch.run_id and event_type == "run_failed":
+            raise SystemExit("synthetic second prelaunch process loss")
+        return event
+
+    with monkeypatch.context() as second_loss:
+        second_loss.setattr(RunService, "_append", append_failure_then_lose_process)
+        with pytest.raises(SystemExit, match="second prelaunch process loss"):
+            RunService(tmp_path).reconcile_abandoned_runs()
+
+    root = (tmp_path / ".temper-fixture-output").resolve()
+    after_second_loss = RunService(tmp_path)
+    assert after_second_loss.status(launch.run_id) is RunLifecycleStatus.FAILED
+    with pytest.raises(RunOwnershipError, match="^run_ownership_unresolved$"):
+        released_run_claim_identity(root, launch.run_id)
+
+    assert after_second_loss.reconcile_abandoned_runs() == (launch.run_id,)
+    assert released_run_claim_identity(root, launch.run_id) == claim
+    assert (
+        sum(
+            event.event_type == "run_failed"
+            for event in after_second_loss._events(launch.run_id)
+        )
+        == 1
+    )
+
+
+def _persist_synthetic_running_attempt(
+    service: RunService,
+    launch: RunLaunchRequest,
+    claim: ContentIdentity,
+    *,
+    legacy_ownership_evidence: bool = False,
+) -> None:
+    preflight_result = runs_module.preflight(
+        launch.recipe_resolution,
+        launch.hardware_requirements,
+        launch.execution_target,
+        launch.hardware_capability_profile,
+        launch.estimate,
+    )
+    runtime_request, run = service.planned_first_attempt(launch, preflight_result)
+    service._persist_launch_records(
+        launch.hardware_capability_profile,
+        runtime_request,
+        run,
+    )
+    payload: dict[str, object] = {
+        "run_identity": identity_fields(run.identity),
+        "runtime_request_identity": identity_fields(runtime_request.identity),
+        "attempt_number": run.attempt_number,
+        "fixture_runtime": True,
+    }
+    if not legacy_ownership_evidence:
+        payload.update(
+            {
+                "run_ownership_identity": identity_fields(claim),
+                "artifact_id": launch.artifact_id,
+            }
+        )
+    service._append(launch.run_id, "launched", "run_launched", payload)
+
+
+def test_abandoned_sweep_checks_live_lease_before_record_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id="run-live-owner-snapshot",
+        request_id="request-live-owner-snapshot",
+        artifact_id="artifact-live-owner-snapshot",
+    )
+    service = RunService(tmp_path)
+    claim = service.planned_first_attempt_ownership(launch)
+    root = (tmp_path / ".temper-fixture-output").resolve()
+
+    with claim_run_ownership(root, launch.run_id, claim):
+        _persist_synthetic_running_attempt(service, launch, claim)
+        restarted = RunService(tmp_path)
+        monkeypatch.setattr(restarted.store, "iter_records", lambda: iter(()))
+
+        assert restarted.reconcile_abandoned_runs() == ()
+        assert service.status(launch.run_id) is RunLifecycleStatus.RUNNING
+
+
+def test_abandoned_sweep_leaves_legacy_running_claim_unresolved(
+    tmp_path: Path,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id="run-legacy-running-ownership",
+        request_id="request-legacy-running-ownership",
+        artifact_id="artifact-legacy-running-ownership",
+    )
+    service = RunService(tmp_path)
+    claim = service.planned_first_attempt_ownership(launch)
+    root = (tmp_path / ".temper-fixture-output").resolve()
+    with claim_run_ownership(root, launch.run_id, claim):
+        _persist_synthetic_running_attempt(
+            service,
+            launch,
+            claim,
+            legacy_ownership_evidence=True,
+        )
+
+    assert RunService(tmp_path).reconcile_abandoned_runs() == ()
+    with pytest.raises(RunOwnershipError, match="^run_ownership_unresolved$"):
+        released_run_claim_identity(root, launch.run_id)
+    assert service.status(launch.run_id) is RunLifecycleStatus.RUNNING
+
+
+def test_abandoned_sweep_recovers_run_named_like_legacy_control_directory(
+    tmp_path: Path,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id="replay",
+        request_id="request-control-name-replay",
+        artifact_id="artifact-control-name-replay",
+    )
+    service = RunService(tmp_path)
+    claim = service.planned_first_attempt_ownership(launch)
+    root = (tmp_path / ".temper-fixture-output").resolve()
+    with claim_run_ownership(root, launch.run_id, claim):
+        _persist_synthetic_running_attempt(service, launch, claim)
+
+    assert RunService(tmp_path).reconcile_abandoned_runs() == (launch.run_id,)
+    assert service.status(launch.run_id) is RunLifecycleStatus.INTERRUPTED
+    assert released_run_claim_identity(root, launch.run_id) == claim
+
+
 def test_prelaunch_record_conflict_leaves_run_id_retryable(tmp_path: Path) -> None:
     foundation = _foundation(tmp_path)
     launch = foundation.launch(
@@ -714,6 +1059,150 @@ def test_prelaunch_record_conflict_leaves_run_id_retryable(tmp_path: Path) -> No
 
     assert corrected.status is RunLifecycleStatus.COMPLETED
     assert service.status(launch.run_id) is RunLifecycleStatus.COMPLETED
+
+
+def test_resolved_claim_reuse_is_recovered_after_later_process_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id="run-resolved-claim-reused",
+        request_id="request-resolved-claim-reused",
+        artifact_id="artifact-resolved-claim-reused",
+    )
+    conflicting_profile = replace(
+        foundation.profile,
+        library_versions={
+            **foundation.profile.library_versions,
+            "synthetic_conflict_marker": "v2",
+        },
+    )
+    service = RunService(tmp_path)
+
+    with pytest.raises(ApplicationServiceError, match="run_record_conflict"):
+        service.launch(replace(launch, hardware_capability_profile=conflicting_profile))
+
+    root = (tmp_path / ".temper-fixture-output").resolve()
+    claim = service.planned_first_attempt_ownership(launch)
+    assert released_run_claim_identity(root, launch.run_id) == claim
+    original_write = runs_module.write_record_idempotently
+
+    def write_run_then_lose_process(*args: object, **kwargs: object) -> None:
+        original_write(*args, **kwargs)  # type: ignore[arg-type]
+        record = args[1] if len(args) > 1 else kwargs.get("record")
+        if isinstance(record, Run) and record.run_id == launch.run_id:
+            raise SystemExit("synthetic loss after resolved-claim Run write")
+
+    with monkeypatch.context() as process_loss:
+        process_loss.setattr(
+            runs_module, "write_record_idempotently", write_run_then_lose_process
+        )
+        with pytest.raises(SystemExit, match="resolved-claim Run write"):
+            service.launch(launch)
+
+    assert service._events(launch.run_id) == ()
+    restarted = RunService(tmp_path)
+    assert restarted.reconcile_abandoned_runs() == (launch.run_id,)
+    assert restarted.status(launch.run_id) is RunLifecycleStatus.FAILED
+    assert released_run_claim_identity(root, launch.run_id) == claim
+
+
+def test_legacy_v1_prelaunch_prefix_remains_conservatively_unresolved(
+    tmp_path: Path,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id="run-legacy-v1-prelaunch",
+        request_id="request-legacy-v1-prelaunch",
+        artifact_id="artifact-legacy-v1-prelaunch",
+    )
+    service = RunService(tmp_path)
+    claim = service.planned_first_attempt_ownership(launch)
+    preflight_result = runs_module.preflight(
+        launch.recipe_resolution,
+        launch.hardware_requirements,
+        launch.execution_target,
+        launch.hardware_capability_profile,
+        launch.estimate,
+    )
+    runtime_request, run = service.planned_first_attempt(launch, preflight_result)
+    root = (tmp_path / ".temper-fixture-output").resolve()
+
+    with claim_run_ownership(root, launch.run_id, claim):
+        service._persist_launch_records(
+            launch.hardware_capability_profile,
+            runtime_request,
+            run,
+        )
+        service._append(
+            launch.run_id,
+            "preflight",
+            "run_preflight_succeeded",
+            {
+                "ready": True,
+                "preflight_identity": identity_fields(
+                    runtime_request.preflight_identity
+                ),
+                "blocking_reasons": [],
+            },
+        )
+
+    restarted = RunService(tmp_path)
+    assert restarted.reconcile_abandoned_runs() == ()
+    assert tuple(event.event_type for event in restarted._events(launch.run_id)) == (
+        "run_preflight_succeeded",
+    )
+    with pytest.raises(ApplicationServiceError, match="^run_lifecycle_incomplete$"):
+        restarted.status(launch.run_id)
+    with pytest.raises(RunOwnershipError, match="^run_ownership_unresolved$"):
+        released_run_claim_identity(root, launch.run_id)
+
+
+def test_legacy_v1_preflight_blocked_remains_conservatively_unresolved(
+    tmp_path: Path,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id="run-legacy-v1-preflight-blocked",
+        request_id="request-legacy-v1-preflight-blocked",
+        artifact_id="artifact-legacy-v1-preflight-blocked",
+    )
+    blocked = replace(
+        launch, estimate=replace(launch.estimate, accelerator_memory_bytes=1)
+    )
+    service = RunService(tmp_path)
+    claim = service.planned_first_attempt_ownership(blocked)
+    preflight_result = runs_module.preflight(
+        blocked.recipe_resolution,
+        blocked.hardware_requirements,
+        blocked.execution_target,
+        blocked.hardware_capability_profile,
+        blocked.estimate,
+    )
+    preflight_identity = content_identity(
+        runs_module.PREFLIGHT_EVIDENCE_PROJECTION,
+        preflight_result.to_view(),
+    )
+    root = (tmp_path / ".temper-fixture-output").resolve()
+
+    with claim_run_ownership(root, blocked.run_id, claim):
+        service._append(
+            blocked.run_id,
+            "preflight",
+            "run_preflight_blocked",
+            {
+                "ready": False,
+                "preflight_identity": identity_fields(preflight_identity),
+                "blocking_reasons": list(preflight_result.blocking_reasons),
+            },
+        )
+
+    restarted = RunService(tmp_path)
+    assert restarted.reconcile_abandoned_runs() == ()
+    assert restarted.status(blocked.run_id) is RunLifecycleStatus.PREFLIGHT_BLOCKED
+    with pytest.raises(RunOwnershipError, match="^run_ownership_unresolved$"):
+        released_run_claim_identity(root, blocked.run_id)
 
 
 class _FailingAdapter(FixtureAdapter):
@@ -768,9 +1257,175 @@ def test_checkpoint_write_failure_terminalizes_the_launched_run(
     assert event.payload["failure_code"] == "run_output_persistence_failed"
 
 
+def _abandon_fixture_after_availability(
+    service: RunService,
+    launch: RunLaunchRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> ContentIdentity:
+    claim = service.planned_first_attempt_ownership(launch)
+    original_write = runs_module.write_record_idempotently
+
+    def write_then_lose_process(*args: object, **kwargs: object) -> None:
+        original_write(*args, **kwargs)  # type: ignore[arg-type]
+        record = args[1] if len(args) > 1 else kwargs.get("record")
+        if isinstance(record, ArtifactAvailability):
+            raise SystemExit("synthetic process loss after artifact availability")
+
+    with monkeypatch.context() as process_loss:
+        process_loss.setattr(
+            runs_module, "write_record_idempotently", write_then_lose_process
+        )
+        with pytest.raises(SystemExit, match="after artifact availability"):
+            service.launch(launch)
+    assert service.status(launch.run_id) is RunLifecycleStatus.RUNNING
+    return claim
+
+
+@pytest.mark.parametrize("member_state", ["intact", "missing"])
+def test_abandoned_artifact_honors_durable_ingestion_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    member_state: str,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id=f"run-durable-ingestion-failure-{member_state}",
+        request_id=f"request-durable-ingestion-failure-{member_state}",
+        artifact_id=f"artifact-durable-ingestion-failure-{member_state}",
+    )
+    service = RunService(tmp_path)
+    claim = _abandon_fixture_after_availability(service, launch, monkeypatch)
+    if member_state == "missing":
+        (
+            tmp_path
+            / ".temper-fixture-output"
+            / "artifacts"
+            / launch.artifact_id
+            / "adapter.bin"
+        ).unlink()
+    service._append(
+        launch.run_id,
+        "artifact-ingestion-failed",
+        "artifact_ingestion_failed",
+        {
+            "failure_code": "run_abandoned_artifact_unrecoverable",
+            "verified_artifact": False,
+        },
+    )
+
+    restarted = RunService(tmp_path)
+    assert restarted.reconcile_abandoned_runs() == (launch.run_id,)
+    assert restarted.status(launch.run_id) is RunLifecycleStatus.FAILED
+    assert (
+        released_run_claim_identity(
+            (tmp_path / ".temper-fixture-output").resolve(), launch.run_id
+        )
+        == claim
+    )
+    events = restarted._events(launch.run_id)
+    assert sum(event.event_type == "artifact_ingestion_failed" for event in events) == 1
+    assert sum(event.event_type == "run_failed" for event in events) == 1
+    assert not any(event.event_type == "run_completed" for event in events)
+    artifact = next(
+        stored.record
+        for stored in restarted.store.iter_records()
+        if isinstance(stored.record, Artifact)
+        and stored.record.artifact_id == launch.artifact_id
+    )
+    availabilities = tuple(
+        stored.record
+        for stored in restarted.store.iter_records()
+        if isinstance(stored.record, ArtifactAvailability)
+        and stored.record.artifact == record_reference(artifact)
+    )
+    superseded = {
+        availability.supersedes.identity
+        for availability in availabilities
+        if availability.supersedes is not None
+    }
+    current = tuple(
+        availability
+        for availability in availabilities
+        if availability.identity not in superseded
+    )
+    assert len(current) == 1
+    assert current[0].state is AvailabilityState.UNAVAILABLE
+
+
+def test_abandoned_ingestion_failure_survives_second_process_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id="run-ingestion-failure-second-loss",
+        request_id="request-ingestion-failure-second-loss",
+        artifact_id="artifact-ingestion-failure-second-loss",
+    )
+    service = RunService(tmp_path)
+    claim = _abandon_fixture_after_availability(service, launch, monkeypatch)
+    (
+        tmp_path
+        / ".temper-fixture-output"
+        / "artifacts"
+        / launch.artifact_id
+        / "adapter.bin"
+    ).unlink()
+    original_append = RunService._append
+
+    def append_then_lose_process(
+        run_service: RunService,
+        run_id: str,
+        key: str,
+        event_type: str,
+        payload: object,
+    ) -> object:
+        event = original_append(
+            run_service,
+            run_id,
+            key,
+            event_type,
+            payload,  # type: ignore[arg-type]
+        )
+        if event_type == "artifact_ingestion_failed":
+            raise SystemExit("synthetic process loss after ingestion failure")
+        return event
+
+    with monkeypatch.context() as second_loss:
+        second_loss.setattr(RunService, "_append", append_then_lose_process)
+        with pytest.raises(SystemExit, match="after ingestion failure"):
+            RunService(tmp_path).reconcile_abandoned_runs()
+
+    after_loss = RunService(tmp_path)
+    assert after_loss.status(launch.run_id) is RunLifecycleStatus.RUNNING
+    assert (
+        sum(
+            event.event_type == "artifact_ingestion_failed"
+            for event in after_loss._events(launch.run_id)
+        )
+        == 1
+    )
+    assert after_loss.reconcile_abandoned_runs() == (launch.run_id,)
+    assert after_loss.status(launch.run_id) is RunLifecycleStatus.FAILED
+    assert (
+        released_run_claim_identity(
+            (tmp_path / ".temper-fixture-output").resolve(), launch.run_id
+        )
+        == claim
+    )
+    events = after_loss._events(launch.run_id)
+    assert sum(event.event_type == "artifact_ingestion_failed" for event in events) == 1
+    assert sum(event.event_type == "run_failed" for event in events) == 1
+    assert not any(event.event_type == "run_completed" for event in events)
+
+
 @pytest.mark.parametrize(
     ("failed_event", "expected_phase"),
-    [("run_progress", "runtime_output"), ("run_completed", "completion")],
+    [
+        ("run_progress", "runtime_output"),
+        ("artifact_ingestion_verified", "artifact_ingestion"),
+        ("run_completed", "completion"),
+    ],
 )
 def test_post_launch_event_append_failure_terminalizes_the_run(
     tmp_path: Path,
@@ -806,6 +1461,110 @@ def test_post_launch_event_append_failure_terminalizes_the_run(
     assert event.event_type == "run_failed"
     assert event.payload["phase"] == expected_phase
     assert event.payload["failure_code"] == "event_append_failed"
+    if failed_event in {"artifact_ingestion_verified", "run_completed"}:
+        artifact = next(
+            stored.record
+            for stored in service.store.iter_records()
+            if isinstance(stored.record, Artifact)
+            and stored.record.artifact_id == launch.artifact_id
+        )
+        availabilities = tuple(
+            stored.record
+            for stored in service.store.iter_records()
+            if isinstance(stored.record, ArtifactAvailability)
+            and stored.record.artifact == record_reference(artifact)
+        )
+        superseded = {
+            availability.supersedes.identity
+            for availability in availabilities
+            if availability.supersedes is not None
+        }
+        current = tuple(
+            availability
+            for availability in availabilities
+            if availability.identity not in superseded
+        )
+        assert len(current) == 1
+        assert current[0].state is AvailabilityState.UNAVAILABLE
+
+
+def test_available_artifact_cannot_be_consumed_before_run_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foundation = _foundation(tmp_path)
+    launch = foundation.launch(
+        run_id="run-available-before-completion",
+        request_id="request-available-before-completion",
+        artifact_id="artifact-available-before-completion",
+    )
+    service = RunService(tmp_path)
+    original_write = runs_module.write_record_idempotently
+    consumption_blocked = False
+
+    def inspect_then_fail(*args: object, **kwargs: object) -> None:
+        nonlocal consumption_blocked
+        original_write(*args, **kwargs)  # type: ignore[arg-type]
+        record = args[1] if len(args) > 1 else kwargs.get("record")
+        if (
+            isinstance(record, ArtifactAvailability)
+            and record.state is AvailabilityState.AVAILABLE
+            and record.artifact.logical_id == launch.artifact_id
+            and not consumption_blocked
+        ):
+            artifact = next(
+                stored.record
+                for stored in TypedEvidenceStore(tmp_path).iter_records()
+                if isinstance(stored.record, Artifact)
+                and stored.record.artifact_id == launch.artifact_id
+            )
+            with pytest.raises(
+                ApplicationServiceError, match="^local_use_artifact_unavailable$"
+            ):
+                LocalUseService(tmp_path).inspect_artifact(
+                    artifact,
+                    foundation.model,
+                    foundation.group,
+                    foundation.target,
+                )
+            consumption_blocked = True
+            raise EvidenceError("synthetic_availability_boundary_failure")
+
+    with monkeypatch.context() as availability_failure:
+        availability_failure.setattr(
+            runs_module, "write_record_idempotently", inspect_then_fail
+        )
+        with pytest.raises(
+            ApplicationServiceError, match="^synthetic_availability_boundary_failure$"
+        ):
+            service.launch(launch)
+
+    assert consumption_blocked is True
+    assert service.status(launch.run_id) is RunLifecycleStatus.FAILED
+    artifact = next(
+        stored.record
+        for stored in service.store.iter_records()
+        if isinstance(stored.record, Artifact)
+        and stored.record.artifact_id == launch.artifact_id
+    )
+    availabilities = tuple(
+        stored.record
+        for stored in service.store.iter_records()
+        if isinstance(stored.record, ArtifactAvailability)
+        and stored.record.artifact == record_reference(artifact)
+    )
+    superseded = {
+        availability.supersedes.identity
+        for availability in availabilities
+        if availability.supersedes is not None
+    }
+    current = tuple(
+        availability
+        for availability in availabilities
+        if availability.identity not in superseded
+    )
+    assert len(current) == 1
+    assert current[0].state is AvailabilityState.UNAVAILABLE
 
 
 @pytest.mark.parametrize(
@@ -1127,6 +1886,113 @@ def test_library_runtime_preserves_run_artifact_local_use_and_export_contracts(
         )
         == exported.integrity
     )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_status"),
+    (
+        pytest.param(None, RunLifecycleStatus.COMPLETED, id="intact"),
+        pytest.param("missing", RunLifecycleStatus.FAILED, id="missing-member"),
+        pytest.param("mutated", RunLifecycleStatus.FAILED, id="mutated-member"),
+    ),
+)
+def test_abandoned_library_completion_reverifies_current_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str | None,
+    expected_status: RunLifecycleStatus,
+) -> None:
+    foundation, _, _, adapter = _library_foundation(tmp_path)
+    launch = foundation.launch(
+        run_id=f"run-library-abandoned-{mutation or 'intact'}",
+        request_id=f"request-library-abandoned-{mutation or 'intact'}",
+        artifact_id=f"artifact-library-abandoned-{mutation or 'intact'}",
+    )
+    service = RunService(tmp_path, adapter=adapter)
+    claim = service.planned_first_attempt_ownership(launch)
+    original_append = RunService._append
+
+    def append_then_lose_process(
+        run_service: RunService,
+        run_id: str,
+        key: str,
+        event_type: str,
+        payload: object,
+    ) -> object:
+        event = original_append(
+            run_service,
+            run_id,
+            key,
+            event_type,
+            payload,  # type: ignore[arg-type]
+        )
+        if run_id == launch.run_id and event_type == "artifact_ingestion_verified":
+            raise SystemExit("synthetic library process loss after ingestion")
+        return event
+
+    with monkeypatch.context() as process_loss:
+        process_loss.setattr(RunService, "_append", append_then_lose_process)
+        with pytest.raises(SystemExit, match="library process loss"):
+            service.launch(launch)
+
+    assert service.status(launch.run_id) is RunLifecycleStatus.RUNNING
+    member = (
+        tmp_path
+        / ".temper-fixture-output"
+        / "artifacts"
+        / launch.artifact_id
+        / "adapter.bin"
+    )
+    if mutation == "missing":
+        member.unlink()
+    elif mutation == "mutated":
+        member.write_bytes(b"synthetic mutated adapter bytes")
+
+    restarted = RunService(tmp_path)
+    assert restarted.reconcile_abandoned_runs() == (launch.run_id,)
+    assert restarted.status(launch.run_id) is expected_status
+    assert (
+        released_run_claim_identity(
+            (tmp_path / ".temper-fixture-output").resolve(), launch.run_id
+        )
+        == claim
+    )
+    events = restarted._events(launch.run_id)
+    terminal = events[-1]
+    artifacts = tuple(
+        stored.record
+        for stored in TypedEvidenceStore(tmp_path).iter_records()
+        if isinstance(stored.record, Artifact)
+        and stored.record.artifact_id == launch.artifact_id
+    )
+    assert len(artifacts) == 1
+    availabilities = tuple(
+        stored.record
+        for stored in TypedEvidenceStore(tmp_path).iter_records()
+        if isinstance(stored.record, ArtifactAvailability)
+        and stored.record.artifact == record_reference(artifacts[0])
+    )
+    superseded = {
+        availability.supersedes.identity
+        for availability in availabilities
+        if availability.supersedes is not None
+    }
+    current = tuple(
+        availability
+        for availability in availabilities
+        if availability.identity not in superseded
+    )
+    assert len(current) == 1
+    if expected_status is RunLifecycleStatus.COMPLETED:
+        assert terminal.event_type == "run_completed"
+        assert current[0].state is AvailabilityState.AVAILABLE
+    else:
+        assert terminal.event_type == "run_failed"
+        assert (
+            terminal.payload.get("failure_code")
+            == "run_abandoned_artifact_unrecoverable"
+        )
+        assert current[0].state is AvailabilityState.UNAVAILABLE
 
 
 def test_library_runtime_cancellation_interruption_and_recovery_release_resources(

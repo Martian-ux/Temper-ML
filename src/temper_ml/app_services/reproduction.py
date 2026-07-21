@@ -11,6 +11,7 @@ import importlib
 import os
 from pathlib import Path
 import stat
+import time
 from typing import Any
 
 from temper_ml.app_services.errors import ApplicationServiceError
@@ -55,6 +56,8 @@ _REPLAY_TERMINAL_EVENT_BY_STATUS = {
     RunLifecycleStatus.PREFLIGHT_BLOCKED: "replay_execution_failed",
 }
 _REPLAY_TERMINAL_EVENTS = frozenset(_REPLAY_TERMINAL_EVENT_BY_STATUS.values())
+_REPLAY_PLANNING_WAIT_SECONDS = 5.0
+_REPLAY_PLANNING_RETRY_SECONDS = 0.01
 
 
 @dataclass(frozen=True)
@@ -248,6 +251,101 @@ class ReproductionService:
         self.store = TypedEvidenceStore(self.project_root)
         self.adapter = adapter
 
+    def reserve_replay_attempt(self, candidate_key: str) -> int:
+        """Durably reserve one candidate ordinal under a cross-process lease."""
+
+        try:
+            require_identifier("candidate_key", candidate_key)
+        except RecordValidationError:
+            raise ApplicationServiceError("replay_candidate_invalid") from None
+        deadline = time.monotonic() + _REPLAY_PLANNING_WAIT_SECONDS
+        while True:
+            try:
+                with self._claim_replay_execution(f"planning-{candidate_key}"):
+                    return self._reserve_replay_attempt_locked(candidate_key)
+            except ApplicationServiceError as exc:
+                if exc.code != "replay_execution_busy":
+                    raise
+                if time.monotonic() >= deadline:
+                    raise ApplicationServiceError("replay_planning_busy") from None
+                time.sleep(_REPLAY_PLANNING_RETRY_SECONDS)
+
+    def _reserve_replay_attempt_locked(self, candidate_key: str) -> int:
+        prefix = f"run-replay-{candidate_key}-"
+        planning_stream = f"planning-replay-{candidate_key}"
+        try:
+            records = tuple(stored.record for stored in self.store.iter_records())
+            streams = self.store.iter_streams()
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        used = {
+            record.run_id
+            for record in records
+            if isinstance(record, Run) and record.run_id.startswith(prefix)
+        }
+        for snapshot in streams:
+            for event in snapshot.events:
+                if event.event_type == "replay_execution_started":
+                    if event.payload.get("candidate_key") != candidate_key:
+                        continue
+                    run_id = event.payload.get("run_id")
+                    if not isinstance(run_id, str) or not run_id.startswith(prefix):
+                        raise ApplicationServiceError(
+                            "replay_planning_evidence_conflict"
+                        )
+                    used.add(run_id)
+                    continue
+                if event.event_type != "replay_planning_reserved":
+                    continue
+                if snapshot.stream_id != planning_stream:
+                    if event.payload.get("candidate_key") == candidate_key:
+                        raise ApplicationServiceError(
+                            "replay_planning_evidence_conflict"
+                        )
+                    continue
+                payload = event.payload
+                ordinal = payload.get("ordinal")
+                run_id = payload.get("run_id")
+                if (
+                    set(payload)
+                    != {"schema_version", "candidate_key", "ordinal", "run_id"}
+                    or payload.get("schema_version") != "v1"
+                    or payload.get("candidate_key") != candidate_key
+                    or type(ordinal) is not int
+                    or ordinal < 1
+                    or run_id != f"{prefix}{ordinal:03d}"
+                    or event.idempotency_key
+                    != f"{planning_stream}-reserved-{ordinal:03d}"
+                ):
+                    raise ApplicationServiceError("replay_planning_evidence_conflict")
+                used.add(run_id)
+        ordinal = 1
+        while f"{prefix}{ordinal:03d}" in used:
+            ordinal += 1
+        run_id = f"{prefix}{ordinal:03d}"
+        request = EventRequest(
+            f"{planning_stream}-reserved-{ordinal:03d}",
+            "replay_planning_reserved",
+            {
+                "schema_version": "v1",
+                "candidate_key": candidate_key,
+                "ordinal": ordinal,
+                "run_id": run_id,
+            },
+        )
+        self._append_replay_event(planning_stream, request)
+        durable = tuple(
+            event
+            for event in self._replay_events(planning_stream)
+            if event.idempotency_key == request.idempotency_key
+        )
+        if (
+            len(durable) != 1
+            or durable[0].request_fields() != request.canonical_fields()
+        ):
+            raise ApplicationServiceError("replay_planning_evidence_conflict")
+        return ordinal
+
     def execute(
         self,
         request: ReplayExecutionRequest,
@@ -377,6 +475,7 @@ class ReproductionService:
         run_service.reconcile_terminal_ownership(
             intent.run_id,
             intent.run_ownership_identity,
+            artifact_id=intent.artifact_id,
         )
         self._append_terminal(intent, result.status)
         return ReplayExecutionResult(plan, result)
@@ -608,6 +707,7 @@ class ReproductionService:
             status = run_service.reconcile_abandoned_running(
                 intent.run_id,
                 intent.run_ownership_identity,
+                artifact_id=intent.artifact_id,
             )
         if status is None or status is RunLifecycleStatus.RUNNING:
             return None
@@ -670,6 +770,7 @@ class ReproductionService:
         run_service.reconcile_terminal_ownership(
             intent.run_id,
             intent.run_ownership_identity,
+            artifact_id=intent.artifact_id,
         )
         return ReplayReconciliationResult(
             intent.plan_id,
@@ -848,6 +949,7 @@ class ReproductionService:
         lock_path = (
             Path(os.path.abspath(self.project_root / RUNTIME_OUTPUT_DIRECTORY))
             / "runtime-ownership"
+            / ".control"
             / "replay"
             / stream_id
             / "lease.lock"

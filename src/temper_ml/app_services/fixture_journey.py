@@ -958,8 +958,11 @@ class FixtureJourneyService:
     def reconcile_pending_operations(self) -> dict[str, object]:
         """Recover interrupted mutations at an explicit controlled boundary."""
 
+        run_service = RunService(self.project_root)
+        run_service.repair_incomplete_ownership_claims()
         replay = ReproductionService(self.project_root).reconcile_pending()
-        RunService(self.project_root).reconcile_terminal_ownerships()
+        run_service.reconcile_abandoned_runs()
+        run_service.reconcile_terminal_ownerships()
         cleanup = RetentionService(self.project_root).reconcile_pending()
         return {
             "replay_execution_count": len(replay),
@@ -1013,7 +1016,9 @@ class FixtureJourneyService:
         _, model, prepared = self._prepared_context()
         requirements, target, group, profile = self._resolved_context()
         source = self._record_by_logical_id(Experiment, candidate.experiment_id)
-        ordinal = self._next_replay_ordinal(candidate.key)
+        ordinal = ReproductionService(self.project_root).reserve_replay_attempt(
+            candidate.key
+        )
         suffix = f"{candidate.key}-{ordinal:03d}"
         if mode == ReplayMode.STRICT.value:
             exact_preflight = preflight(
@@ -1039,7 +1044,6 @@ class FixtureJourneyService:
                 estimate=candidate.estimate,
             )
         elif mode == ReplayMode.ADAPTED.value:
-            derivation_ordinal = len(self._records(ExperimentDerivation)) + 1
             adapted_requirements = replace(
                 requirements,
                 requirements_id=f"requirements-replay-{suffix}",
@@ -1085,8 +1089,8 @@ class FixtureJourneyService:
                     "recipe_resolution": record_reference(adapted_resolution),
                     "hardware_requirements": record_reference(adapted_requirements),
                 },
-                derivation_id=f"derivation-adapted-{derivation_ordinal:03d}",
-                diff_id=f"manifest-diff-adapted-{derivation_ordinal:03d}",
+                derivation_id=f"derivation-adapted-{suffix}",
+                diff_id=f"manifest-diff-adapted-{suffix}",
                 reason_code="hardware_precision_adaptation",
                 reason=(
                     "The available fixture profile supports bf16 instead of the "
@@ -1119,33 +1123,6 @@ class FixtureJourneyService:
             raise ApplicationServiceError("replay_mode_invalid")
         self._replay_draft = _FixtureReplayDraft(plan, launch, candidate_key)
         return self._replay_draft.to_view()
-
-    def _next_replay_ordinal(self, candidate_key: str) -> int:
-        """Reserve every run ID already consumed by a Run or replay intent."""
-
-        prefix = f"run-replay-{candidate_key}-"
-        try:
-            store = TypedEvidenceStore(self.project_root)
-            used = {
-                record.run_id
-                for record in (stored.record for stored in store.iter_records())
-                if isinstance(record, Run) and record.run_id.startswith(prefix)
-            }
-            used.update(
-                run_id
-                for snapshot in store.iter_streams()
-                for event in snapshot.events
-                if event.event_type == "replay_execution_started"
-                and event.payload.get("candidate_key") == candidate_key
-                and isinstance((run_id := event.payload.get("run_id")), str)
-                and run_id.startswith(prefix)
-            )
-        except EvidenceError as exc:
-            raise ApplicationServiceError(exc.code) from None
-        ordinal = 1
-        while f"{prefix}{ordinal:03d}" in used:
-            ordinal += 1
-        return ordinal
 
     def execute_replay(
         self,

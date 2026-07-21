@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 from pathlib import Path
-from typing import Mapping, NoReturn
+from typing import Mapping, NoReturn, TypeVar
 
 from temper_ml.app_services._records import (
     require_no_conflicting_logical_revision,
@@ -28,6 +28,7 @@ from temper_ml.domain.compatibility import (
     ResumeRequest,
     check_resume_compatibility,
 )
+from temper_ml.domain.datasets import DatasetVersion
 from temper_ml.domain.experiments import Experiment
 from temper_ml.domain.hardware import (
     ExecutionTarget,
@@ -41,6 +42,7 @@ from temper_ml.domain.projections import (
 )
 from temper_ml.domain.recipes import RecipeResolution
 from temper_ml.domain.records import (
+    RecordReference,
     RecordValidationError,
     TypedRecord,
     identity_fields,
@@ -75,8 +77,10 @@ from temper_ml.runtime.ownership import (
     RunOwnershipError,
     RunOwnershipLease,
     claim_abandoned_run_ownership,
+    claim_released_run_ownership,
     claim_run_ownership,
     existing_run_claim_identity,
+    iter_run_ownership_claims,
     reconcile_run_ownership,
     released_run_claim_identity,
 )
@@ -110,6 +114,8 @@ PREFLIGHT_EVIDENCE_PROJECTION = HashProjection("runtime.preflight_evidence", "v1
 ARTIFACT_LINEAGE_PROJECTION = HashProjection("artifact.runtime_lineage", "v1")
 RUN_OWNERSHIP_PROJECTION = HashProjection("runtime.run_ownership_claim", "v1")
 RUNTIME_OUTPUT_DIRECTORY = ".temper-fixture-output"
+
+_TypedRecordT = TypeVar("_TypedRecordT", bound=TypedRecord)
 
 _RUN_TERMINAL_STATUSES = {
     "run_preflight_blocked": "preflight_blocked",
@@ -645,15 +651,37 @@ class RunService:
                     "artifact_id": request.artifact_id,
                 }
             )
+        expected_preflight_payload: dict[str, object] = {
+            "ready": True,
+            "preflight_identity": identity_fields(preflight_identity),
+            "blocking_reasons": [],
+        }
+        preflight_events = tuple(
+            event
+            for event in lifecycle_events
+            if event.event_type == "run_preflight_succeeded"
+        )
+        if len(preflight_events) != 1:
+            raise ApplicationServiceError("run_existing_lifecycle_conflict")
+        if "run_ownership_identity" in preflight_events[0].payload:
+            expected_preflight_payload.update(
+                {
+                    "run_identity": identity_fields(run.identity),
+                    "runtime_request_identity": identity_fields(
+                        runtime_request.identity
+                    ),
+                    "run_ownership_identity": identity_fields(
+                        self.planned_first_attempt_ownership(request)
+                    ),
+                    "artifact_id": request.artifact_id,
+                    "attempt_number": 1,
+                }
+            )
         expected_events = [
             EventRequest(
                 f"{run.run_id}-preflight",
                 "run_preflight_succeeded",
-                {
-                    "ready": True,
-                    "preflight_identity": identity_fields(preflight_identity),
-                    "blocking_reasons": [],
-                },
+                expected_preflight_payload,
             ),
             EventRequest(
                 f"{run.run_id}-request-frozen",
@@ -1063,11 +1091,23 @@ class RunService:
         self,
         run_id: str,
         expected_claim_identity: ContentIdentity | None,
+        *,
+        artifact_id: str | None = None,
     ) -> RunLifecycleStatus | None:
         """Terminalize one running lifecycle only after its exact OS lease is free."""
 
         if expected_claim_identity is None:
-            return None
+            events = self._events(run_id)
+            status, lifecycle = validated_run_lifecycle(events)
+            if status is not RunLifecycleStatus.RUNNING:
+                return status
+            expected_claim_identity = self._canonical_or_context_ownership_identity(
+                run_id,
+                lifecycle,
+                artifact_id=artifact_id,
+            )
+            if expected_claim_identity is None:
+                return None
         try:
             require_identifier("run_id", run_id)
         except RecordValidationError:
@@ -1079,51 +1119,580 @@ class RunService:
             with claim_abandoned_run_ownership(
                 root, run_id, expected_claim_identity
             ) as ownership:
-                events = self._events(run_id)
-                status, lifecycle = validated_run_lifecycle(events)
-                if status.terminal:
-                    ownership.resolve()
-                    return status
-                if status is not RunLifecycleStatus.RUNNING:
-                    raise ApplicationServiceError("run_abandoned_lifecycle_conflict")
-                launched = tuple(
-                    event for event in lifecycle if event.event_type == "run_launched"
+                return self._reconcile_abandoned_running_owned(
+                    run_id,
+                    expected_claim_identity,
+                    ownership,
                 )
-                runs = tuple(
-                    stored.record
-                    for stored in self.store.iter_records()
-                    if isinstance(stored.record, Run) and stored.record.run_id == run_id
-                )
-                if len(launched) != 1 or len(runs) != 1:
-                    raise ApplicationServiceError("run_abandoned_lifecycle_conflict")
-                run = runs[0]
-                runtime_request = self._runtime_request_for_identity(
-                    run.request_identity
-                )
-                if (
-                    _event_identity(launched[0], "run_identity") != run.identity
-                    or _event_identity(launched[0], "runtime_request_identity")
-                    != runtime_request.identity
-                    or launched[0].payload.get("attempt_number") != run.attempt_number
-                ):
-                    raise ApplicationServiceError("run_abandoned_lifecycle_conflict")
-                if "run_ownership_identity" in launched[0].payload and (
-                    _event_identity(launched[0], "run_ownership_identity")
-                    != expected_claim_identity
-                ):
-                    raise ApplicationServiceError("run_ownership_claim_conflict")
-                self._terminalize_abandoned_running(
-                    run,
-                    runtime_request,
-                    launched[0],
-                )
-                terminal = self.status(run_id)
-                if not terminal.terminal:
-                    raise ApplicationServiceError("run_abandoned_terminal_missing")
-                ownership.resolve()
-                return terminal
         except RunOwnershipError as exc:
             raise ApplicationServiceError(exc.code) from None
+
+    def _reconcile_abandoned_running_owned(
+        self,
+        run_id: str,
+        expected_claim_identity: ContentIdentity,
+        ownership: RunOwnershipLease,
+    ) -> RunLifecycleStatus:
+        """Terminalize one lifecycle after its exact abandoned lease is held."""
+
+        events = self._events(run_id)
+        status, lifecycle = validated_run_lifecycle(events)
+        if status.terminal:
+            ownership.resolve()
+            return status
+        if status is not RunLifecycleStatus.RUNNING:
+            raise ApplicationServiceError("run_abandoned_lifecycle_conflict")
+        launched = tuple(
+            event for event in lifecycle if event.event_type == "run_launched"
+        )
+        try:
+            runs = tuple(
+                stored.record
+                for stored in self.store.iter_records()
+                if isinstance(stored.record, Run) and stored.record.run_id == run_id
+            )
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        if len(launched) != 1 or len(runs) != 1:
+            raise ApplicationServiceError("run_abandoned_lifecycle_conflict")
+        run = runs[0]
+        runtime_request = self._runtime_request_for_identity(run.request_identity)
+        if (
+            _event_identity(launched[0], "run_identity") != run.identity
+            or _event_identity(launched[0], "runtime_request_identity")
+            != runtime_request.identity
+            or launched[0].payload.get("attempt_number") != run.attempt_number
+        ):
+            raise ApplicationServiceError("run_abandoned_lifecycle_conflict")
+        if "run_ownership_identity" in launched[0].payload and (
+            _event_identity(launched[0], "run_ownership_identity")
+            != expected_claim_identity
+        ):
+            raise ApplicationServiceError("run_ownership_claim_conflict")
+        self._terminalize_abandoned_running(
+            run,
+            runtime_request,
+            launched[0],
+        )
+        terminal = self.status(run_id)
+        if not terminal.terminal:
+            raise ApplicationServiceError("run_abandoned_terminal_missing")
+        ownership.resolve()
+        return terminal
+
+    def reconcile_abandoned_runs(self) -> tuple[str, ...]:
+        """Recover unresolved ordinary attempts without replay-specific intent."""
+
+        root = self._runtime_root().absolute()
+        try:
+            claims = iter_run_ownership_claims(root)
+        except RunOwnershipError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        repaired: list[str] = []
+        for claim in claims:
+            try:
+                ownership_claim = (
+                    claim_released_run_ownership(
+                        root, claim.run_id, claim.claim_identity
+                    )
+                    if claim.resolved
+                    else claim_abandoned_run_ownership(
+                        root, claim.run_id, claim.claim_identity
+                    )
+                )
+                with ownership_claim as ownership:
+                    if self._reconcile_abandoned_claim_owned(
+                        claim.run_id,
+                        claim.claim_identity,
+                        ownership,
+                        claim_was_resolved=claim.resolved,
+                        request_id=claim.request_id,
+                        artifact_id=claim.artifact_id,
+                        attempt_number=claim.attempt_number,
+                    ):
+                        repaired.append(claim.run_id)
+            except RunOwnershipError as exc:
+                if exc.code in {
+                    "run_ownership_unavailable",
+                    "run_ownership_resolved",
+                    "run_ownership_unresolved",
+                }:
+                    continue
+                raise ApplicationServiceError(exc.code) from None
+        return tuple(repaired)
+
+    def repair_incomplete_ownership_claims(self) -> tuple[str, ...]:
+        """Finish interrupted claim publication before specialized recovery."""
+
+        try:
+            return tuple(
+                claim.run_id
+                for claim in iter_run_ownership_claims(self._runtime_root().absolute())
+            )
+        except RunOwnershipError as exc:
+            raise ApplicationServiceError(exc.code) from None
+
+    def _reconcile_abandoned_claim_owned(
+        self,
+        run_id: str,
+        claim_identity: ContentIdentity,
+        ownership: RunOwnershipLease,
+        *,
+        claim_was_resolved: bool,
+        request_id: str | None,
+        artifact_id: str | None,
+        attempt_number: int | None,
+    ) -> bool:
+        """Reread all lifecycle evidence only after the exact lease is held."""
+
+        try:
+            events = self._events(run_id)
+            runs = tuple(
+                stored.record
+                for stored in self.store.iter_records()
+                if isinstance(stored.record, Run) and stored.record.run_id == run_id
+            )
+            if not events:
+                return self._reconcile_abandoned_record_prefix_owned(
+                    run_id,
+                    claim_identity,
+                    ownership,
+                    runs,
+                    claim_was_resolved=claim_was_resolved,
+                    request_id=request_id,
+                    artifact_id=artifact_id,
+                    attempt_number=attempt_number,
+                )
+            try:
+                status, lifecycle = validated_run_lifecycle(events)
+            except ApplicationServiceError as exc:
+                if exc.code == "run_lifecycle_incomplete":
+                    return self._reconcile_abandoned_prelaunch_owned(
+                        run_id,
+                        claim_identity,
+                        ownership,
+                        events,
+                        runs,
+                        request_id=request_id,
+                        artifact_id=artifact_id,
+                        attempt_number=attempt_number,
+                    )
+                raise
+            if status is RunLifecycleStatus.PREFLIGHT_BLOCKED:
+                if runs:
+                    raise ApplicationServiceError("run_abandoned_lifecycle_conflict")
+                if not self._valid_abandoned_preflight(lifecycle, claim_identity):
+                    if (
+                        request_id is None
+                        and artifact_id is None
+                        and attempt_number is None
+                        and self._valid_legacy_abandoned_preflight(lifecycle)
+                    ):
+                        return False
+                    raise ApplicationServiceError("run_abandoned_lifecycle_conflict")
+                ownership.resolve()
+                return True
+            if status is not RunLifecycleStatus.RUNNING:
+                if (
+                    not claim_was_resolved
+                    and self._valid_claim_bound_no_launch_terminal(
+                        claim_identity,
+                        lifecycle,
+                        runs,
+                        request_id=request_id,
+                        artifact_id=artifact_id,
+                        attempt_number=attempt_number,
+                    )
+                ):
+                    ownership.resolve()
+                    return True
+                return False
+            if len(runs) != 1:
+                raise ApplicationServiceError("run_abandoned_lifecycle_conflict")
+            expected = self._canonical_ownership_identity(runs[0], lifecycle)
+            if expected is None:
+                return False
+            if expected != claim_identity:
+                raise ApplicationServiceError("run_ownership_claim_conflict")
+            self._reconcile_abandoned_running_owned(
+                run_id,
+                claim_identity,
+                ownership,
+            )
+            return True
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+
+    @staticmethod
+    def _valid_abandoned_preflight(
+        lifecycle: tuple[StoredEvent, ...],
+        claim_identity: ContentIdentity,
+    ) -> bool:
+        """Validate an event-only preflight terminal against its exact claim."""
+
+        if len(lifecycle) != 1 or lifecycle[0].event_type != "run_preflight_blocked":
+            return False
+        event = lifecycle[0]
+        artifact_id = event.payload.get("artifact_id")
+        try:
+            if _event_identity(
+                event, "run_ownership_identity"
+            ) != claim_identity or not isinstance(artifact_id, str):
+                raise RecordValidationError("preflight ownership evidence is invalid")
+            require_identifier("artifact_id", artifact_id)
+        except (ApplicationServiceError, RecordValidationError):
+            return False
+        return True
+
+    @staticmethod
+    def _valid_legacy_abandoned_preflight(
+        lifecycle: tuple[StoredEvent, ...],
+    ) -> bool:
+        """Recognize, but do not resolve, an identity-unbound v1 terminal."""
+
+        if len(lifecycle) != 1 or lifecycle[0].event_type != "run_preflight_blocked":
+            return False
+        event = lifecycle[0]
+        reasons = event.payload.get("blocking_reasons")
+        try:
+            if (
+                set(event.payload)
+                != {"ready", "preflight_identity", "blocking_reasons"}
+                or event.payload.get("ready") is not False
+                or not isinstance(reasons, tuple)
+                or not reasons
+                or any(not isinstance(reason, str) or not reason for reason in reasons)
+            ):
+                return False
+            _event_identity(event, "preflight_identity")
+        except ApplicationServiceError:
+            return False
+        return True
+
+    def _valid_claim_bound_no_launch_terminal(
+        self,
+        claim_identity: ContentIdentity,
+        lifecycle: tuple[StoredEvent, ...],
+        runs: tuple[Run, ...],
+        *,
+        request_id: str | None,
+        artifact_id: str | None,
+        attempt_number: int | None,
+    ) -> bool:
+        """Prove an exact v2 record-prefix failure before releasing its claim."""
+
+        terminals = tuple(
+            event for event in lifecycle if event.event_type in _RUN_TERMINAL_STATUSES
+        )
+        if (
+            len(runs) != 1
+            or len(terminals) != 1
+            or terminals[0].event_type != "run_failed"
+            or terminals[0].payload.get("phase")
+            not in {"launch_records", "launch_evidence"}
+            or any(event.event_type == "run_launched" for event in lifecycle)
+            or not isinstance(request_id, str)
+            or not isinstance(artifact_id, str)
+            or type(attempt_number) is not int
+        ):
+            return False
+        runtime_request = self._runtime_request_for_identity(runs[0].request_identity)
+        if (
+            runtime_request.request_id != request_id
+            or runs[0].attempt_number != attempt_number
+            or self._ownership_identity_from_records(
+                runs[0], runtime_request, artifact_id
+            )
+            != claim_identity
+        ):
+            raise ApplicationServiceError("run_abandoned_prelaunch_conflict")
+        return True
+
+    def _reconcile_abandoned_record_prefix_owned(
+        self,
+        run_id: str,
+        claim_identity: ContentIdentity,
+        ownership: RunOwnershipLease,
+        runs: tuple[Run, ...],
+        *,
+        claim_was_resolved: bool,
+        request_id: str | None,
+        artifact_id: str | None,
+        attempt_number: int | None,
+    ) -> bool:
+        """Recover an exact v2 claim whose record writes outlived the process."""
+
+        context = (request_id, artifact_id, attempt_number)
+        if all(value is None for value in context):
+            if runs or claim_was_resolved:
+                return False
+            ownership.resolve()
+            return True
+        if (
+            not isinstance(request_id, str)
+            or not isinstance(artifact_id, str)
+            or type(attempt_number) is not int
+            or attempt_number < 1
+        ):
+            raise ApplicationServiceError("run_abandoned_prelaunch_conflict")
+        try:
+            requests = tuple(
+                stored.record
+                for stored in self.store.iter_records()
+                if isinstance(stored.record, ResolvedRuntimeRequest)
+                and stored.record.request_id == request_id
+            )
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        if not requests and not runs:
+            if claim_was_resolved:
+                return False
+            ownership.resolve()
+            return True
+        if len(requests) != 1 or len(runs) > 1:
+            raise ApplicationServiceError("run_abandoned_prelaunch_conflict")
+        runtime_request = requests[0]
+        try:
+            expected_run = self._prelaunch_run_from_request(
+                run_id, runtime_request, attempt_number
+            )
+            ownership_matches = (
+                self._ownership_identity_from_records(
+                    expected_run, runtime_request, artifact_id
+                )
+                == claim_identity
+            )
+        except ApplicationServiceError:
+            if claim_was_resolved and not runs:
+                return False
+            raise
+        if not ownership_matches:
+            if claim_was_resolved and not runs:
+                return False
+            raise ApplicationServiceError("run_abandoned_prelaunch_conflict")
+        if runs and runs[0] != expected_run:
+            raise ApplicationServiceError("run_abandoned_prelaunch_conflict")
+        if not runs:
+            require_no_conflicting_logical_revision(
+                self.store,
+                expected_run,
+                conflict_code="run_abandoned_prelaunch_conflict",
+            )
+            write_record_idempotently(
+                self.store,
+                expected_run,
+                conflict_code="run_abandoned_prelaunch_conflict",
+            )
+        self._append_failure(
+            run_id,
+            "launch_records",
+            "run_launch_record_persistence_failed",
+        )
+        if self.status(run_id) is not RunLifecycleStatus.FAILED:
+            raise ApplicationServiceError("run_abandoned_terminal_missing")
+        ownership.resolve()
+        return True
+
+    @staticmethod
+    def _prelaunch_run_from_request(
+        run_id: str,
+        runtime_request: ResolvedRuntimeRequest,
+        attempt_number: int,
+    ) -> Run:
+        try:
+            return Run(
+                run_id=run_id,
+                experiment=runtime_request.experiment,
+                experiment_manifest_identity=(
+                    runtime_request.experiment_manifest_identity
+                ),
+                attempt_number=attempt_number,
+                hardware_capability_profile=(
+                    runtime_request.hardware_capability_profile
+                ),
+                execution_target=runtime_request.execution_target,
+                runtime_identity=runtime_request.runtime_identity,
+                request_identity=runtime_request.identity,
+                training_state_identity=runtime_request.training_state_identity,
+                retry_of=runtime_request.resume_from_run,
+            )
+        except RecordValidationError:
+            raise ApplicationServiceError("run_abandoned_prelaunch_conflict") from None
+
+    def _reconcile_abandoned_prelaunch_owned(
+        self,
+        run_id: str,
+        claim_identity: ContentIdentity,
+        ownership: RunOwnershipLease,
+        events: tuple[StoredEvent, ...],
+        runs: tuple[Run, ...],
+        *,
+        request_id: str | None,
+        artifact_id: str | None,
+        attempt_number: int | None,
+    ) -> bool:
+        """Terminalize a claim-bound prefix that never reached worker launch."""
+
+        event_types = tuple(event.event_type for event in events)
+        if event_types not in {
+            ("run_preflight_succeeded",),
+            ("run_preflight_succeeded", "runtime_request_frozen"),
+            (
+                "run_preflight_succeeded",
+                "runtime_request_frozen",
+                "run_recovered",
+            ),
+        }:
+            return False
+        preflight_event = events[0]
+        expected_fields = {
+            "ready",
+            "preflight_identity",
+            "blocking_reasons",
+            "run_identity",
+            "runtime_request_identity",
+            "run_ownership_identity",
+            "artifact_id",
+            "attempt_number",
+        }
+        if (
+            request_id is None
+            and artifact_id is None
+            and attempt_number is None
+            and set(preflight_event.payload) != expected_fields
+        ):
+            # Identity-only v1 claims predate claim-bound prefix evidence.  Their
+            # old preflight prefix is not strong enough to terminalize safely.
+            return False
+        event_artifact_id = preflight_event.payload.get("artifact_id")
+        event_attempt_number = preflight_event.payload.get("attempt_number")
+        try:
+            if (
+                preflight_event.idempotency_key != f"{run_id}-preflight"
+                or set(preflight_event.payload) != expected_fields
+                or preflight_event.payload.get("ready") is not True
+                or preflight_event.payload.get("blocking_reasons") != ()
+                or not isinstance(event_artifact_id, str)
+                or type(event_attempt_number) is not int
+                or event_attempt_number < 1
+                or _event_identity(preflight_event, "run_ownership_identity")
+                != claim_identity
+                or (artifact_id is not None and event_artifact_id != artifact_id)
+                or (
+                    attempt_number is not None
+                    and event_attempt_number != attempt_number
+                )
+            ):
+                raise RecordValidationError("prelaunch evidence is invalid")
+            require_identifier("artifact_id", event_artifact_id)
+            run_identity = _event_identity(preflight_event, "run_identity")
+            runtime_request_identity = _event_identity(
+                preflight_event, "runtime_request_identity"
+            )
+            if request_id is not None:
+                require_identifier("request_id", request_id)
+            preflight_identity = _event_identity(preflight_event, "preflight_identity")
+        except (ApplicationServiceError, RecordValidationError):
+            raise ApplicationServiceError("run_abandoned_prelaunch_conflict") from None
+        try:
+            requests = tuple(
+                stored.record
+                for stored in self.store.iter_records()
+                if isinstance(stored.record, ResolvedRuntimeRequest)
+                and stored.record.identity == runtime_request_identity
+            )
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        if len(requests) > 1 or len(runs) > 1 or (runs and not requests):
+            raise ApplicationServiceError("run_abandoned_prelaunch_conflict")
+        if not requests:
+            if len(events) != 1:
+                raise ApplicationServiceError("run_abandoned_prelaunch_conflict")
+        else:
+            runtime_request = requests[0]
+            expected_run = self._prelaunch_run_from_request(
+                run_id, runtime_request, event_attempt_number
+            )
+            if (
+                (request_id is not None and runtime_request.request_id != request_id)
+                or expected_run.identity != run_identity
+                or runtime_request.preflight_identity != preflight_identity
+                or self._ownership_identity_from_records(
+                    expected_run, runtime_request, event_artifact_id
+                )
+                != claim_identity
+                or (runs and runs[0] != expected_run)
+            ):
+                raise ApplicationServiceError("run_abandoned_prelaunch_conflict")
+            if not runs:
+                require_no_conflicting_logical_revision(
+                    self.store,
+                    expected_run,
+                    conflict_code="run_abandoned_prelaunch_conflict",
+                )
+                write_record_idempotently(
+                    self.store,
+                    expected_run,
+                    conflict_code="run_abandoned_prelaunch_conflict",
+                )
+            if len(events) >= 2:
+                expected_frozen = EventRequest(
+                    f"{run_id}-request-frozen",
+                    "runtime_request_frozen",
+                    {
+                        "runtime_request_identity": identity_fields(
+                            runtime_request.identity
+                        ),
+                        "experiment_manifest_identity": identity_fields(
+                            runtime_request.experiment_manifest_identity
+                        ),
+                        "preflight_identity": identity_fields(preflight_identity),
+                        "evaluation_mode": runtime_request.evaluation_mode.value,
+                        "starting_step": runtime_request.starting_step,
+                    },
+                )
+                if events[1].request_fields() != expected_frozen.canonical_fields():
+                    raise ApplicationServiceError("run_abandoned_prelaunch_conflict")
+            if len(events) == 3:
+                if (
+                    runtime_request.resume_from_run is None
+                    or runtime_request.resume_checkpoint_identity is None
+                ):
+                    raise ApplicationServiceError("run_abandoned_prelaunch_conflict")
+                try:
+                    prior = self.store.read_record(
+                        runtime_request.resume_from_run
+                    ).record
+                except EvidenceError as exc:
+                    raise ApplicationServiceError(exc.code) from None
+                if not isinstance(prior, Run):
+                    raise ApplicationServiceError("run_abandoned_prelaunch_conflict")
+                expected_recovered = EventRequest(
+                    f"{run_id}-recovered",
+                    "run_recovered",
+                    {
+                        "prior_run_identity": identity_fields(prior.identity),
+                        "checkpoint_identity": identity_fields(
+                            runtime_request.resume_checkpoint_identity
+                        ),
+                        "training_state_identity": identity_fields(
+                            runtime_request.training_state_identity
+                        ),
+                        "starting_step": runtime_request.starting_step,
+                        "resume_compatible": True,
+                    },
+                )
+                if events[2].request_fields() != expected_recovered.canonical_fields():
+                    raise ApplicationServiceError("run_abandoned_prelaunch_conflict")
+        self._append_failure(
+            run_id,
+            "launch_records",
+            "run_launch_record_persistence_failed",
+        )
+        if self.status(run_id) is not RunLifecycleStatus.FAILED:
+            raise ApplicationServiceError("run_abandoned_terminal_missing")
+        ownership.resolve()
+        return True
 
     def reconcile_terminal_ownerships(self) -> tuple[str, ...]:
         """Repair unresolved claims for ordinary canonically terminal runs."""
@@ -1171,6 +1740,8 @@ class RunService:
         self,
         run_id: str,
         expected_claim_identity: ContentIdentity | None,
+        *,
+        artifact_id: str | None = None,
     ) -> ContentIdentity:
         """Repair output ownership only after one verified canonical terminal."""
 
@@ -1183,9 +1754,20 @@ class RunService:
         ):
             raise ApplicationServiceError("run_ownership_terminal_required")
         root = self._runtime_root().absolute()
-        try:
-            if expected_claim_identity is None:
+        if expected_claim_identity is None:
+            try:
                 return released_run_claim_identity(root, run_id)
+            except RunOwnershipError as exc:
+                if exc.code != "run_ownership_unresolved":
+                    raise ApplicationServiceError(exc.code) from None
+            expected_claim_identity = self._canonical_or_context_ownership_identity(
+                run_id,
+                lifecycle,
+                artifact_id=artifact_id,
+            )
+            if expected_claim_identity is None:
+                raise ApplicationServiceError("run_ownership_unresolved")
+        try:
             return reconcile_run_ownership(root, run_id, expected_claim_identity)
         except RunOwnershipError as exc:
             raise ApplicationServiceError(exc.code) from None
@@ -1230,6 +1812,39 @@ class RunService:
         ):
             raise ApplicationServiceError("run_ownership_canonical_evidence_conflict")
         return expected
+
+    def _canonical_or_context_ownership_identity(
+        self,
+        run_id: str,
+        lifecycle: tuple[StoredEvent, ...],
+        *,
+        artifact_id: str | None,
+    ) -> ContentIdentity | None:
+        """Derive one claim from launch evidence or exact v2 replay context."""
+
+        try:
+            runs = tuple(
+                stored.record
+                for stored in self.store.iter_records()
+                if isinstance(stored.record, Run) and stored.record.run_id == run_id
+            )
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        if len(runs) != 1:
+            raise ApplicationServiceError("run_ownership_canonical_evidence_conflict")
+        expected = self._canonical_ownership_identity(runs[0], lifecycle)
+        if expected is not None or artifact_id is None:
+            return expected
+        try:
+            require_identifier("artifact_id", artifact_id)
+        except RecordValidationError:
+            raise ApplicationServiceError(
+                "run_ownership_canonical_evidence_conflict"
+            ) from None
+        runtime_request = self._runtime_request_for_identity(runs[0].request_identity)
+        return self._ownership_identity_from_records(
+            runs[0], runtime_request, artifact_id
+        )
 
     def _ownership_identity_from_records(
         self,
@@ -1286,6 +1901,17 @@ class RunService:
     ) -> None:
         fixture_runtime = launched.payload.get("fixture_runtime")
         if fixture_runtime is True:
+            if any(
+                event.event_type == "artifact_ingestion_started"
+                for event in self._events(run.run_id)
+            ):
+                self._recover_abandoned_artifact_completion(
+                    run,
+                    runtime_request,
+                    launched,
+                    runtime_artifact_identity=None,
+                )
+                return
             self._append_abandoned_interrupted(run.run_id)
             return
         if (
@@ -1317,49 +1943,11 @@ class RunService:
         ):
             raise ApplicationServiceError("run_worker_reconciliation_failed")
         if snapshot.state is ControllerState.COMPLETED:
-            artifacts = tuple(
-                stored.record
-                for stored in self.store.iter_records()
-                if isinstance(stored.record, Artifact)
-                and stored.record.producing_run == record_reference(run)
-            )
-            verified = tuple(
-                event
-                for event in self._events(run.run_id)
-                if event.event_type == "artifact_ingestion_verified"
-            )
-            valid_completion = len(artifacts) == 1 and len(verified) == 1
-            if valid_completion:
-                artifact = artifacts[0]
-                try:
-                    valid_completion = (
-                        snapshot.artifact_identity == artifact.content_identity
-                        and _event_identity(verified[0], "artifact_identity")
-                        == artifact.identity
-                        and _event_identity(verified[0], "bundle_identity")
-                        == artifact.content_identity
-                        and _event_identity(verified[0], "integrity_evidence")
-                        == artifact.integrity_evidence
-                    )
-                except ApplicationServiceError:
-                    valid_completion = False
-            if not valid_completion:
-                self._append_failure(
-                    run.run_id,
-                    "runtime_reconciliation",
-                    "run_abandoned_completion_unrecoverable",
-                )
-                return
-            self._append(
-                run.run_id,
-                "completed",
-                "run_completed",
-                {
-                    "terminal": True,
-                    "verified_artifact": True,
-                    "artifact_identity": identity_fields(artifact.identity),
-                    "integrity_evidence": identity_fields(artifact.integrity_evidence),
-                },
+            self._recover_abandoned_artifact_completion(
+                run,
+                runtime_request,
+                launched,
+                runtime_artifact_identity=snapshot.artifact_identity,
             )
             return
         if snapshot.state is ControllerState.CANCELLED:
@@ -1387,6 +1975,382 @@ class RunService:
             self._append_failure(run.run_id, phase, failure_code)
             return
         raise ApplicationServiceError("run_worker_reconciliation_failed")
+
+    def _recover_abandoned_artifact_completion(
+        self,
+        run: Run,
+        runtime_request: ResolvedRuntimeRequest,
+        launched: StoredEvent,
+        *,
+        runtime_artifact_identity: ContentIdentity | None,
+    ) -> None:
+        existing_failure = self._abandoned_ingestion_failure(run.run_id)
+        if existing_failure is not None:
+            failure_phase, failure_code = existing_failure
+            self._fence_abandoned_artifact(run, launched)
+            self._append_failure(run.run_id, failure_phase, failure_code)
+            return
+        try:
+            artifact, _, integrity = self._verify_abandoned_artifact(
+                run,
+                runtime_request,
+                launched,
+                runtime_artifact_identity=runtime_artifact_identity,
+            )
+        except ApplicationServiceError:
+            self._fence_abandoned_artifact(run, launched)
+            self._append(
+                run.run_id,
+                "artifact-ingestion-failed",
+                "artifact_ingestion_failed",
+                {
+                    "failure_code": "run_abandoned_artifact_unrecoverable",
+                    "verified_artifact": False,
+                },
+            )
+            self._append_failure(
+                run.run_id,
+                "artifact_reconciliation",
+                "run_abandoned_artifact_unrecoverable",
+            )
+            return
+        self._append(
+            run.run_id,
+            "completed",
+            "run_completed",
+            {
+                "terminal": True,
+                "verified_artifact": True,
+                "artifact_identity": identity_fields(artifact.identity),
+                "integrity_evidence": identity_fields(integrity.evidence_identity),
+            },
+        )
+
+    def _abandoned_ingestion_failure(self, run_id: str) -> tuple[str, str] | None:
+        """Honor one durable ingestion failure before attempting completion."""
+
+        failures = tuple(
+            event
+            for event in self._events(run_id)
+            if event.event_type == "artifact_ingestion_failed"
+        )
+        if not failures:
+            return None
+        if len(failures) != 1:
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        failure = failures[0]
+        failure_code = failure.payload.get("failure_code")
+        if (
+            failure.idempotency_key != f"{run_id}-artifact-ingestion-failed"
+            or set(failure.payload) != {"failure_code", "verified_artifact"}
+            or not isinstance(failure_code, str)
+            or not failure_code
+            or failure.payload.get("verified_artifact") is not False
+        ):
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        phase = (
+            "artifact_reconciliation"
+            if failure_code == "run_abandoned_artifact_unrecoverable"
+            else "artifact_ingestion"
+        )
+        return phase, failure_code
+
+    def _verify_abandoned_artifact(
+        self,
+        run: Run,
+        runtime_request: ResolvedRuntimeRequest,
+        launched: StoredEvent,
+        *,
+        runtime_artifact_identity: ContentIdentity | None,
+    ) -> tuple[Artifact, ArtifactAvailability, ArtifactIntegrityResult]:
+        artifact_id = self._launched_artifact_id(launched)
+        if (
+            launched.payload.get("fixture_runtime") is False
+            and runtime_artifact_identity is None
+        ):
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        artifacts = tuple(
+            stored.record
+            for stored in self.store.iter_records()
+            if isinstance(stored.record, Artifact)
+            and (
+                stored.record.artifact_id == artifact_id
+                or stored.record.producing_run == record_reference(run)
+            )
+        )
+        if (
+            len(artifacts) != 1
+            or artifacts[0].artifact_id != artifact_id
+            or artifacts[0].producing_run != record_reference(run)
+        ):
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        artifact = artifacts[0]
+        if (
+            runtime_artifact_identity is not None
+            and runtime_artifact_identity != artifact.content_identity
+        ):
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        experiment = self._resolve_record(run.experiment, Experiment)
+        resolution = self._resolve_record(
+            runtime_request.recipe_resolution, RecipeResolution
+        )
+        dataset = self._record_by_identity(
+            DatasetVersion, runtime_request.dataset_version_identity
+        )
+        model = self._resolve_record(artifact.base_model_revision, BaseModelRevision)
+        if len(artifact.compatibility_groups) != 1:
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        group = self._resolve_record(
+            artifact.compatibility_groups[0], CompatibilityGroup
+        )
+        if (
+            run.request_identity != runtime_request.identity
+            or run.experiment != record_reference(experiment)
+            or runtime_request.experiment != record_reference(experiment)
+            or experiment.recipe_resolution != record_reference(resolution)
+            or experiment.dataset_version != dataset.identity
+            or experiment.base_model_revision != record_reference(model)
+            or experiment.compatibility_group != record_reference(group)
+            or artifact.project != experiment.project
+            or artifact.tokenizer_identity != model.tokenizer_identity
+            or group.base_model_revision != record_reference(model)
+            or group.tokenizer_identity != model.tokenizer_identity
+        ):
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        expectation = ArtifactIntegrityExpectation(
+            bundle_identity=artifact.content_identity,
+            producing_run=run,
+            runtime_request=runtime_request,
+            experiment=experiment,
+            recipe_resolution=resolution,
+            dataset_version=dataset,
+            base_model_revision=model,
+            compatibility_group=group,
+        )
+        try:
+            integrity = verify_artifact_bundle(
+                self._artifact_root(artifact_id), expectation
+            )
+            stored_manifest = self.store.read_bundle_manifest(
+                integrity.bundle_manifest.identity
+            )
+        except (ArtifactIntegrityError, EvidenceError) as exc:
+            code = getattr(exc, "code", "run_abandoned_artifact_conflict")
+            raise ApplicationServiceError(code) from None
+        lineage = content_identity(
+            ARTIFACT_LINEAGE_PROJECTION,
+            {
+                "schema_version": "v1",
+                "experiment": record_reference(experiment).to_dict(),
+                "resolved_runtime_request": record_reference(runtime_request).to_dict(),
+                "producing_run": record_reference(run).to_dict(),
+            },
+        )
+        expected_artifact = Artifact(
+            artifact_id=artifact_id,
+            project=experiment.project,
+            producing_run=record_reference(run),
+            adapter_type=resolution.adapter_type,
+            content_kind=ArtifactContentKind.BUNDLE,
+            content_identity=integrity.bundle_manifest.identity,
+            base_model_revision=record_reference(model),
+            tokenizer_identity=model.tokenizer_identity,
+            compatibility_groups=(record_reference(group),),
+            parent_artifacts=(),
+            storage_references=(StorageReference("project_store", artifact_id),),
+            integrity_evidence=integrity.evidence_identity,
+            provenance=integrity.provenance_identity,
+            lineage_evidence=lineage,
+        )
+        if (
+            stored_manifest != integrity.bundle_manifest
+            or artifact != expected_artifact
+        ):
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        expected_availability = ArtifactAvailability(
+            availability_id=f"available-{artifact.identity.value[:24]}",
+            artifact=record_reference(artifact),
+            state=AvailabilityState.AVAILABLE,
+            available_byte_classes=("final_adapter",),
+            storage_references=artifact.storage_references,
+            checkpoint_resumable=False,
+            observed_content_identity=artifact.content_identity,
+        )
+        availabilities = tuple(
+            stored.record
+            for stored in self.store.iter_records()
+            if isinstance(stored.record, ArtifactAvailability)
+            and stored.record.artifact == record_reference(artifact)
+        )
+        if not availabilities:
+            require_no_conflicting_logical_revision(
+                self.store,
+                expected_availability,
+                conflict_code="run_abandoned_artifact_conflict",
+            )
+            write_record_idempotently(
+                self.store,
+                expected_availability,
+                conflict_code="run_abandoned_artifact_conflict",
+            )
+        if self._current_artifact_availability(artifact) != expected_availability:
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        started = tuple(
+            event
+            for event in self._events(run.run_id)
+            if event.event_type == "artifact_ingestion_started"
+        )
+        if (
+            len(started) != 1
+            or _event_identity(started[0], "expected_bundle_identity")
+            != integrity.bundle_manifest.identity
+            or started[0].payload.get("expected_member_count")
+            != len(integrity.bundle_manifest.members)
+        ):
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        verified_payload = {
+            "artifact_identity": identity_fields(artifact.identity),
+            "bundle_identity": identity_fields(artifact.content_identity),
+            "integrity_evidence": identity_fields(integrity.evidence_identity),
+            "quality_evaluation_required": False,
+        }
+        verified_request = EventRequest(
+            f"{run.run_id}-artifact-ingestion-verified",
+            "artifact_ingestion_verified",
+            verified_payload,
+        )
+        verified = tuple(
+            event
+            for event in self._events(run.run_id)
+            if event.event_type == "artifact_ingestion_verified"
+        )
+        if not verified:
+            self._append(
+                run.run_id,
+                "artifact-ingestion-verified",
+                "artifact_ingestion_verified",
+                verified_payload,
+            )
+        elif (
+            len(verified) != 1
+            or verified[0].request_fields() != verified_request.canonical_fields()
+        ):
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        try:
+            self.store.verify()
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        return artifact, expected_availability, integrity
+
+    def _fence_abandoned_artifact(self, run: Run, launched: StoredEvent) -> None:
+        artifact_id = self._launched_artifact_id(launched)
+        artifacts = tuple(
+            stored.record
+            for stored in self.store.iter_records()
+            if isinstance(stored.record, Artifact)
+            and (
+                stored.record.artifact_id == artifact_id
+                or stored.record.producing_run == record_reference(run)
+            )
+        )
+        if not artifacts:
+            return
+        if (
+            len(artifacts) != 1
+            or artifacts[0].artifact_id != artifact_id
+            or artifacts[0].producing_run != record_reference(run)
+        ):
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        artifact = artifacts[0]
+        availabilities = tuple(
+            stored.record
+            for stored in self.store.iter_records()
+            if isinstance(stored.record, ArtifactAvailability)
+            and stored.record.artifact == record_reference(artifact)
+        )
+        current = (
+            self._current_artifact_availability(artifact) if availabilities else None
+        )
+        if current is not None and current.state in {
+            AvailabilityState.UNAVAILABLE,
+            AvailabilityState.REMOVED,
+        }:
+            return
+        unavailable = ArtifactAvailability(
+            availability_id=f"recovery-unavailable-{artifact.identity.value[:24]}",
+            artifact=record_reference(artifact),
+            state=AvailabilityState.UNAVAILABLE,
+            available_byte_classes=(),
+            storage_references=(),
+            checkpoint_resumable=False,
+            observed_content_identity=artifact.content_identity,
+            supersedes=(record_reference(current) if current is not None else None),
+        )
+        require_no_conflicting_logical_revision(
+            self.store,
+            unavailable,
+            conflict_code="run_abandoned_artifact_conflict",
+        )
+        write_record_idempotently(
+            self.store,
+            unavailable,
+            conflict_code="run_abandoned_artifact_conflict",
+        )
+
+    def _launched_artifact_id(self, launched: StoredEvent) -> str:
+        artifact_id = launched.payload.get("artifact_id")
+        try:
+            if not isinstance(artifact_id, str):
+                raise RecordValidationError("artifact_id is invalid")
+            return require_identifier("artifact_id", artifact_id)
+        except RecordValidationError:
+            raise ApplicationServiceError("run_abandoned_artifact_conflict") from None
+
+    def _current_artifact_availability(
+        self, artifact: Artifact
+    ) -> ArtifactAvailability:
+        values = tuple(
+            stored.record
+            for stored in self.store.iter_records()
+            if isinstance(stored.record, ArtifactAvailability)
+            and stored.record.artifact == record_reference(artifact)
+        )
+        superseded = {
+            value.supersedes.identity
+            for value in values
+            if value.supersedes is not None
+        }
+        current = tuple(value for value in values if value.identity not in superseded)
+        if len(current) != 1:
+            raise ApplicationServiceError("artifact_availability_ambiguous")
+        return current[0]
+
+    def _resolve_record(
+        self,
+        reference: RecordReference,
+        kind: type[_TypedRecordT],
+    ) -> _TypedRecordT:
+        try:
+            record = self.store.read_record(reference).record
+        except EvidenceError:
+            raise ApplicationServiceError("run_abandoned_artifact_conflict") from None
+        if not isinstance(record, kind):
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        return record
+
+    def _record_by_identity(
+        self,
+        kind: type[_TypedRecordT],
+        identity: ContentIdentity,
+    ) -> _TypedRecordT:
+        matches = tuple(
+            stored.record
+            for stored in self.store.iter_records()
+            if isinstance(stored.record, kind) and stored.record.identity == identity
+        )
+        if len(matches) != 1:
+            raise ApplicationServiceError("run_abandoned_artifact_conflict")
+        return matches[0]
 
     def _append_abandoned_interrupted(self, run_id: str) -> None:
         checkpoint_count = sum(
@@ -1468,11 +2432,15 @@ class RunService:
                 (self.project_root / RUNTIME_OUTPUT_DIRECTORY).absolute(),
                 request.run_id,
                 claim_identity,
+                request_id=request.request_id,
+                artifact_id=request.artifact_id,
+                attempt_number=attempt_number,
             ) as ownership:
                 try:
                     result = self._launch_owned(
                         request,
                         control=control,
+                        claim_identity=claim_identity,
                         attempt_number=attempt_number,
                         retry_of=retry_of,
                         recovery_checkpoint=recovery_checkpoint,
@@ -1555,6 +2523,7 @@ class RunService:
         request: RunLaunchRequest,
         *,
         control: FixtureControl | None,
+        claim_identity: ContentIdentity,
         attempt_number: int,
         retry_of: Run | None,
         recovery_checkpoint: FixtureCheckpoint | None,
@@ -1587,6 +2556,8 @@ class RunService:
                     "ready": False,
                     "preflight_identity": identity_fields(preflight_identity),
                     "blocking_reasons": list(result.blocking_reasons),
+                    "run_ownership_identity": identity_fields(claim_identity),
+                    "artifact_id": request.artifact_id,
                 },
             )
             raise ApplicationServiceError("run_preflight_blocked")
@@ -1609,15 +2580,31 @@ class RunService:
             raise ApplicationServiceError("run_launch_record_invalid") from None
         start_step = runtime_request.starting_step
         try:
-            self._persist_launch_records(
+            self._validate_launch_records(
                 request.hardware_capability_profile, runtime_request, run
             )
         except ApplicationServiceError:
             raise
         except Exception:
-            raise ApplicationServiceError(
-                "run_launch_record_persistence_failed"
-            ) from None
+            raise ApplicationServiceError("run_record_conflict") from None
+        try:
+            self._persist_launch_records(
+                request.hardware_capability_profile, runtime_request, run
+            )
+        except Exception as exc:
+            if not self._launch_run_record_is_durable(run):
+                stable_errors = (
+                    ApplicationServiceError,
+                    ArtifactIntegrityError,
+                    EvidenceError,
+                    FixtureAdapterError,
+                    LibraryRuntimeError,
+                )
+                code = exc.code if isinstance(exc, stable_errors) else None
+                if not isinstance(code, str) or not code:
+                    code = "run_launch_record_persistence_failed"
+                raise ApplicationServiceError(code) from None
+            self._terminalize_post_launch_failure(request.run_id, "launch_records", exc)
         try:
             self._append(
                 request.run_id,
@@ -1627,6 +2614,13 @@ class RunService:
                     "ready": True,
                     "preflight_identity": identity_fields(preflight_identity),
                     "blocking_reasons": [],
+                    "run_identity": identity_fields(run.identity),
+                    "runtime_request_identity": identity_fields(
+                        runtime_request.identity
+                    ),
+                    "run_ownership_identity": identity_fields(claim_identity),
+                    "artifact_id": request.artifact_id,
+                    "attempt_number": attempt_number,
                 },
             )
             self._append(
@@ -1665,14 +2659,7 @@ class RunService:
             launched_payload: dict[str, object] = {
                 "run_identity": identity_fields(run.identity),
                 "runtime_request_identity": identity_fields(runtime_request.identity),
-                "run_ownership_identity": identity_fields(
-                    self._ownership_identity(
-                        request,
-                        attempt_number=attempt_number,
-                        retry_of=retry_of,
-                        recovery_checkpoint=recovery_checkpoint,
-                    )
-                ),
+                "run_ownership_identity": identity_fields(claim_identity),
                 "artifact_id": request.artifact_id,
                 "attempt_number": attempt_number,
                 "fixture_runtime": self.adapter.runtime_kind == "fixture",
@@ -1929,18 +2916,47 @@ class RunService:
         run: Run,
     ) -> None:
         records = (profile, runtime_request, run)
-        for record in records:
-            require_no_conflicting_logical_revision(
-                self.store,
-                record,
-                conflict_code="run_record_conflict",
-            )
+        self._validate_launch_records(profile, runtime_request, run)
         for record in records:
             write_record_idempotently(
                 self.store,
                 record,
                 conflict_code="run_record_conflict",
             )
+
+    def _validate_launch_records(
+        self,
+        profile: HardwareCapabilityProfile,
+        runtime_request: ResolvedRuntimeRequest,
+        run: Run,
+    ) -> None:
+        """Check a complete launch record set before publishing lifecycle evidence."""
+
+        records = (profile, runtime_request, run)
+        for record in records:
+            require_no_conflicting_logical_revision(
+                self.store,
+                record,
+                conflict_code="run_record_conflict",
+            )
+
+    def _launch_run_record_is_durable(self, expected: Run) -> bool:
+        """Distinguish a recoverable record prefix from a discoverable run."""
+
+        try:
+            matches = tuple(
+                stored.record
+                for stored in self.store.iter_records()
+                if isinstance(stored.record, Run)
+                and stored.record.run_id == expected.run_id
+            )
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        if not matches:
+            return False
+        if len(matches) != 1 or matches[0] != expected:
+            raise ApplicationServiceError("run_record_conflict")
+        return True
 
     def _record_runtime_output(
         self,
@@ -2312,8 +3328,11 @@ class RunService:
                 "interruption": "run_interruption_persistence_failed",
                 "artifact_ingestion": "artifact_ingestion_failed",
                 "completion": "run_completion_persistence_failed",
+                "launch_records": "run_launch_record_persistence_failed",
                 "launch_evidence": "run_launch_evidence_persistence_failed",
             }.get(phase, "run_post_launch_failed")
+        if phase in {"artifact_ingestion", "completion"}:
+            self._fence_failed_run_artifact(run_id)
         if phase == "artifact_ingestion":
             try:
                 self._append(
@@ -2326,6 +3345,51 @@ class RunService:
                 pass
         self._append_failure(run_id, phase, code)
         raise ApplicationServiceError(code) from None
+
+    def _fence_failed_run_artifact(self, run_id: str) -> None:
+        """Prevent a post-ingestion failed run from retaining usable bytes."""
+
+        try:
+            records = tuple(stored.record for stored in self.store.iter_records())
+            runs = tuple(
+                record
+                for record in records
+                if isinstance(record, Run) and record.run_id == run_id
+            )
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        launched = tuple(
+            event
+            for event in self._events(run_id)
+            if event.event_type == "run_launched"
+        )
+        if len(runs) != 1 or len(launched) != 1:
+            raise ApplicationServiceError("run_artifact_failure_fence_conflict")
+        artifact_id = self._launched_artifact_id(launched[0])
+        artifacts = tuple(
+            record
+            for record in records
+            if isinstance(record, Artifact)
+            and (
+                record.artifact_id == artifact_id
+                or record.producing_run == record_reference(runs[0])
+            )
+        )
+        if not artifacts:
+            return
+        if (
+            len(artifacts) != 1
+            or artifacts[0].artifact_id != artifact_id
+            or artifacts[0].producing_run != record_reference(runs[0])
+        ):
+            raise ApplicationServiceError("run_artifact_failure_fence_conflict")
+        if not any(
+            isinstance(record, ArtifactAvailability)
+            and record.artifact == record_reference(artifacts[0])
+            for record in records
+        ):
+            return
+        self._fence_abandoned_artifact(runs[0], launched[0])
 
     def _stream_id(self, run_id: str) -> str:
         return f"run-{run_id}"
