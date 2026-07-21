@@ -567,6 +567,11 @@ class ReproductionService:
         if not runs and not requests:
             if not abandoned:
                 return None
+            run_service.reconcile_unlaunched_ownership(
+                intent.run_id,
+                intent.runtime_request_identity,
+                intent.run_ownership_identity,
+            )
             return ReplayReconciliationResult(
                 intent.plan_id,
                 intent.mode,
@@ -599,6 +604,11 @@ class ReproductionService:
         ):
             raise ApplicationServiceError("replay_execution_evidence_conflict")
         status = self._run_status_or_none(run_service, intent.run_id)
+        if status is RunLifecycleStatus.RUNNING and abandoned:
+            status = run_service.reconcile_abandoned_running(
+                intent.run_id,
+                intent.run_ownership_identity,
+            )
         if status is None or status is RunLifecycleStatus.RUNNING:
             return None
         events = run_service._events(intent.run_id)

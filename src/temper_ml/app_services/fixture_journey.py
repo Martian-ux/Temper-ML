@@ -959,6 +959,7 @@ class FixtureJourneyService:
         """Recover interrupted mutations at an explicit controlled boundary."""
 
         replay = ReproductionService(self.project_root).reconcile_pending()
+        RunService(self.project_root).reconcile_terminal_ownerships()
         cleanup = RetentionService(self.project_root).reconcile_pending()
         return {
             "replay_execution_count": len(replay),
@@ -1012,13 +1013,7 @@ class FixtureJourneyService:
         _, model, prepared = self._prepared_context()
         requirements, target, group, profile = self._resolved_context()
         source = self._record_by_logical_id(Experiment, candidate.experiment_id)
-        ordinal = (
-            sum(
-                run.run_id.startswith(f"run-replay-{candidate.key}-")
-                for run in self._records(Run)
-            )
-            + 1
-        )
+        ordinal = self._next_replay_ordinal(candidate.key)
         suffix = f"{candidate.key}-{ordinal:03d}"
         if mode == ReplayMode.STRICT.value:
             exact_preflight = preflight(
@@ -1124,6 +1119,33 @@ class FixtureJourneyService:
             raise ApplicationServiceError("replay_mode_invalid")
         self._replay_draft = _FixtureReplayDraft(plan, launch, candidate_key)
         return self._replay_draft.to_view()
+
+    def _next_replay_ordinal(self, candidate_key: str) -> int:
+        """Reserve every run ID already consumed by a Run or replay intent."""
+
+        prefix = f"run-replay-{candidate_key}-"
+        try:
+            store = TypedEvidenceStore(self.project_root)
+            used = {
+                record.run_id
+                for record in (stored.record for stored in store.iter_records())
+                if isinstance(record, Run) and record.run_id.startswith(prefix)
+            }
+            used.update(
+                run_id
+                for snapshot in store.iter_streams()
+                for event in snapshot.events
+                if event.event_type == "replay_execution_started"
+                and event.payload.get("candidate_key") == candidate_key
+                and isinstance((run_id := event.payload.get("run_id")), str)
+                and run_id.startswith(prefix)
+            )
+        except EvidenceError as exc:
+            raise ApplicationServiceError(exc.code) from None
+        ordinal = 1
+        while f"{prefix}{ordinal:03d}" in used:
+            ordinal += 1
+        return ordinal
 
     def execute_replay(
         self,

@@ -20,7 +20,12 @@ from temper_ml.app_services.runs import RunLifecycleStatus, RunService
 from temper_ml.domain.runs import ResolvedRuntimeRequest, Run
 from temper_ml.domain.retention import CleanupOutcome
 from temper_ml.runtime.fixture_adapter import FixtureControl
-from temper_ml.runtime.ownership import RunOwnershipError, RunOwnershipLease
+from temper_ml.runtime.ownership import (
+    RunOwnershipError,
+    RunOwnershipLease,
+    existing_run_claim_identity,
+    released_run_claim_identity,
+)
 from temper_ml.store.evidence import EvidenceError, TypedEvidenceStore
 from temper_ml.ui.server import create_ui_server
 
@@ -783,3 +788,277 @@ def test_terminal_run_reconciles_failed_ownership_resolution_before_replay_succe
         == 1
     )
     assert prepared["run_id"] == run_id
+
+
+def test_no_record_replay_process_loss_consumes_attempt_and_releases_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journey = _launched_journey(tmp_path)
+    first = journey.prepare_replay("ember", "strict_replay")
+    draft = journey._replay_draft
+    assert draft is not None
+    request = ReplayExecutionRequest(draft.plan, draft.launch, draft.candidate_key)
+    first_run_id = draft.launch.run_id
+    first_claim = RunService(tmp_path).planned_first_attempt_ownership(draft.launch)
+
+    def lose_process_before_launch_records(*_args: object, **_kwargs: object) -> None:
+        raise SystemExit("synthetic process loss before launch records")
+
+    with monkeypatch.context() as process_loss:
+        process_loss.setattr(
+            RunService,
+            "_persist_launch_records",
+            lose_process_before_launch_records,
+        )
+        with pytest.raises(SystemExit, match="before launch records"):
+            ReproductionService(tmp_path).execute(request)
+
+    records = tuple(
+        stored.record for stored in TypedEvidenceStore(tmp_path).iter_records()
+    )
+    assert not any(
+        isinstance(record, Run) and record.run_id == first_run_id for record in records
+    )
+    assert not any(
+        isinstance(record, ResolvedRuntimeRequest)
+        and record.request_id == draft.launch.request_id
+        for record in records
+    )
+    assert (
+        existing_run_claim_identity(
+            (tmp_path / ".temper-fixture-output").resolve(), first_run_id
+        )
+        == first_claim
+    )
+    assert not (
+        tmp_path
+        / ".temper-fixture-output"
+        / "runtime-ownership"
+        / first_run_id
+        / "resolved.json"
+    ).exists()
+
+    del request, draft, journey
+    restarted = FixtureJourneyService(tmp_path)
+    restarted.reconcile_pending_operations()
+    assert (
+        released_run_claim_identity(
+            (tmp_path / ".temper-fixture-output").resolve(), first_run_id
+        )
+        == first_claim
+    )
+    first_execution = next(
+        item
+        for item in restarted.workspace()["reproduction"]["executions"]
+        if item["run_id"] == first_run_id
+    )
+    assert first_execution["status"] == "failed"
+    first_replay_events = next(
+        snapshot.events
+        for snapshot in TypedEvidenceStore(tmp_path).iter_streams()
+        if snapshot.stream_id.startswith("replay-")
+        and any(
+            event.payload.get("run_id") == first_run_id for event in snapshot.events
+        )
+    )
+    assert first_replay_events[-1].event_type == "replay_execution_failed"
+    assert (
+        first_replay_events[-1].payload.get("failure_code")
+        == "run_launch_record_persistence_failed"
+    )
+
+    second = restarted.prepare_replay("ember", "strict_replay")
+    assert second["plan_id"] == first["plan_id"]
+    assert second["run_id"] != first_run_id
+    assert second["run_id"].endswith("-002")
+    completed = restarted.execute_replay(second["plan_id"], run_id=second["run_id"])
+    assert completed["status"] == "completed"
+    assert TypedEvidenceStore(tmp_path).verify().to_dict()["status"] == "verified"
+
+
+def test_post_launch_process_loss_reconciles_one_interrupted_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journey = _launched_journey(tmp_path)
+    prepared = journey.prepare_replay("ember", "strict_replay")
+    draft = journey._replay_draft
+    assert draft is not None
+    request = ReplayExecutionRequest(draft.plan, draft.launch, draft.candidate_key)
+    run_id = draft.launch.run_id
+    claim = RunService(tmp_path).planned_first_attempt_ownership(draft.launch)
+    original_append = RunService._append
+
+    def lose_process_after_launch(
+        service: RunService,
+        event_run_id: str,
+        key: str,
+        event_type: str,
+        payload: object,
+    ) -> object:
+        event = original_append(
+            service,
+            event_run_id,
+            key,
+            event_type,
+            payload,  # type: ignore[arg-type]
+        )
+        if event_run_id == run_id and event_type == "run_launched":
+            raise SystemExit("synthetic process loss after run_launched")
+        return event
+
+    with monkeypatch.context() as process_loss:
+        process_loss.setattr(RunService, "_append", lose_process_after_launch)
+        with pytest.raises(SystemExit, match="after run_launched"):
+            ReproductionService(tmp_path).execute(request)
+
+    assert RunService(tmp_path).status(run_id) is RunLifecycleStatus.RUNNING
+    assert not (
+        tmp_path
+        / ".temper-fixture-output"
+        / "runtime-ownership"
+        / run_id
+        / "resolved.json"
+    ).exists()
+
+    del request, draft, journey
+    restarted = FixtureJourneyService(tmp_path)
+    recovery = restarted.reconcile_pending_operations()
+    assert recovery["replay_execution_count"] == 1
+    assert RunService(tmp_path).status(run_id) is RunLifecycleStatus.INTERRUPTED
+    assert (
+        released_run_claim_identity(
+            (tmp_path / ".temper-fixture-output").resolve(), run_id
+        )
+        == claim
+    )
+    streams = TypedEvidenceStore(tmp_path).iter_streams()
+    run_events = next(
+        snapshot.events for snapshot in streams if snapshot.stream_id == f"run-{run_id}"
+    )
+    replay_events = next(
+        snapshot.events
+        for snapshot in streams
+        if snapshot.stream_id.startswith("replay-")
+        and any(event.payload.get("run_id") == run_id for event in snapshot.events)
+    )
+    assert (
+        sum(
+            event.event_type
+            in {
+                "run_preflight_blocked",
+                "run_cancelled",
+                "run_interrupted",
+                "run_completed",
+                "run_failed",
+            }
+            for event in run_events
+        )
+        == 1
+    )
+    assert (
+        sum(
+            event.event_type
+            in {
+                "replay_execution_completed",
+                "replay_execution_cancelled",
+                "replay_execution_interrupted",
+                "replay_execution_failed",
+            }
+            for event in replay_events
+        )
+        == 1
+    )
+    execution = next(
+        item
+        for item in restarted.workspace()["reproduction"]["executions"]
+        if item["run_id"] == run_id
+    )
+    assert execution["status"] == "interrupted"
+    assert prepared["run_id"] == run_id
+
+
+def test_startup_repairs_normal_terminal_run_ownership_without_replay_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journey = FixtureJourneyService(tmp_path)
+    journey.setup_project()
+    journey.import_dataset()
+    journey.resolve_candidates()
+    candidate = journey.state.candidates[0]
+
+    def fail_resolution(_lease: RunOwnershipLease) -> None:
+        raise RunOwnershipError("run_ownership_resolution_failed")
+
+    with monkeypatch.context() as resolution_failure:
+        resolution_failure.setattr(RunOwnershipLease, "resolve", fail_resolution)
+        with pytest.raises(
+            ApplicationServiceError, match="^run_ownership_resolution_failed$"
+        ):
+            journey.launch_primary()
+
+    claim = existing_run_claim_identity(
+        (tmp_path / ".temper-fixture-output").resolve(), candidate.run_id
+    )
+    protected = tuple(
+        entry
+        for entry in RetentionService(tmp_path).inventory().entries
+        if entry.byte_class in {ByteClass.CHECKPOINT, ByteClass.FINAL_ADAPTER}
+        and any(
+            (subject.record_type == "run" and subject.logical_id == candidate.run_id)
+            or (
+                subject.record_type == "artifact"
+                and subject.logical_id == candidate.artifact_id
+            )
+            for subject in entry.subjects
+        )
+    )
+    assert {entry.byte_class for entry in protected} == {
+        ByteClass.CHECKPOINT,
+        ByteClass.FINAL_ADAPTER,
+    }
+    assert not any(entry.deletable for entry in protected)
+    assert not any(
+        snapshot.stream_id.startswith("replay-")
+        for snapshot in TypedEvidenceStore(tmp_path).iter_streams()
+    )
+
+    del journey
+    server = create_ui_server(tmp_path, port=0)
+    try:
+        workspace = server.journey.workspace()
+    finally:
+        server.server_close()
+    assert (
+        next(item for item in workspace["runs"] if item["run_id"] == candidate.run_id)[
+            "status"
+        ]
+        == "completed"
+    )
+    assert (
+        released_run_claim_identity(
+            (tmp_path / ".temper-fixture-output").resolve(), candidate.run_id
+        )
+        == claim
+    )
+    released = tuple(
+        entry
+        for entry in RetentionService(tmp_path).inventory().entries
+        if entry.byte_class in {ByteClass.CHECKPOINT, ByteClass.FINAL_ADAPTER}
+        and any(
+            (subject.record_type == "run" and subject.logical_id == candidate.run_id)
+            or (
+                subject.record_type == "artifact"
+                and subject.logical_id == candidate.artifact_id
+            )
+            for subject in entry.subjects
+        )
+    )
+    assert {entry.byte_class for entry in released} == {
+        ByteClass.CHECKPOINT,
+        ByteClass.FINAL_ADAPTER,
+    }
+    assert all(entry.deletable for entry in released)
+    assert TypedEvidenceStore(tmp_path).verify().to_dict()["status"] == "verified"

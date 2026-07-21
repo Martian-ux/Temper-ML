@@ -78,6 +78,8 @@ def released_run_claim_identity(
     root = private_root / "runtime-ownership" / run_id
     resolution_path = root / "resolved.json"
     try:
+        if safe_path_stat(resolution_path, allow_missing=True) is None:
+            raise RunOwnershipError("run_ownership_unresolved")
         resolution_bytes = read_stable_bytes(resolution_path)
         resolution = loads_canonical_json(resolution_bytes)
         expected_resolution = {
@@ -93,8 +95,6 @@ def released_run_claim_identity(
         return claim_identity
     except RunOwnershipError:
         raise
-    except FileNotFoundError:
-        raise RunOwnershipError("run_ownership_unresolved") from None
     except (
         OSError,
         SafeIoError,
@@ -212,6 +212,25 @@ def claim_released_run_ownership(
 
 
 @contextmanager
+def claim_abandoned_run_ownership(
+    private_root: Path,
+    run_id: str,
+    claim_identity: ContentIdentity,
+) -> Iterator[RunOwnershipLease]:
+    """Acquire one exact unresolved claim without creating ownership bytes."""
+
+    with _claim_run_ownership(
+        private_root,
+        run_id,
+        claim_identity,
+        allow_create=False,
+        require_resolved=False,
+        require_unresolved=True,
+    ) as lease:
+        yield lease
+
+
+@contextmanager
 def _claim_run_ownership(
     private_root: Path,
     run_id: str,
@@ -219,9 +238,12 @@ def _claim_run_ownership(
     *,
     allow_create: bool,
     require_resolved: bool,
+    require_unresolved: bool = False,
 ) -> Iterator[RunOwnershipLease]:
     """Implement creating launch claims and non-creating released claims."""
 
+    if require_resolved and require_unresolved:
+        raise RunOwnershipError("run_ownership_state_invalid")
     if not isinstance(private_root, Path) or not private_root.is_absolute():
         raise RunOwnershipError("run_ownership_root_invalid")
     try:
@@ -306,8 +328,11 @@ def _claim_run_ownership(
             elif existing_resolution is None:
                 if require_resolved:
                     raise RunOwnershipError("run_ownership_unresolved")
-            elif read_stable_bytes(resolution_path) != resolution:
-                raise RunOwnershipError("run_ownership_resolution_conflict")
+            else:
+                if read_stable_bytes(resolution_path) != resolution:
+                    raise RunOwnershipError("run_ownership_resolution_conflict")
+                if require_unresolved:
+                    raise RunOwnershipError("run_ownership_resolved")
         except RunOwnershipError:
             raise
         except (OSError, SafeIoError, UnsafeFilesystemPath):

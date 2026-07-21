@@ -5,6 +5,7 @@ import pytest
 from temper_ml.domain.projections import ContentIdentity
 from temper_ml.runtime.ownership import (
     RunOwnershipError,
+    claim_abandoned_run_ownership,
     claim_released_run_ownership,
     claim_run_ownership,
     reconcile_run_ownership,
@@ -39,6 +40,8 @@ def test_run_ownership_stays_blocked_when_terminal_resolution_is_missing(
         pass
 
     with pytest.raises(RunOwnershipError, match="run_ownership_unresolved"):
+        released_run_claim_identity(root, "run-unresolved")
+    with pytest.raises(RunOwnershipError, match="run_ownership_unresolved"):
         with claim_run_ownership(root, "run-unresolved", CLAIM):
             raise AssertionError("an unresolved claim was reacquired")
 
@@ -55,6 +58,23 @@ def test_exact_unresolved_claim_can_be_reconciled_after_terminal_validation(
     assert released_run_claim_identity(root, "run-reconciled") == CLAIM
     with claim_released_run_ownership(root, "run-reconciled", CLAIM):
         pass
+
+
+def test_abandoned_claim_requires_an_existing_unresolved_exact_lease(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path.resolve()
+
+    with claim_run_ownership(root, "run-abandoned", CLAIM):
+        pass
+
+    with claim_abandoned_run_ownership(root, "run-abandoned", CLAIM) as abandoned:
+        abandoned.resolve()
+
+    assert released_run_claim_identity(root, "run-abandoned") == CLAIM
+    with pytest.raises(RunOwnershipError, match="^run_ownership_resolved$"):
+        with claim_abandoned_run_ownership(root, "run-abandoned", CLAIM):
+            raise AssertionError("a released claim was treated as abandoned")
 
 
 def test_released_claim_never_recreates_a_missing_lock(tmp_path: Path) -> None:
