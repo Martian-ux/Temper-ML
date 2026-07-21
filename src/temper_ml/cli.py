@@ -13,8 +13,18 @@ from temper_ml.app_services.fixture_journey import (
     FixtureJourneyService,
     FixtureTokenizer,
 )
+from temper_ml.app_services.experiments import (
+    ReplayMode,
+    adapted_replay_plan,
+    strict_replay_plan,
+)
 from temper_ml.app_services.projects import ProjectService
-from temper_ml.domain.experiments import ManifestDiff
+from temper_ml.app_services.retention import RetentionService
+from temper_ml.domain.experiments import (
+    Experiment,
+    ExperimentDerivation,
+    ManifestDiff,
+)
 from temper_ml.domain.hardware import (
     ExecutionTarget,
     HardwareCapabilityProfile,
@@ -23,6 +33,7 @@ from temper_ml.domain.hardware import (
 from temper_ml.domain.projections import ContentIdentity, ProjectionError
 from temper_ml.domain.recipes import RecipeResolution
 from temper_ml.domain.runs import EvaluationMode
+from temper_ml.domain.retention import CleanupReceipt
 from temper_ml.runtime.paths import PortablePathError
 from temper_ml.runtime.preflight import (
     EstimateComponents,
@@ -77,6 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
     manifest_diff.add_argument("project")
     manifest_diff.add_argument("--id", dest="diff_id", required=True)
     manifest_diff.add_argument("--identity", dest="diff_identity")
+    cleanup_receipt = commands.add_parser("cleanup-receipt")
+    cleanup_receipt.add_argument("project")
+    cleanup_receipt.add_argument("--id", dest="receipt_id", required=True)
+    cleanup_receipt.add_argument("--identity", dest="receipt_identity")
     preflight_command = commands.add_parser("preflight")
     preflight_command.add_argument("project")
     preflight_command.add_argument("--resolution-id", required=True)
@@ -92,6 +107,39 @@ def build_parser() -> argparse.ArgumentParser:
         "host-runtime-overhead-bytes",
     ):
         preflight_command.add_argument(f"--{option}", type=int, required=True)
+    inventory = commands.add_parser("inventory")
+    inventory.add_argument("project")
+    cleanup_plan = commands.add_parser("cleanup-plan")
+    cleanup_plan.add_argument("project")
+    cleanup_plan.add_argument("--entry-id", action="append", required=True)
+    cleanup_execute = commands.add_parser("cleanup-execute")
+    cleanup_execute.add_argument("project")
+    cleanup_execute.add_argument("--entry-id", action="append", required=True)
+    cleanup_execute.add_argument("--plan-id", required=True)
+    cleanup_execute.add_argument("--execution-id", required=True)
+    cleanup_execute.add_argument("--confirm", action="store_true")
+    replay_plan = commands.add_parser("replay-plan")
+    replay_plan.add_argument("project")
+    replay_plan.add_argument("--experiment-id", required=True)
+    replay_plan.add_argument("--experiment-identity")
+    replay_plan.add_argument("--profile-id", required=True)
+    replay_plan.add_argument("--profile-identity")
+    replay_plan.add_argument(
+        "--mode",
+        choices=(ReplayMode.STRICT.value, ReplayMode.ADAPTED.value),
+        default=ReplayMode.STRICT.value,
+    )
+    replay_plan.add_argument("--derivation-id")
+    replay_plan.add_argument("--derivation-identity")
+    for option in (
+        "base-model-bytes",
+        "adapter-optimizer-bytes",
+        "peak-activation-bytes",
+        "accelerator-runtime-overhead-bytes",
+        "dataset-bytes",
+        "host-runtime-overhead-bytes",
+    ):
+        replay_plan.add_argument(f"--{option}", type=int, required=True)
     fixture = commands.add_parser("fixture-workflow")
     fixture.add_argument("project")
     fixture.add_argument(
@@ -208,6 +256,21 @@ def _run(arguments: argparse.Namespace) -> object:
             },
             "diff": record.to_payload(),
         }
+    if arguments.command == "cleanup-receipt":
+        store.verify()
+        record = store.inspect_manifest(
+            "cleanup_receipt",
+            arguments.receipt_id,
+            _optional_identity(arguments.receipt_identity),
+        ).to_record()
+        if not isinstance(record, CleanupReceipt):
+            raise EvidenceError("cleanup_receipt_invalid")
+        return {
+            "schema_version": "v1",
+            "command": "cleanup-receipt",
+            "status": "available",
+            "receipt": record.to_payload(),
+        }
     if arguments.command == "preflight":
         store.verify()
         resolution_record = store.inspect_manifest(
@@ -232,16 +295,7 @@ def _run(arguments: argparse.Namespace) -> object:
             raise EvidenceError("preflight_record_invalid")
         if not isinstance(target_record, ExecutionTarget):
             raise EvidenceError("preflight_record_invalid")
-        components = EstimateComponents(
-            base_model_bytes=arguments.base_model_bytes,
-            adapter_optimizer_bytes=arguments.adapter_optimizer_bytes,
-            peak_activation_bytes=arguments.peak_activation_bytes,
-            accelerator_runtime_overhead_bytes=(
-                arguments.accelerator_runtime_overhead_bytes
-            ),
-            dataset_bytes=arguments.dataset_bytes,
-            host_runtime_overhead_bytes=arguments.host_runtime_overhead_bytes,
-        )
+        components = _estimate_components(arguments)
         result = preflight(
             resolution_record,
             requirements_record,
@@ -252,6 +306,91 @@ def _run(arguments: argparse.Namespace) -> object:
         result["schema_version"] = "v1"
         result["command"] = "preflight"
         return result
+    if arguments.command == "inventory":
+        result = RetentionService(arguments.project).inventory().to_view()
+        result["command"] = "inventory"
+        return result
+    if arguments.command == "cleanup-plan":
+        result = (
+            RetentionService(arguments.project)
+            .plan(tuple(arguments.entry_id))
+            .to_view()
+        )
+        result["command"] = "cleanup-plan"
+        return result
+    if arguments.command == "cleanup-execute":
+        service = RetentionService(arguments.project)
+        plan = service.plan(
+            tuple(arguments.entry_id), execution_id=arguments.execution_id
+        )
+        if plan.plan_id != arguments.plan_id:
+            raise ApplicationServiceError("cleanup_plan_mismatch")
+        receipt = service.execute(plan, confirm=arguments.confirm)
+        return {
+            "schema_version": "v1",
+            "command": "cleanup-execute",
+            "status": receipt.outcome.value,
+            "receipt": receipt.to_payload(),
+        }
+    if arguments.command == "replay-plan":
+        store.verify()
+        source = store.inspect_manifest(
+            "experiment",
+            arguments.experiment_id,
+            _optional_identity(arguments.experiment_identity),
+        ).to_record()
+        profile = store.inspect_manifest(
+            "hardware_capability_profile",
+            arguments.profile_id,
+            _optional_identity(arguments.profile_identity),
+        ).to_record()
+        if not isinstance(source, Experiment) or not isinstance(
+            profile, HardwareCapabilityProfile
+        ):
+            raise EvidenceError("replay_record_invalid")
+        if arguments.mode == ReplayMode.STRICT.value:
+            planned = source
+            derivation = None
+        else:
+            if arguments.derivation_id is None:
+                raise ApplicationServiceError("adapted_derivation_required")
+            derivation_record = store.inspect_manifest(
+                "experiment_derivation",
+                arguments.derivation_id,
+                _optional_identity(arguments.derivation_identity),
+            ).to_record()
+            if (
+                not isinstance(derivation_record, ExperimentDerivation)
+                or derivation_record.parent_experiment != source
+            ):
+                raise EvidenceError("replay_record_invalid")
+            derivation = derivation_record
+            planned = derivation.derived_experiment
+        resolution_record = store.read_record(planned.recipe_resolution).record
+        requirements_record = store.read_record(planned.hardware_requirements).record
+        target_record = store.read_record(planned.execution_target).record
+        if not isinstance(resolution_record, RecipeResolution):
+            raise EvidenceError("replay_record_invalid")
+        if not isinstance(requirements_record, HardwareRequirements):
+            raise EvidenceError("replay_record_invalid")
+        if not isinstance(target_record, ExecutionTarget):
+            raise EvidenceError("replay_record_invalid")
+        replay_preflight = preflight(
+            resolution_record,
+            requirements_record,
+            target_record,
+            profile,
+            estimate_resources(resolution_record, _estimate_components(arguments)),
+        )
+        replay_plan_result = (
+            strict_replay_plan(source, replay_preflight)
+            if derivation is None
+            else adapted_replay_plan(derivation, replay_preflight)
+        )
+        value = replay_plan_result.to_view()
+        value["schema_version"] = "v1"
+        value["command"] = "replay-plan"
+        return value
     if arguments.command == "fixture-workflow":
         return _fixture_workflow(
             arguments.project,
@@ -266,6 +405,19 @@ def _fixture_workflow(
     evaluation_mode: EvaluationMode,
 ) -> dict[str, object]:
     return FixtureJourneyService(project_root).legacy_workflow(evaluation_mode)
+
+
+def _estimate_components(arguments: argparse.Namespace) -> EstimateComponents:
+    return EstimateComponents(
+        base_model_bytes=arguments.base_model_bytes,
+        adapter_optimizer_bytes=arguments.adapter_optimizer_bytes,
+        peak_activation_bytes=arguments.peak_activation_bytes,
+        accelerator_runtime_overhead_bytes=(
+            arguments.accelerator_runtime_overhead_bytes
+        ),
+        dataset_bytes=arguments.dataset_bytes,
+        host_runtime_overhead_bytes=arguments.host_runtime_overhead_bytes,
+    )
 
 
 def _parse_identity(value: str) -> ContentIdentity:

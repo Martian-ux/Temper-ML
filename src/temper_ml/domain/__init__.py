@@ -104,6 +104,12 @@ from temper_ml.domain.policies import (
 )
 from temper_ml.domain.projects import Project, ProjectPolicy
 from temper_ml.domain.recipes import Recipe, RecipeResolution
+from temper_ml.domain.retention import (
+    CleanupObjectReceipt,
+    CleanupObjectStatus,
+    CleanupOutcome,
+    CleanupReceipt,
+)
 from temper_ml.domain.records import (
     CORE_LOGICAL_ID_FIELDS,
     CORE_PROJECTION_REGISTRY,
@@ -134,6 +140,10 @@ __all__ = [
     "CompatibilityError",
     "CompatibilityGroup",
     "ComparisonOperator",
+    "CleanupObjectReceipt",
+    "CleanupObjectStatus",
+    "CleanupOutcome",
+    "CleanupReceipt",
     "ConfidenceLabel",
     "ConfidenceRule",
     "CandidateAssessment",

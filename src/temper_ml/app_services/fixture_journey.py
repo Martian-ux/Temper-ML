@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 import hashlib
 from pathlib import Path
@@ -24,6 +24,10 @@ from temper_ml.app_services.evaluations import (
 from temper_ml.app_services.experiments import (
     ExperimentFreezeRequest,
     ExperimentService,
+    ReplayMode,
+    ReplayPlan,
+    plan_replay,
+    strict_replay_plan,
 )
 from temper_ml.app_services.local_use import (
     AdapterExportRequest,
@@ -35,6 +39,11 @@ from temper_ml.app_services.projects import (
     ProjectCreateRequest,
     ProjectService,
 )
+from temper_ml.app_services.reproduction import (
+    ReplayExecutionRequest,
+    ReproductionService,
+)
+from temper_ml.app_services.retention import CleanupPlan, RetentionService
 from temper_ml.app_services.runs import (
     RunExecutionResult,
     RunLaunchRequest,
@@ -85,7 +94,11 @@ from temper_ml.domain.evaluations import (
     UserDecision,
     UserDecisionStatus,
 )
-from temper_ml.domain.experiments import Experiment
+from temper_ml.domain.experiments import (
+    Experiment,
+    ExperimentDerivation,
+    ReproductionMode,
+)
 from temper_ml.domain.hardware import (
     ExecutionTarget,
     HardwareCapabilityProfile,
@@ -102,6 +115,7 @@ from temper_ml.domain.records import (
     thaw_json,
 )
 from temper_ml.domain.runs import EvaluationMode, Run
+from temper_ml.domain.retention import CleanupReceipt
 from temper_ml.domain.tasks import TaskDefinition
 from temper_ml.runtime.fixture_inference import InferenceSettings
 from temper_ml.runtime.preflight import (
@@ -184,6 +198,20 @@ class _JourneyState:
     candidates: tuple[CandidateSpec, ...] = ()
 
 
+@dataclass(frozen=True)
+class _FixtureReplayDraft:
+    plan: ReplayPlan
+    launch: RunLaunchRequest
+    candidate_key: str
+
+    def to_view(self) -> dict[str, object]:
+        return {
+            **self.plan.to_view(),
+            "candidate_key": self.candidate_key,
+            "run_id": self.launch.run_id,
+        }
+
+
 class FixtureJourneyService:
     """Staged, idempotent orchestration over existing domain services."""
 
@@ -193,6 +221,8 @@ class FixtureJourneyService:
         self._comparison: ComparisonState | None = None
         self._blind_packet: BlindReviewPacket | None = None
         self._sealed_blind_review: Review | None = None
+        self._cleanup_plan: CleanupPlan | None = None
+        self._replay_draft: _FixtureReplayDraft | None = None
 
     def setup_project(self) -> dict[str, object]:
         task, model, project, baseline, policy = _fixture_project_records()
@@ -908,7 +938,227 @@ class FixtureJourneyService:
         return WorkspaceQueryService(self.project_root).view(
             prepared_available=self.state.prepared is not None,
             private_previews=previews,
+            active_cleanup_plan=(
+                self._cleanup_plan.to_view() if self._cleanup_plan is not None else None
+            ),
+            active_replay_plan=(
+                self._replay_draft.to_view() if self._replay_draft is not None else None
+            ),
         )
+
+    def storage_inventory(self) -> dict[str, object]:
+        """Return the complete fixed-root inventory without implicit selection."""
+
+        return (
+            RetentionService(self.project_root)
+            .inventory(reconcile_pending=False)
+            .to_view()
+        )
+
+    def reconcile_pending_operations(self) -> dict[str, object]:
+        """Recover interrupted mutations at an explicit controlled boundary."""
+
+        run_service = RunService(self.project_root)
+        run_service.repair_incomplete_ownership_claims()
+        replay = ReproductionService(self.project_root).reconcile_pending()
+        run_service.reconcile_abandoned_runs()
+        run_service.reconcile_terminal_ownerships()
+        cleanup = RetentionService(self.project_root).reconcile_pending()
+        return {
+            "replay_execution_count": len(replay),
+            "cleanup_receipt_count": len(cleanup),
+        }
+
+    def preview_cleanup(self, entry_ids: tuple[str, ...]) -> dict[str, object]:
+        """Cache one exact cleanup plan for a later explicit confirmation."""
+
+        plan = RetentionService(self.project_root).plan(entry_ids)
+        self._cleanup_plan = plan
+        return plan.to_view()
+
+    def execute_cleanup(
+        self,
+        plan_id: str,
+        *,
+        confirm: bool,
+        entry_ids: tuple[str, ...] | None = None,
+    ) -> dict[str, object]:
+        """Execute only the currently displayed, exactly identified cleanup plan."""
+
+        plan = self._cleanup_plan
+        if plan is None:
+            raise ApplicationServiceError("cleanup_plan_required")
+        if not isinstance(plan_id, str) or plan_id != plan.plan_id:
+            raise ApplicationServiceError("cleanup_plan_mismatch")
+        if entry_ids is not None and (
+            not isinstance(entry_ids, tuple)
+            or tuple(sorted(entry_ids)) != plan.selected_entry_ids
+        ):
+            raise ApplicationServiceError("cleanup_selection_plan_mismatch")
+        receipt = RetentionService(self.project_root).execute(plan, confirm=confirm)
+        self._cleanup_plan = None
+        return _cleanup_receipt_view(receipt)
+
+    def prepare_replay(self, candidate_key: str, mode: str) -> dict[str, object]:
+        """Prepare a strict replay or a visibly derived adapted reproduction."""
+
+        ReproductionService(self.project_root).reconcile_pending()
+        if self.state.prepared is None:
+            self.import_dataset()
+        if not self.state.candidates:
+            self.resolve_candidates()
+        candidate = next(
+            (item for item in self.state.candidates if item.key == candidate_key),
+            None,
+        )
+        if candidate is None:
+            raise ApplicationServiceError("candidate_not_found")
+        _, model, prepared = self._prepared_context()
+        requirements, target, group, profile = self._resolved_context()
+        source = self._record_by_logical_id(Experiment, candidate.experiment_id)
+        ordinal = ReproductionService(self.project_root).reserve_replay_attempt(
+            candidate.key
+        )
+        suffix = f"{candidate.key}-{ordinal:03d}"
+        if mode == ReplayMode.STRICT.value:
+            exact_preflight = preflight(
+                candidate.resolution,
+                requirements,
+                target,
+                profile,
+                candidate.estimate,
+            )
+            plan = strict_replay_plan(source, exact_preflight)
+            launch = RunLaunchRequest(
+                run_id=f"run-replay-{suffix}",
+                request_id=f"request-replay-{suffix}",
+                artifact_id=f"artifact-replay-{suffix}",
+                experiment=source,
+                recipe_resolution=candidate.resolution,
+                prepared_dataset=prepared,
+                base_model_revision=model,
+                compatibility_group=group,
+                hardware_requirements=requirements,
+                execution_target=target,
+                hardware_capability_profile=profile,
+                estimate=candidate.estimate,
+            )
+        elif mode == ReplayMode.ADAPTED.value:
+            adapted_requirements = replace(
+                requirements,
+                requirements_id=f"requirements-replay-{suffix}",
+                required_precision_modes=("bf16",),
+            )
+            adapted_resolution = replace(
+                candidate.resolution,
+                resolution_id=f"resolution-replay-{suffix}",
+                hardware_requirements=record_reference(adapted_requirements),
+                precision="bf16",
+                applied_constraints=tuple(
+                    sorted(
+                        {
+                            *candidate.resolution.applied_constraints,
+                            "adapted_precision_bf16",
+                        }
+                    )
+                ),
+            )
+            adapted_profile = replace(
+                profile,
+                profile_id=f"profile-replay-{suffix}",
+                supported_precision_modes=("bf16",),
+            )
+            strict_preflight = preflight(
+                candidate.resolution,
+                requirements,
+                target,
+                adapted_profile,
+                candidate.estimate,
+            )
+            adapted_preflight = preflight(
+                adapted_resolution,
+                adapted_requirements,
+                target,
+                adapted_profile,
+                candidate.estimate,
+            )
+            derivation = ExperimentService(self.project_root).clone(
+                source,
+                experiment_id=f"experiment-replay-{suffix}",
+                replacements={
+                    "recipe_resolution": record_reference(adapted_resolution),
+                    "hardware_requirements": record_reference(adapted_requirements),
+                },
+                derivation_id=f"derivation-adapted-{suffix}",
+                diff_id=f"manifest-diff-adapted-{suffix}",
+                reason_code="hardware_precision_adaptation",
+                reason=(
+                    "The available fixture profile supports bf16 instead of the "
+                    "source experiment's fp32 requirement."
+                ),
+                reproduction_mode=ReproductionMode.ADAPTED_REPRODUCTION,
+                supporting_records=(adapted_requirements, adapted_resolution),
+            )
+            plan = plan_replay(
+                source,
+                strict_preflight,
+                adapted_derivation=derivation,
+                adapted_preflight=adapted_preflight,
+            )
+            launch = RunLaunchRequest(
+                run_id=f"run-replay-{suffix}",
+                request_id=f"request-replay-{suffix}",
+                artifact_id=f"artifact-replay-{suffix}",
+                experiment=derivation.derived_experiment,
+                recipe_resolution=adapted_resolution,
+                prepared_dataset=prepared,
+                base_model_revision=model,
+                compatibility_group=group,
+                hardware_requirements=adapted_requirements,
+                execution_target=target,
+                hardware_capability_profile=adapted_profile,
+                estimate=candidate.estimate,
+            )
+        else:
+            raise ApplicationServiceError("replay_mode_invalid")
+        self._replay_draft = _FixtureReplayDraft(plan, launch, candidate_key)
+        return self._replay_draft.to_view()
+
+    def execute_replay(
+        self,
+        plan_id: str,
+        *,
+        run_id: str,
+        candidate_key: str | None = None,
+        mode: str | None = None,
+    ) -> dict[str, object]:
+        """Execute only the currently displayed ready replay plan as a new run."""
+
+        draft = self._replay_draft
+        if draft is None:
+            return (
+                ReproductionService(self.project_root)
+                .reconcile_plan(
+                    plan_id,
+                    run_id,
+                    candidate_key=candidate_key,
+                    mode=mode,
+                )
+                .to_view()
+            )
+        if not isinstance(plan_id, str) or plan_id != draft.plan.plan_id:
+            raise ApplicationServiceError("replay_plan_mismatch")
+        if not isinstance(run_id, str) or run_id != draft.launch.run_id:
+            raise ApplicationServiceError("replay_run_plan_mismatch")
+        if candidate_key is not None and candidate_key != draft.candidate_key:
+            raise ApplicationServiceError("replay_candidate_plan_mismatch")
+        if mode is not None and mode != draft.plan.mode.value:
+            raise ApplicationServiceError("replay_mode_plan_mismatch")
+        result = ReproductionService(self.project_root).execute(
+            ReplayExecutionRequest(draft.plan, draft.launch, draft.candidate_key)
+        )
+        self._replay_draft = None
+        return result.to_view()
 
     def _ensure_project(self) -> None:
         if self.state.opened is None or self.state.model is None:
@@ -1094,9 +1344,18 @@ class WorkspaceQueryService:
         *,
         prepared_available: bool = False,
         private_previews: list[dict[str, object]] | None = None,
+        active_cleanup_plan: dict[str, object] | None = None,
+        active_replay_plan: dict[str, object] | None = None,
     ) -> dict[str, object]:
         store = TypedEvidenceStore(self.project_root)
         try:
+            store.verify()
+            inventory = (
+                RetentionService(self.project_root)
+                .inventory(reconcile_pending=False)
+                .to_view()
+            )
+            checkpoint_identities = _verified_checkpoint_identities(inventory)
             verification = store.verify()
             stored = store.iter_records()
             streams = store.iter_streams()
@@ -1127,6 +1386,12 @@ class WorkspaceQueryService:
         current_decision = decisions[-1] if decisions else None
         sessions = tuple(item for item in records if isinstance(item, LocalUseSession))
         exports = tuple(item for item in records if isinstance(item, AdapterExport))
+        cleanup_receipts = tuple(
+            item for item in records if isinstance(item, CleanupReceipt)
+        )
+        derivations = tuple(
+            item for item in records if isinstance(item, ExperimentDerivation)
+        )
         run_streams = {snapshot.stream_id: snapshot.events for snapshot in streams}
         candidate_key_by_id = {
             "artifact-fixture-runtime": "ember",
@@ -1176,7 +1441,12 @@ class WorkspaceQueryService:
                 for resolution in resolutions
             ],
             "runs": [
-                _run_view(run, run_streams.get(f"run-{run.run_id}", ())) for run in runs
+                _run_view(
+                    run,
+                    run_streams.get(f"run-{run.run_id}", ()),
+                    checkpoint_identities.get(run.run_id, frozenset()),
+                )
+                for run in runs
             ],
             "artifacts": [
                 self._artifact_view(
@@ -1240,6 +1510,23 @@ class WorkspaceQueryService:
                 "saved_session_count": len(sessions),
                 "export_count": len(exports),
                 "deployment_ready": False,
+            },
+            "retention": {
+                **inventory,
+                "active_plan": active_cleanup_plan,
+                "receipts": [
+                    _cleanup_receipt_view(receipt) for receipt in cleanup_receipts
+                ],
+            },
+            "reproduction": {
+                "active_plan": active_replay_plan,
+                "derivations": [
+                    _experiment_derivation_view(derivation)
+                    for derivation in derivations
+                    if derivation.reproduction_mode
+                    is ReproductionMode.ADAPTED_REPRODUCTION
+                ],
+                "executions": _replay_execution_views(streams),
             },
             "stages": _stage_view(
                 bool(projects),
@@ -1458,7 +1745,7 @@ def _fixture_recipe_entries() -> tuple[RecipeCatalogEntry, RecipeCatalogEntry]:
         "fixture",
         "periodic",
         "selected_separately",
-        "standard",
+        "full",
         {},
     )
     capacity = Recipe(
@@ -1472,7 +1759,7 @@ def _fixture_recipe_entries() -> tuple[RecipeCatalogEntry, RecipeCatalogEntry]:
         "fixture",
         "periodic",
         "selected_separately",
-        "standard",
+        "full",
         {},
     )
     capacity_defaults = dict(defaults)
@@ -1568,7 +1855,81 @@ def _current_reviews(reviews: tuple[Review, ...]) -> tuple[Review, ...]:
     return tuple(review for review in reviews if review.identity not in superseded)
 
 
-def _run_view(run: Run, events: tuple[Any, ...]) -> dict[str, object]:
+def _verified_checkpoint_identities(
+    inventory: Mapping[str, object],
+) -> dict[str, frozenset[str]]:
+    """Index only checkpoint bytes whose observed identity matches run evidence."""
+
+    values: dict[str, set[str]] = {}
+    entries = inventory.get("entries")
+    if not isinstance(entries, list):
+        return {}
+    for entry in entries:
+        if not isinstance(entry, Mapping) or entry.get("byte_class") != "checkpoint":
+            continue
+        identity = entry.get("content_identity")
+        subjects = entry.get("subjects")
+        if (
+            not isinstance(identity, Mapping)
+            or not isinstance((identity_value := identity.get("value")), str)
+            or not isinstance(subjects, list)
+        ):
+            continue
+        for subject in subjects:
+            if (
+                isinstance(subject, Mapping)
+                and subject.get("record_type") == "run"
+                and isinstance((run_id := subject.get("logical_id")), str)
+            ):
+                values.setdefault(run_id, set()).add(identity_value)
+    return {run_id: frozenset(items) for run_id, items in values.items()}
+
+
+def _run_view(
+    run: Run,
+    events: tuple[Any, ...],
+    verified_checkpoint_identities: frozenset[str],
+) -> dict[str, object]:
+    checkpoint_base_availability: dict[str, bool] = {}
+    checkpoint_pending: dict[str, set[tuple[str, str]]] = {}
+    checkpoint_removed: set[str] = set()
+    for event in events:
+        if event.event_type == "run_checkpoint":
+            identity = event.payload.get("checkpoint_identity")
+            if isinstance(identity, Mapping) and isinstance(identity.get("value"), str):
+                checkpoint_base_availability[identity["value"]] = (
+                    event.payload.get("resume_compatible") is True
+                    and identity["value"] in verified_checkpoint_identities
+                )
+        elif event.event_type in {
+            "run_checkpoint_cleanup_pending",
+            "run_checkpoint_cleanup_cancelled",
+            "run_checkpoint_removed",
+        }:
+            identity = event.payload.get("content_identity")
+            if isinstance(identity, Mapping) and isinstance(identity.get("value"), str):
+                identity_value = identity["value"]
+                execution_id = event.payload.get("execution_id")
+                entry_id = event.payload.get("entry_id")
+                if not isinstance(execution_id, str) or not isinstance(entry_id, str):
+                    checkpoint_removed.add(identity_value)
+                    continue
+                key = (execution_id, entry_id)
+                pending = checkpoint_pending.setdefault(identity_value, set())
+                if event.event_type == "run_checkpoint_cleanup_pending":
+                    pending.add(key)
+                elif key not in pending:
+                    checkpoint_removed.add(identity_value)
+                else:
+                    pending.discard(key)
+                    if event.event_type == "run_checkpoint_removed":
+                        checkpoint_removed.add(identity_value)
+    checkpoint_availability = {
+        identity: available
+        and identity not in checkpoint_removed
+        and not checkpoint_pending.get(identity)
+        for identity, available in checkpoint_base_availability.items()
+    }
     terminal = next(
         (
             event.event_type.removeprefix("run_")
@@ -1607,18 +1968,128 @@ def _run_view(run: Run, events: tuple[Any, ...]) -> dict[str, object]:
         elif event.event_type == "run_checkpoint":
             step = event.payload.get("step")
             byte_count = event.payload.get("byte_count")
+            checkpoint_identity = event.payload.get("checkpoint_identity")
             if isinstance(step, int) and not isinstance(step, bool):
                 item["step"] = step
             if isinstance(byte_count, int) and not isinstance(byte_count, bool):
                 item["byte_count"] = byte_count
+            if isinstance(checkpoint_identity, Mapping) and isinstance(
+                checkpoint_identity.get("value"), str
+            ):
+                item["resume_available"] = checkpoint_availability.get(
+                    checkpoint_identity["value"], False
+                )
+        elif event.event_type in {
+            "run_checkpoint_cleanup_pending",
+            "run_checkpoint_cleanup_cancelled",
+            "run_checkpoint_removed",
+        }:
+            item["resume_available"] = event.payload.get("resume_available") is True
         timeline.append(item)
+    checkpoint_events = tuple(
+        event for event in events if event.event_type == "run_checkpoint"
+    )
+    available_checkpoints = sum(
+        1
+        for event in checkpoint_events
+        if isinstance(event.payload.get("checkpoint_identity"), Mapping)
+        and isinstance(event.payload["checkpoint_identity"].get("value"), str)
+        and checkpoint_availability.get(
+            event.payload["checkpoint_identity"]["value"], False
+        )
+    )
     return {
         "reference": record_reference(run).to_dict(),
         "run_id": run.run_id,
         "status": terminal,
         "attempt_number": run.attempt_number,
+        "checkpoint_count": len(checkpoint_events),
+        "resume_available_checkpoint_count": available_checkpoints,
         "events": timeline,
     }
+
+
+def _cleanup_receipt_view(receipt: CleanupReceipt) -> dict[str, object]:
+    return {
+        "schema_version": "v1",
+        "reference": record_reference(receipt).to_dict(),
+        **receipt.to_payload(),
+    }
+
+
+def _experiment_derivation_view(
+    derivation: ExperimentDerivation,
+) -> dict[str, object]:
+    return {
+        "reference": record_reference(derivation).to_dict(),
+        "mode": derivation.reproduction_mode.value,
+        "reason_code": derivation.reason_code,
+        "reason": derivation.reason,
+        "source_experiment": record_reference(derivation.parent_experiment).to_dict(),
+        "derived_experiment": record_reference(derivation.derived_experiment).to_dict(),
+        "source_manifest_identity": {
+            "algorithm": derivation.parent_experiment.manifest_identity.algorithm,
+            "value": derivation.parent_experiment.manifest_identity.value,
+        },
+        "derived_manifest_identity": {
+            "algorithm": derivation.derived_experiment.manifest_identity.algorithm,
+            "value": derivation.derived_experiment.manifest_identity.value,
+        },
+        "manifest_changes": [
+            change.to_dict() for change in derivation.manifest_diff.changes
+        ],
+    }
+
+
+def _replay_execution_views(streams: tuple[Any, ...]) -> list[dict[str, object]]:
+    views: list[dict[str, object]] = []
+    for snapshot in streams:
+        started = next(
+            (
+                event
+                for event in snapshot.events
+                if event.event_type == "replay_execution_started"
+            ),
+            None,
+        )
+        if started is None:
+            continue
+        terminal = next(
+            (
+                event
+                for event in reversed(snapshot.events)
+                if event.event_type
+                in {
+                    "replay_execution_completed",
+                    "replay_execution_cancelled",
+                    "replay_execution_interrupted",
+                    "replay_execution_failed",
+                }
+            ),
+            None,
+        )
+        mode = started.payload.get("mode")
+        run_id = started.payload.get("run_id")
+        plan_id = started.payload.get("plan_id")
+        candidate_key = started.payload.get("candidate_key")
+        views.append(
+            {
+                "mode": mode if isinstance(mode, str) else "unknown",
+                "run_id": run_id if isinstance(run_id, str) else None,
+                "plan_id": plan_id if isinstance(plan_id, str) else None,
+                "candidate_key": (
+                    candidate_key if isinstance(candidate_key, str) else None
+                ),
+                "status": (
+                    str(terminal.payload.get("run_status", "failed"))
+                    if terminal is not None
+                    else "running"
+                ),
+                "exact_reproduction": mode == ReplayMode.STRICT.value,
+                "adapted_reproduction": mode == ReplayMode.ADAPTED.value,
+            }
+        )
+    return views
 
 
 def _stage_view(
@@ -1677,6 +2148,24 @@ def _empty_workspace() -> dict[str, object]:
             "saved_session_count": 0,
             "export_count": 0,
             "deployment_ready": False,
+        },
+        "retention": {
+            "schema_version": "v1",
+            "retention_default": "full",
+            "inventory_identity": None,
+            "entry_count": 0,
+            "logical_bytes": 0,
+            "physical_bytes": 0,
+            "reclaimable_physical_bytes": 0,
+            "byte_classes": {},
+            "entries": [],
+            "active_plan": None,
+            "receipts": [],
+        },
+        "reproduction": {
+            "active_plan": None,
+            "derivations": [],
+            "executions": [],
         },
         "stages": _stage_view(False, False, False, False, False, False),
     }

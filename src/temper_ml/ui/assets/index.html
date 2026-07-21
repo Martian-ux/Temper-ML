@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="temper-csrf" content="{{CSRF_TOKEN}}">
     <title>Temper ML - Local evaluation lab</title>
-    <link rel="stylesheet" href="/assets/app.css?v=dashboard-v1">
-    <script src="/assets/app.js?v=dashboard-v1" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=storage-v6">
+    <script src="/assets/app.js?v=storage-v6" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#primary-workspace">Skip to workspace</a>
@@ -60,6 +60,13 @@
               <button type="button" data-stage="use">
                 <span class="nav-index">06</span>
                 <span class="nav-copy"><strong>Local use</strong><small>Select and export</small></span>
+                <span class="nav-state" aria-hidden="true"></span>
+              </button>
+            </li>
+            <li>
+              <button type="button" data-stage="storage">
+                <span class="nav-index">07</span>
+                <span class="nav-copy"><strong>Storage</strong><small>Cleanup and replay</small></span>
                 <span class="nav-state" aria-hidden="true"></span>
               </button>
             </li>
@@ -362,6 +369,79 @@
                   <small>Export is not deployment readiness.</small>
                 </div>
                 <button class="primary-action" type="button" data-action="export">Verify export</button>
+              </section>
+            </section>
+
+            <section class="stage-panel" data-panel="storage" aria-labelledby="storage-title" hidden>
+              <header class="panel-heading storage-heading">
+                <div>
+                  <p class="eyebrow">07 / Storage and reproduction</p>
+                  <h2 id="storage-title" data-panel-title tabindex="-1">Inspect storage before cleanup.</h2>
+                  <p class="lead">Inspect physical storage, preview every consequence, and reproduce a run without blurring exact replay and adaptation.</p>
+                </div>
+                <span class="stage-state is-complete" data-stage-state="storage">Full retention</span>
+              </header>
+
+              <section class="storage-summary" aria-label="Storage summary">
+                <div><span>Retention</span><strong id="retention-default">Full</strong><small>No implicit cleanup</small></div>
+                <div><span>Logical bytes</span><strong id="storage-logical-bytes">0 B</strong><small>Across every link</small></div>
+                <div><span>Physical bytes</span><strong id="storage-physical-bytes">0 B</strong><small>Shared bytes counted once</small></div>
+                <div><span>Reclaimable</span><strong id="storage-reclaimable-bytes">0 B</strong><small>Deletable heavy objects</small></div>
+              </section>
+
+              <section class="storage-plane" aria-labelledby="inventory-title">
+                <div class="storage-ledger">
+                  <div class="storage-section-heading">
+                    <div>
+                      <p class="card-kicker">Byte inventory</p>
+                      <h3 id="inventory-title">Every local runtime object</h3>
+                    </div>
+                    <span id="storage-entry-count" class="derived-badge">0 objects</span>
+                  </div>
+                  <div class="storage-table-wrap">
+                    <table class="storage-table">
+                      <thead><tr><th scope="col">Select</th><th scope="col">Object</th><th scope="col">Class</th><th scope="col">Size</th><th scope="col">References</th></tr></thead>
+                      <tbody id="storage-entries"></tbody>
+                    </table>
+                  </div>
+                  <div class="cleanup-selection-bar">
+                    <p id="cleanup-selection-summary">Select explicit deletable objects to calculate consequences.</p>
+                    <button type="button" class="primary-action" data-action="cleanup-preview">Preview cleanup</button>
+                  </div>
+                </div>
+
+                <aside class="cleanup-consequence" aria-labelledby="cleanup-plan-title">
+                  <p class="card-kicker">Consequence preview</p>
+                  <h3 id="cleanup-plan-title">Nothing is selected.</h3>
+                  <div id="cleanup-plan-view" class="consequence-body">
+                    <p>Temper will calculate physical bytes freed, retained classes, affected records, and every loss of capability before deletion.</p>
+                  </div>
+                  <label class="confirmation-check"><input id="cleanup-confirmation" type="checkbox"> I reviewed this exact plan and its warnings.</label>
+                  <button type="button" data-action="cleanup-execute">Execute exact plan</button>
+                </aside>
+              </section>
+
+              <section class="replay-plane" aria-labelledby="replay-title">
+                <div class="replay-control">
+                  <p class="card-kicker">Reproduction mode</p>
+                  <h3 id="replay-title">Replay the manifest, or derive visibly.</h3>
+                  <p>Strict replay preserves the original manifest. Adapted reproduction creates a new experiment and an exact manifest diff.</p>
+                  <div class="replay-fields">
+                    <label for="replay-candidate">Candidate</label>
+                    <select id="replay-candidate"><option value="ember">Ember / balanced</option><option value="slate">Slate / capacity</option></select>
+                    <label for="replay-mode">Mode</label>
+                    <select id="replay-mode"><option value="strict_replay">Strict replay</option><option value="adapted_reproduction">Adapted reproduction</option></select>
+                  </div>
+                  <div class="replay-actions">
+                    <button type="button" class="primary-action" data-action="replay-plan">Plan reproduction</button>
+                    <button type="button" data-action="replay-execute">Execute new run</button>
+                  </div>
+                </div>
+                <div id="replay-plan-view" class="manifest-diff">
+                  <p class="card-kicker">Manifest comparison</p>
+                  <h3>No replay planned</h3>
+                  <p>Choose a candidate and mode to compare the source and planned manifests before launch.</p>
+                </div>
               </section>
             </section>
           </main>

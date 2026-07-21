@@ -78,6 +78,12 @@ from temper_ml.domain.records import (
     identity_fields,
     record_reference,
 )
+from temper_ml.domain.retention import (
+    CleanupObjectReceipt,
+    CleanupObjectStatus,
+    CleanupOutcome,
+    CleanupReceipt,
+)
 from temper_ml.domain.runs import EvaluationMode, ResolvedRuntimeRequest, Run
 from temper_ml.domain.tasks import TaskDefinition
 from temper_ml.store.canonical_json import dumps_canonical_json
@@ -498,6 +504,31 @@ def _complete_record_graph() -> tuple[TypedRecord, ...]:
         UserDecisionStatus.SELECTED,
         evaluation_result.evidence_status,
     )
+    cleanup_object = CleanupObjectReceipt(
+        entry_id="entry-cleanup-graph",
+        logical_key="logs/cleanup-graph.log",
+        byte_class="debugging_evidence",
+        byte_count=1,
+        content_identity=_identity("cleanup-object-graph"),
+        status=CleanupObjectStatus.REMOVED,
+        physical_bytes_freed=True,
+        subjects=(),
+    )
+    cleanup_receipt = CleanupReceipt(
+        receipt_id="cleanup-receipt-00000000000000000000000000000000",
+        execution_id="cleanup-execution-00000000000000000000000000000000",
+        project=record_reference(project),
+        inventory_identity=_identity("cleanup-inventory-graph"),
+        plan_identity=_identity("cleanup-plan-graph"),
+        outcome=CleanupOutcome.COMPLETED,
+        selected_entry_ids=(cleanup_object.entry_id,),
+        objects=(cleanup_object,),
+        logical_bytes_removed=1,
+        physical_bytes_freed=1,
+        impact_categories=("debugging_evidence",),
+        affected_subjects=(),
+        availability_updates=(),
+    )
     return (
         dataset,
         task,
@@ -527,6 +558,7 @@ def _complete_record_graph() -> tuple[TypedRecord, ...]:
         recommendation,
         user_decision,
         review,
+        cleanup_receipt,
     )
 
 

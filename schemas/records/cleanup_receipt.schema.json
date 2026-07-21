@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cleanup_receipt.schema.json",
+  "allOf": [
+    {"$ref": "common.schema.json#/$defs/envelope"},
+    {
+      "properties": {
+        "record_type": {"const": "cleanup_receipt"},
+        "payload": {
+          "type": "object",
+          "required": [
+            "receipt_id",
+            "execution_id",
+            "project",
+            "inventory_identity",
+            "plan_identity",
+            "outcome",
+            "selected_entry_ids",
+            "objects",
+            "logical_bytes_removed",
+            "physical_bytes_freed",
+            "impact_categories",
+            "affected_subjects",
+            "availability_updates",
+            "failure_code"
+          ],
+          "properties": {
+            "receipt_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "execution_id": {"$ref": "common.schema.json#/$defs/identifier"},
+            "project": {"$ref": "common.schema.json#/$defs/projectReference"},
+            "inventory_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "plan_identity": {"$ref": "common.schema.json#/$defs/identity"},
+            "outcome": {"enum": ["completed", "partial", "failed"]},
+            "selected_entry_ids": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {"$ref": "common.schema.json#/$defs/identifier"}
+            },
+            "objects": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": [
+                  "entry_id",
+                  "logical_key",
+                  "byte_class",
+                  "byte_count",
+                  "content_identity",
+                  "status",
+                  "physical_bytes_freed",
+                  "subjects"
+                ],
+                "properties": {
+                  "entry_id": {"$ref": "common.schema.json#/$defs/identifier"},
+                  "logical_key": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.?(?:/|$))[^\\\\]+$"},
+                  "byte_class": {"enum": ["checkpoint", "debugging_evidence", "export_bundle", "final_adapter", "runtime_control", "staging_cache", "unknown"]},
+                  "byte_count": {"type": "integer", "minimum": 0},
+                  "content_identity": {"$ref": "common.schema.json#/$defs/identity"},
+                  "status": {"enum": ["removed", "retained", "ambiguous", "failed", "not_attempted"]},
+                  "physical_bytes_freed": {"type": "boolean"},
+                  "subjects": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": {"$ref": "common.schema.json#/$defs/reference"}
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "logical_bytes_removed": {"type": "integer", "minimum": 0},
+            "physical_bytes_freed": {"type": "integer", "minimum": 0},
+            "impact_categories": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"enum": ["cache_convenience", "debugging_evidence", "final_artifact_availability", "inspectability", "resumability", "shared_reference"]}
+            },
+            "affected_subjects": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"$ref": "common.schema.json#/$defs/reference"}
+            },
+            "availability_updates": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"$ref": "common.schema.json#/$defs/artifactAvailabilityReference"}
+            },
+            "failure_code": {
+              "oneOf": [
+                {"type": "null"},
+                {"$ref": "common.schema.json#/$defs/identifier"}
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

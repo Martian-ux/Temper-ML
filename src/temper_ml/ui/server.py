@@ -233,6 +233,43 @@ class TemperUiHandler(BaseHTTPRequestHandler):
             return journey.export_selected(
                 candidate_key=_required_text(body, "candidate_key")
             )
+        if path == "/api/v1/storage/cleanup/preview":
+            _require_fields(body, ("entry_ids",))
+            entry_ids = body.get("entry_ids")
+            if not isinstance(entry_ids, list) or any(
+                not isinstance(entry_id, str) or not entry_id for entry_id in entry_ids
+            ):
+                raise ValueError("entry_ids")
+            return journey.preview_cleanup(tuple(entry_ids))
+        if path == "/api/v1/storage/cleanup/execute":
+            _require_fields(body, ("plan_id", "entry_ids", "confirm"))
+            entry_ids = body.get("entry_ids")
+            if not isinstance(entry_ids, list) or any(
+                not isinstance(entry_id, str) or not entry_id for entry_id in entry_ids
+            ):
+                raise ValueError("entry_ids")
+            confirm = body.get("confirm")
+            if not isinstance(confirm, bool):
+                raise ValueError("confirm")
+            return journey.execute_cleanup(
+                _required_text(body, "plan_id"),
+                confirm=confirm,
+                entry_ids=tuple(entry_ids),
+            )
+        if path == "/api/v1/replays/plan":
+            _require_fields(body, ("candidate_key", "mode"))
+            return journey.prepare_replay(
+                _required_text(body, "candidate_key"),
+                _required_text(body, "mode"),
+            )
+        if path == "/api/v1/replays/execute":
+            _require_fields(body, ("plan_id", "run_id", "candidate_key", "mode"))
+            return journey.execute_replay(
+                _required_text(body, "plan_id"),
+                run_id=_required_text(body, "run_id"),
+                candidate_key=_required_text(body, "candidate_key"),
+                mode=_required_text(body, "mode"),
+            )
         raise ApplicationServiceError("route_not_found")
 
     def _content_length(self) -> int | None:
@@ -357,8 +394,10 @@ def create_ui_server(
             (TemperUiServer,),
             {"address_family": socket.AF_INET6},
         )
+    journey = FixtureJourneyService(project_root)
+    journey.reconcile_pending_operations()
     server = server_type((host, port), TemperUiHandler)
-    server.journey = FixtureJourneyService(project_root)
+    server.journey = journey
     server.csrf_token = secrets.token_urlsafe(32)
     server.public_host = host
     return server

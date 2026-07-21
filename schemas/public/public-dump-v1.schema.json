@@ -107,6 +107,7 @@
         "artifact_availability",
         "base_model_revision",
         "baseline_policy",
+        "cleanup_receipt",
         "compatibility_group",
         "dataset_version",
         "evaluation_result",

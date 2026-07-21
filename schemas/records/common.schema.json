@@ -38,6 +38,7 @@
     "artifactAvailabilityReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "artifact_availability"}}}]},
     "baselinePolicyReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "baseline_policy"}}}]},
     "baseModelRevisionReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "base_model_revision"}}}]},
+    "cleanupReceiptReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "cleanup_receipt"}}}]},
     "compatibilityGroupReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "compatibility_group"}}}]},
     "datasetVersionReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "dataset_version"}}}]},
     "executionTargetReference": {"allOf": [{"$ref": "#/$defs/reference"}, {"properties": {"record_type": {"const": "execution_target"}}}]},

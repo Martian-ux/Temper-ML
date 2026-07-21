@@ -108,6 +108,11 @@ class ReplayPlan:
             value["manifest_diff"] = record_reference(
                 self.derivation.manifest_diff
             ).to_dict()
+            value["manifest_changes"] = [
+                change.to_dict() for change in self.derivation.manifest_diff.changes
+            ]
+        else:
+            value["manifest_changes"] = []
         return value
 
 

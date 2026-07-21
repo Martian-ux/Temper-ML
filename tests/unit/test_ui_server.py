@@ -8,6 +8,11 @@ import pytest
 
 from temper_ml.app_services.errors import ApplicationServiceError
 from temper_ml.ui.server import create_ui_server
+from temper_ml.app_services.reproduction import (
+    ReplayExecutionRequest,
+    ReproductionService,
+)
+from temper_ml.store.evidence import EvidenceError
 
 
 def _request(
@@ -86,6 +91,10 @@ def test_ui_shell_is_local_accessible_and_hardened(ui_server) -> None:
     assert b'id="workflow-steps"' in body
     assert b'id="review-capture-selection"' in body
     assert b"Convert selected review to case" in body
+    assert b"Inspect storage before cleanup" in body
+    assert b'id="storage-entries"' in body
+    assert b'id="cleanup-confirmation"' in body
+    assert b'id="replay-plan-view"' in body
     assert b"general chat" not in body.lower()
     assert b'aria-live="polite"' in body
 
@@ -139,6 +148,153 @@ def test_ui_routes_call_services_and_get_remains_read_only(ui_server) -> None:
     status, _, after = _request(ui_server, "GET", "/api/v1/workspace", origin=False)
     assert status == 200
     assert after != before
+
+
+def test_workspace_get_does_not_reconcile_a_pending_replay(
+    ui_server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journey = ui_server.journey
+    journey.setup_project()
+    journey.import_dataset()
+    journey.resolve_candidates()
+    journey.launch_candidates()
+    prepared = journey.prepare_replay("ember", "strict_replay")
+    draft = journey._replay_draft
+    assert draft is not None
+    service = ReproductionService(journey.project_root)
+    original_append = service.store.append_event
+    failed = False
+
+    def lose_replay_terminal(stream_id: str, event_request: object) -> object:
+        nonlocal failed
+        if (
+            getattr(event_request, "event_type", None) == "replay_execution_completed"
+            and not failed
+        ):
+            failed = True
+            raise EvidenceError("fixture_pending_replay")
+        return original_append(stream_id, event_request)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service.store, "append_event", lose_replay_terminal)
+    with pytest.raises(ApplicationServiceError, match="^fixture_pending_replay$"):
+        service.execute(
+            ReplayExecutionRequest(draft.plan, draft.launch, draft.candidate_key)
+        )
+
+    before = {
+        path.relative_to(journey.project_root): path.read_bytes()
+        for path in (journey.project_root / ".temper").rglob("*")
+        if path.is_file()
+    }
+    status, _, payload = _request(ui_server, "GET", "/api/v1/workspace", origin=False)
+    after = {
+        path.relative_to(journey.project_root): path.read_bytes()
+        for path in (journey.project_root / ".temper").rglob("*")
+        if path.is_file()
+    }
+
+    assert status == 200
+    assert after == before
+    workspace = json.loads(payload)["data"]
+    execution = next(
+        item
+        for item in workspace["reproduction"]["executions"]
+        if item["run_id"] == prepared["run_id"]
+    )
+    assert execution["status"] == "running"
+
+
+def test_retention_and_replay_routes_validate_and_delegate(
+    ui_server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        ui_server.journey,
+        "preview_cleanup",
+        lambda entry_ids: observed.append(("preview", entry_ids)) or {"planned": True},
+    )
+    monkeypatch.setattr(
+        ui_server.journey,
+        "execute_cleanup",
+        lambda plan_id, *, confirm, entry_ids: (
+            observed.append(("cleanup", (plan_id, entry_ids, confirm)))
+            or {"outcome": "completed"}
+        ),
+    )
+    monkeypatch.setattr(
+        ui_server.journey,
+        "prepare_replay",
+        lambda candidate_key, mode: (
+            observed.append(("plan_replay", (candidate_key, mode)))
+            or {"status": "ready"}
+        ),
+    )
+    monkeypatch.setattr(
+        ui_server.journey,
+        "execute_replay",
+        lambda plan_id, *, run_id, candidate_key, mode: (
+            observed.append(("execute_replay", (plan_id, run_id, candidate_key, mode)))
+            or {"status": "completed"}
+        ),
+    )
+
+    requests = (
+        (
+            "/api/v1/storage/cleanup/preview",
+            {"entry_ids": ["entry-one", "entry-two"]},
+        ),
+        (
+            "/api/v1/storage/cleanup/execute",
+            {
+                "plan_id": "cleanup-plan-one",
+                "entry_ids": ["entry-one", "entry-two"],
+                "confirm": True,
+            },
+        ),
+        (
+            "/api/v1/replays/plan",
+            {"candidate_key": "ember", "mode": "strict_replay"},
+        ),
+        (
+            "/api/v1/replays/execute",
+            {
+                "plan_id": "replay-one",
+                "run_id": "run-replay-one",
+                "candidate_key": "ember",
+                "mode": "strict_replay",
+            },
+        ),
+    )
+    for path, body in requests:
+        status, _, payload = _request(ui_server, "POST", path, json.dumps(body))
+        assert status == 200
+        assert json.loads(payload)["ok"] is True
+
+    assert observed == [
+        ("preview", ("entry-one", "entry-two")),
+        ("cleanup", ("cleanup-plan-one", ("entry-one", "entry-two"), True)),
+        ("plan_replay", ("ember", "strict_replay")),
+        (
+            "execute_replay",
+            ("replay-one", "run-replay-one", "ember", "strict_replay"),
+        ),
+    ]
+
+
+def test_storage_script_binds_controls_and_consent_to_exact_plans() -> None:
+    source = (
+        Path(__file__).parents[2] / "src" / "temper_ml" / "ui" / "assets" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "cleanup_selection_plan_mismatch" in source
+    assert "replay_controls_plan_mismatch" in source
+    assert "renderedCleanupPlanKey" in source
+    assert "button, input, select, textarea" in source
+    assert "checkbox.disabled = Boolean(cleanupPlan)" in source
+    assert "replayCandidate.disabled = Boolean(replayPlan)" in source
+    assert "run_id: plan.run_id" in source
 
 
 @pytest.mark.parametrize(
