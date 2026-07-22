@@ -454,7 +454,7 @@ def _verify_config(
     if value.get("runtime_kind") != "library":
         raise ArtifactIntegrityError("artifact_config_mismatch")
     payload_format = value.get("adapter_payload_format")
-    if payload_format not in {"safetensors", "pytorch_bin"}:
+    if payload_format != "safetensors":
         raise ArtifactIntegrityError("artifact_config_invalid")
     versions = value.get("library_versions")
     if not isinstance(versions, Mapping) or any(
