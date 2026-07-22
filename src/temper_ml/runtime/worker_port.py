@@ -138,7 +138,7 @@ class WorkerInvocation:
         }:
             raise WorkerPortError("worker_invocation_invalid")
         if not isinstance(self.settings, InferenceSettings) or (
-            self.adapter_payload_format not in {"safetensors", "pytorch_bin"}
+            self.adapter_payload_format != "safetensors"
         ):
             raise WorkerPortError("worker_invocation_invalid")
 

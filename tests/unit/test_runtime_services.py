@@ -961,6 +961,52 @@ def test_library_runtime_preserves_run_artifact_local_use_and_export_contracts(
     )
 
 
+def test_library_runtime_rejects_unsafe_pytorch_bin_adapter_payload(
+    tmp_path: Path,
+) -> None:
+    foundation, backend, sources, adapter = _library_foundation(tmp_path)
+    with pytest.raises(LibraryRuntimeError, match="library_training_result_invalid"):
+        LibraryTrainingResult(
+            b"synthetic pickle bytes",
+            "pytorch_bin",
+            {"payload_format": "pytorch_bin"},
+            ((1, 1),),
+            (),
+        )
+
+    inference_runtime = LibraryInferenceRuntime(
+        backend, sources, adapter.runtime_identity
+    )
+    adapter_config = {
+        "runtime_kind": "library",
+        "runtime_identity": {
+            "algorithm": adapter.runtime_identity.algorithm,
+            "value": adapter.runtime_identity.value,
+        },
+        "base_model_revision": record_reference(foundation.model).to_dict(),
+        "tokenizer_identity": {
+            "algorithm": sources.tokenizer_identity.algorithm,
+            "value": sources.tokenizer_identity.value,
+        },
+        "library_versions": dict(backend.probe().library_versions),
+        "adapter_payload_format": "pytorch_bin",
+    }
+
+    with pytest.raises(LibraryRuntimeError, match="library_inference_config_invalid"):
+        inference_runtime.infer_verified(
+            FixtureInferenceRequest(
+                b"synthetic pickle bytes",
+                ContentIdentity("sha256", "a" * 64),
+                InferenceSettings(),
+                ({"prompt": "Synthetic unsafe adapter input"},),
+            ),
+            resolution=foundation.resolution,
+            adapter_config=adapter_config,
+            operation=RuntimeOperation.EVALUATE,
+        )
+    assert backend.inference_calls == 0
+
+
 def test_library_runtime_cancellation_interruption_and_recovery_release_resources(
     tmp_path: Path,
 ) -> None:

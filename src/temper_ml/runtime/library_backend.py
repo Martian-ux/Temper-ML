@@ -198,7 +198,7 @@ class LibraryTrainingResult:
                 )
             except RecordValidationError:
                 raise LibraryRuntimeError("library_training_result_invalid") from None
-            if self.adapter_payload_format not in {"safetensors", "pytorch_bin"}:
+            if self.adapter_payload_format != "safetensors":
                 raise LibraryRuntimeError("library_training_result_invalid")
         if self.adapter_config is not None:
             try:
@@ -580,14 +580,12 @@ class TransformersPeftBackend:
             root = Path(directory)
             safetensors = root / "adapter_model.safetensors"
             pytorch_bin = root / "adapter_model.bin"
-            if safetensors.is_file():
-                payload = safetensors.read_bytes()
-                payload_format = "safetensors"
-            elif pytorch_bin.is_file():
-                payload = pytorch_bin.read_bytes()
-                payload_format = "pytorch_bin"
-            else:
+            if not safetensors.is_file():
                 raise LibraryRuntimeError("library_adapter_output_missing")
+            if pytorch_bin.is_file():
+                raise LibraryRuntimeError("library_adapter_output_unsafe")
+            payload = safetensors.read_bytes()
+            payload_format = "safetensors"
         config: dict[str, object] = {
             "peft_type": "lora",
             "task_type": "causal_lm",
@@ -629,6 +627,8 @@ class TransformersPeftBackend:
         _require_local_directory(tokenizer_source, "library_tokenizer_source_invalid")
         if not adapter_payload or not inputs:
             raise LibraryRuntimeError("library_inference_input_invalid")
+        if adapter_payload_format != "safetensors":
+            raise LibraryRuntimeError("library_inference_config_invalid")
         torch = _required_module("torch")
         transformers = _required_module("transformers")
         peft = _required_module("peft")
@@ -664,12 +664,7 @@ class TransformersPeftBackend:
                 json.dumps(config, sort_keys=True, separators=(",", ":")),
                 encoding="utf-8",
             )
-            name = (
-                "adapter_model.safetensors"
-                if adapter_payload_format == "safetensors"
-                else "adapter_model.bin"
-            )
-            (root / name).write_bytes(adapter_payload)
+            (root / "adapter_model.safetensors").write_bytes(adapter_payload)
             model = peft.PeftModel.from_pretrained(model, str(root), is_trainable=False)
             accelerator = accelerate.Accelerator()
             model = accelerator.prepare_model(model, evaluation_mode=True)

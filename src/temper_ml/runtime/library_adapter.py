@@ -793,7 +793,7 @@ class LibraryInferenceRuntime:
         ) != dict(self.capability.library_versions):
             raise LibraryRuntimeError("library_inference_version_mismatch")
         payload_format = adapter_config.get("adapter_payload_format")
-        if not isinstance(payload_format, str):
+        if payload_format != "safetensors":
             raise LibraryRuntimeError("library_inference_config_invalid")
         if operation not in {
             RuntimeOperation.EVALUATE,
