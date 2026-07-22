@@ -244,6 +244,7 @@ class DatasetImportRequest:
     split_rule: SplitRule
     tokenizer: DeterministicTokenizer
     preview_limit: int = 3
+    required_non_empty_splits: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         require_identifier("version_id", self.version_id)
@@ -260,6 +261,23 @@ class DatasetImportRequest:
         if not isinstance(self.split_rule, SplitRule):
             raise RecordValidationError("split_rule must be a SplitRule")
         require_non_negative_int("preview_limit", self.preview_limit)
+        if (
+            not isinstance(self.required_non_empty_splits, tuple)
+            or any(
+                not isinstance(name, str) or not name
+                for name in self.required_non_empty_splits
+            )
+            or len(set(self.required_non_empty_splits))
+            != len(self.required_non_empty_splits)
+        ):
+            raise RecordValidationError(
+                "required_non_empty_splits must contain unique split names"
+            )
+        configured = {part.name for part in self.split_rule.parts}
+        if not set(self.required_non_empty_splits) <= configured:
+            raise RecordValidationError(
+                "required_non_empty_splits must exist in the split rule"
+            )
 
 
 @dataclass(frozen=True)
@@ -550,6 +568,49 @@ class ReimportComparison:
         }
 
 
+@dataclass(frozen=True)
+class DatasetAnalysis:
+    """Bounded public-safe preflight diagnostics for one governed import."""
+
+    source_rows: int
+    accepted_rows: int
+    exclusions: tuple[ExclusionReceipt, ...]
+    split_counts: tuple[SplitCount, ...]
+
+    def to_view(self, *, exclusion_limit: int = 20) -> dict[str, object]:
+        require_non_negative_int("exclusion_limit", exclusion_limit)
+        counts = Counter((item.phase, item.reason_code) for item in self.exclusions)
+        reasons = [
+            {
+                "phase": phase.value,
+                "reason_code": reason,
+                "count": counts[(phase, reason)],
+            }
+            for phase, reason in sorted(
+                counts, key=lambda item: (item[0].value, item[1])
+            )
+        ]
+        return {
+            "source_rows": self.source_rows,
+            "accepted_rows": self.accepted_rows,
+            "excluded_rows": len(self.exclusions),
+            "reason_counts": reasons,
+            "split_counts": [item.to_dict() for item in self.split_counts],
+            "sample_exclusions": [
+                item.to_dict() for item in self.exclusions[:exclusion_limit]
+            ],
+            "sample_exclusions_truncated": len(self.exclusions) > exclusion_limit,
+        }
+
+
+class DatasetPreflightError(ApplicationServiceError):
+    """Stable import failure carrying only value-free bounded diagnostics."""
+
+    def __init__(self, code: str, analysis: DatasetAnalysis) -> None:
+        self.analysis = analysis
+        super().__init__(code)
+
+
 def _require_canonical_value_deltas(
     deltas: tuple[ReimportValueDelta, ...],
     field_order: tuple[str, ...],
@@ -635,8 +696,22 @@ class DatasetService:
         candidates, exclusions = _prepare_candidates(rows, request)
         if _tokenizer_identity(request.tokenizer) != tokenizer_identity:
             raise ApplicationServiceError("tokenizer_nondeterministic")
+        split_counts = _split_counts(request.split_rule.parts, candidates)
+        analysis = DatasetAnalysis(
+            descriptor.row_count,
+            len(candidates),
+            exclusions,
+            split_counts,
+        )
         if not candidates:
-            raise ApplicationServiceError("dataset_has_no_accepted_rows")
+            raise DatasetPreflightError("dataset_has_no_accepted_rows", analysis)
+        empty_required = [
+            item.split
+            for item in split_counts
+            if item.split in request.required_non_empty_splits and item.count == 0
+        ]
+        if empty_required:
+            raise DatasetPreflightError("dataset_required_split_empty", analysis)
         membership = tuple(
             sorted(
                 (
@@ -726,6 +801,24 @@ class DatasetService:
         except (EvidenceError, RecordValidationError, TypeError, ValueError):
             raise ApplicationServiceError("dataset_persistence_failed") from None
         return PreparedDataset(version, rendered_bytes, previews)
+
+    def analyze_source(
+        self, source: ImportedSource, request: DatasetImportRequest
+    ) -> DatasetAnalysis:
+        """Analyze mapping, filtering, and splitting without persisting a version."""
+
+        if not isinstance(source, ImportedSource):
+            raise ApplicationServiceError("dataset_source_invalid")
+        if not isinstance(request, DatasetImportRequest):
+            raise ApplicationServiceError("dataset_request_invalid")
+        descriptor, rows = _verified_imported_source(source)
+        candidates, exclusions = _prepare_candidates(rows, request)
+        return DatasetAnalysis(
+            descriptor.row_count,
+            len(candidates),
+            exclusions,
+            _split_counts(request.split_rule.parts, candidates),
+        )
 
     @staticmethod
     def correction_report(version: DatasetVersion) -> CorrectionReport:
@@ -914,36 +1007,95 @@ def _prepare_candidates(
     return tuple(candidates), tuple(exclusions)
 
 
+def _split_counts(
+    parts: tuple[SplitPart, ...], candidates: tuple[_RenderedCandidate, ...]
+) -> tuple[SplitCount, ...]:
+    return tuple(
+        SplitCount(part.name, sum(item.split == part.name for item in candidates))
+        for part in parts
+    )
+
+
 def _map_row(
     row: Mapping[str, object], mapping: FieldMapping
-) -> tuple[tuple[str, str | None, str] | None, str | None]:
+) -> tuple[
+    tuple[str, str | None, str, str | None, str | None] | None,
+    str | None,
+]:
     required = (mapping.instruction_field, mapping.response_field)
-    optional = (mapping.context_field,) if mapping.context_field is not None else ()
+    optional = tuple(
+        field
+        for field in (
+            mapping.context_field,
+            mapping.cot_field,
+            mapping.output_field,
+        )
+        if field is not None
+    )
     if any(field not in row for field in (*required, *optional)):
         return None, "missing_mapped_field"
     instruction = row[mapping.instruction_field]
     response = row[mapping.response_field]
     context = row[mapping.context_field] if mapping.context_field is not None else None
+    cot = row[mapping.cot_field] if mapping.cot_field is not None else None
+    output = row[mapping.output_field] if mapping.output_field is not None else None
     if not isinstance(instruction, str) or not isinstance(response, str):
         return None, "mapped_value_not_text"
     if context is not None and not isinstance(context, str):
         return None, "mapped_value_not_text"
+    cot_text, cot_error = _mapped_optional_component(cot)
+    if cot_error is not None:
+        return None, cot_error
+    output_text, output_error = _mapped_optional_component(output)
+    if output_error is not None:
+        return None, output_error
     if not instruction.strip() or not response.strip():
         return None, "required_text_empty"
-    return (instruction, context, response), None
+    return (instruction, context, response, cot_text, output_text), None
 
 
-def _render(mapped: tuple[str, str | None, str], renderer: RendererSpec) -> str:
-    if (
-        renderer.kind is not RendererKind.INSTRUCTION_RESPONSE
-        or renderer.version != "v1"
-    ):
+def _mapped_optional_component(value: object) -> tuple[str | None, str | None]:
+    """Render optional trace structures without weakening required text fields."""
+
+    if value is None:
+        return None, None
+    if isinstance(value, str):
+        return value, None
+    try:
+        encoded = _portable_json_bytes(_thaw_source_value(value)).decode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        return None, "mapped_value_not_text_or_json"
+    return encoded.removesuffix("\n"), None
+
+
+def _render(
+    mapped: tuple[str, str | None, str, str | None, str | None],
+    renderer: RendererSpec,
+) -> str:
+    if renderer.version != "v1":
         raise ApplicationServiceError("renderer_unsupported")
-    instruction, context, response = mapped
-    sections = ["### Instruction", instruction]
-    if context:
-        sections.extend(("### Context", context))
-    sections.extend(("### Response", response))
+    instruction, context, response, cot, output = mapped
+    if renderer.kind is RendererKind.INSTRUCTION_RESPONSE:
+        sections = ["### Instruction", instruction]
+        if context:
+            sections.extend(("### Context", context))
+        sections.extend(("### Response", response))
+    elif renderer.kind is RendererKind.TRACE_COMPLETION:
+        sections = ["### Context", instruction]
+        if context:
+            sections.extend(("### Supporting context", context))
+        sections.extend(("### Completion", response))
+    elif renderer.kind is RendererKind.TRACE_COMPONENTS:
+        sections = ["### Context", instruction]
+        if context:
+            sections.extend(("### Supporting context", context))
+        sections.extend(("### Completion", response))
+        if cot:
+            sections.extend(("### Reasoning", cot))
+        if output:
+            sections.extend(("### Output", output))
+    else:
+        raise ApplicationServiceError("renderer_unsupported")
     return "\n".join(sections)
 
 

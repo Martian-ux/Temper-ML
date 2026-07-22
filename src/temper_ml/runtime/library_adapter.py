@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 from threading import RLock
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from temper_ml.domain.artifacts import build_bytes_bundle_manifest
 from temper_ml.domain.datasets import DatasetVersion
@@ -202,6 +202,9 @@ class LibraryAdapter(FixtureAdapter):
         *,
         capability: LibraryCapability | None = None,
         resources: SerializedResourceCoordinator | None = None,
+        cancellation_requested: Callable[[], bool] | None = None,
+        interruption_requested: Callable[[], bool] | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         if not isinstance(backend, LibraryBackend):
             raise LibraryRuntimeError("library_backend_invalid")
@@ -225,6 +228,16 @@ class LibraryAdapter(FixtureAdapter):
         )
         if not isinstance(self.resources, SerializedResourceCoordinator):
             raise LibraryRuntimeError("library_resource_coordinator_invalid")
+        for callback in (
+            cancellation_requested,
+            interruption_requested,
+            progress_callback,
+        ):
+            if callback is not None and not callable(callback):
+                raise LibraryRuntimeError("library_control_callback_invalid")
+        self._cancellation_requested = cancellation_requested or (lambda: False)
+        self._interruption_requested = interruption_requested or (lambda: False)
+        self._progress_callback = progress_callback
         self.resource_names = resource_names
         self._active_run_ids: set[str] = set()
         self._active_run_lock = RLock()
@@ -429,6 +442,8 @@ class LibraryAdapter(FixtureAdapter):
                 },
             )
             logs.append(FixtureLog(len(logs) + 1, "library_step_completed", step))
+            if self._progress_callback is not None:
+                self._progress_callback(step, item.total_steps)
 
         def on_checkpoint(item: LibraryCheckpointPayload) -> None:
             checkpoint = FixtureCheckpoint(
@@ -456,10 +471,16 @@ class LibraryAdapter(FixtureAdapter):
             )
 
         def cancellation_requested() -> bool:
-            return active_control.cancel_after_step == current_step
+            return (
+                active_control.cancel_after_step == current_step
+                or self._cancellation_requested()
+            )
 
         def interruption_requested() -> bool:
-            return active_control.interrupt_after_step == current_step
+            return (
+                active_control.interrupt_after_step == current_step
+                or self._interruption_requested()
+            )
 
         acquired = False
         try:

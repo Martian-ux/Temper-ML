@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import threading
 import time
+from urllib.parse import quote
 
 import pytest
 
@@ -13,6 +14,7 @@ from temper_ml.app_services.reproduction import (
     ReproductionService,
 )
 from temper_ml.store.evidence import EvidenceError
+from temper_ml.runtime.library_backend import LibraryRuntimeError
 
 
 def _request(
@@ -95,6 +97,20 @@ def test_ui_shell_is_local_accessible_and_hardened(ui_server) -> None:
     assert b'id="storage-entries"' in body
     assert b'id="cleanup-confirmation"' in body
     assert b'id="replay-plan-view"' in body
+    assert b'id="mode-banner"' in body
+    assert b"CHOOSE A MODE" in body
+    assert b"Fixture demo" in body
+    assert b"Real local LoRA training" in body
+    assert b'id="dataset-file"' in body
+    assert b"Glint-Research/Fable-5-traces" in body
+    assert b'id="field-cot"' in body
+    assert b'id="field-context" value="prompt"' in body
+    assert b'id="field-completion" value="trace"' in body
+    assert b'id="field-output" value="messages"' in body
+    assert b"Fable-5 <code>pi_agent</code> viewer rows" in body
+    assert b'id="dataset-row-limit" type="number" min="1" max="10000" value="4"' in body
+    assert b'id="dataset-max-tokens" type="number" min="1" value="32768"' in body
+    assert b'id="operation-rail"' in body
     assert b"general chat" not in body.lower()
     assert b'aria-live="polite"' in body
 
@@ -148,6 +164,32 @@ def test_ui_routes_call_services_and_get_remains_read_only(ui_server) -> None:
     status, _, after = _request(ui_server, "GET", "/api/v1/workspace", origin=False)
     assert status == 200
     assert after != before
+
+
+def test_file_import_bypasses_small_json_limit(ui_server, monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    def import_dataset(**kwargs):
+        observed.update(kwargs)
+        return {"imported": True}
+
+    monkeypatch.setattr(ui_server.journey, "import_dataset", import_dataset)
+    body = b"x" * (1024 * 1024 + 1)
+    options = quote(json.dumps({"context_field": "context", "row_limit": 16}))
+    path = f"/api/v1/dataset/import-file?format=jsonl&options={options}"
+    status, _, payload = _request(
+        ui_server,
+        "POST",
+        path,
+        body.decode("ascii"),
+        content_type="application/octet-stream",
+    )
+
+    assert status == 200
+    assert json.loads(payload)["data"]["result"] == {"imported": True}
+    assert observed["source_format"] == "jsonl"
+    assert len(observed["source_bytes"]) == len(body)
+    assert observed["options"] == {"context_field": "context", "row_limit": 16}
 
 
 def test_workspace_get_does_not_reconcile_a_pending_replay(
@@ -295,6 +337,75 @@ def test_storage_script_binds_controls_and_consent_to_exact_plans() -> None:
     assert "checkbox.disabled = Boolean(cleanupPlan)" in source
     assert "replayCandidate.disabled = Boolean(replayPlan)" in source
     assert "run_id: plan.run_id" in source
+
+
+def test_real_ui_contract_uses_explicit_sources_and_hides_fixture_only_controls() -> (
+    None
+):
+    root = Path(__file__).parents[2] / "src" / "temper_ml" / "ui" / "assets"
+    script = (root / "app.js").read_text(encoding="utf-8")
+    document = (root / "index.html").read_text(encoding="utf-8")
+
+    assert "hugging_face_source_mode: huggingFaceMode" in script
+    assert "analysis?.reason_counts?.length" in script
+    assert "Array.isArray(result.candidates)" in script
+    assert "const conflicts = recommendation.conflicts || []" in script
+    assert "dataset.statistics.split_counts || []" in script
+    assert '"Built-in fixture demo rows"' in script
+    assert "new XMLHttpRequest()" in script
+    assert "select.replaceChildren(...choices.map" in script
+    assert "No verified real adapter yet" in script
+    assert 'artifact.artifact_kind === "real_trained_lora_adapter"' in script
+    assert 'fixture && value("dataset-source-kind") === "hugging_face"' in script
+    assert 'data-panel="evaluate" data-fixture-only' in document
+    assert 'data-panel="storage" data-fixture-only' in document
+    assert 'id="hf-source-mode"' in document
+    assert 'id="dataset-analysis"' in document
+
+
+def test_library_runtime_errors_return_action_safe_conflicts(
+    ui_server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_preflight(_options) -> dict[str, object]:
+        raise LibraryRuntimeError("library_transformers_unavailable")
+
+    monkeypatch.setattr(ui_server.journey, "resolve_candidates", fail_preflight)
+    status, _, payload = _request(
+        ui_server,
+        "POST",
+        "/api/v1/candidates/resolve",
+        json.dumps({"options": {}}),
+    )
+
+    assert status == 409
+    assert json.loads(payload) == {
+        "ok": False,
+        "error": {"code": "library_transformers_unavailable"},
+    }
+
+
+def test_file_import_returns_application_service_errors(
+    ui_server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_import(**_values) -> dict[str, object]:
+        raise ApplicationServiceError("dataset_store_unavailable")
+
+    monkeypatch.setattr(ui_server.journey, "import_dataset", fail_import)
+    status, _, payload = _request(
+        ui_server,
+        "POST",
+        "/api/v1/dataset/import-file?format=json&options=%7B%7D",
+        "[]",
+        content_type="application/octet-stream",
+    )
+
+    assert status == 409
+    assert json.loads(payload) == {
+        "ok": False,
+        "error": {"code": "dataset_store_unavailable"},
+    }
 
 
 @pytest.mark.parametrize(

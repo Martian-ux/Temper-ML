@@ -318,6 +318,75 @@ class LibraryBackend(Protocol):
 class TransformersPeftBackend:
     """A local-only LoRA implementation using the supported library stack."""
 
+    def preflight_sources(
+        self, model_source: Path, tokenizer_source: Path
+    ) -> Mapping[str, str]:
+        """Load local metadata/tokenizer without allocating model weights."""
+        _require_local_directory(model_source, "library_model_source_invalid")
+        _require_local_directory(tokenizer_source, "library_tokenizer_source_invalid")
+        transformers = _required_module("transformers")
+        try:
+            config = transformers.AutoConfig.from_pretrained(
+                str(model_source), local_files_only=True, trust_remote_code=False
+            )
+            tokenizer = transformers.AutoTokenizer.from_pretrained(
+                str(tokenizer_source), local_files_only=True, trust_remote_code=False
+            )
+        except Exception:
+            raise LibraryRuntimeError("library_sources_preflight_failed") from None
+        facts = {
+            "model_type": str(getattr(config, "model_type", "unknown")),
+            "tokenizer_class": type(tokenizer).__name__,
+        }
+        if any(not _public_text(value) for value in facts.values()):
+            raise LibraryRuntimeError("library_sources_preflight_failed")
+        return MappingProxyType(facts)
+
+    def preflight_target_modules(
+        self, model_source: Path, target_modules: tuple[str, ...]
+    ) -> Mapping[str, object]:
+        """Load the local architecture and prove every requested LoRA target exists."""
+
+        _require_local_directory(model_source, "library_model_source_invalid")
+        if (
+            not isinstance(target_modules, tuple)
+            or not target_modules
+            or any(not isinstance(item, str) or not item for item in target_modules)
+        ):
+            raise LibraryRuntimeError("library_target_modules_unsupported")
+        transformers = _required_module("transformers")
+        try:
+            model = transformers.AutoModelForCausalLM.from_pretrained(
+                str(model_source),
+                local_files_only=True,
+                trust_remote_code=False,
+                low_cpu_mem_usage=True,
+            )
+            module_names = tuple(name for name, _ in model.named_modules())
+        except Exception:
+            raise LibraryRuntimeError(
+                "library_target_modules_preflight_failed"
+            ) from None
+        finally:
+            if "model" in locals():
+                del model
+        missing = tuple(
+            target
+            for target in target_modules
+            if not any(
+                name == target or name.endswith(f".{target}") for name in module_names
+            )
+        )
+        if missing:
+            raise LibraryRuntimeError("library_target_modules_unsupported")
+        return MappingProxyType(
+            {
+                "status": "verified",
+                "requested_count": len(target_modules),
+                "matched_count": len(target_modules),
+            }
+        )
+
     def probe(self) -> LibraryCapability:
         torch = _required_module("torch")
         _required_module("transformers")
@@ -675,14 +744,15 @@ class TransformersPeftBackend:
             model = accelerator.prepare_model(model, evaluation_mode=True)
             device = accelerator.device
             outputs: list[str] = []
-            generator = torch.Generator(device=device)
-            generator.manual_seed(settings.seed)
+            torch.manual_seed(settings.seed)
+            cuda = getattr(torch, "cuda", None)
+            if cuda is not None and cuda.is_available():
+                cuda.manual_seed_all(settings.seed)
             for text in inputs:
                 encoded = tokenizer(text, return_tensors="pt").to(device)
                 generate_options: dict[str, object] = {
                     "max_new_tokens": settings.maximum_tokens,
                     "do_sample": settings.temperature != 0,
-                    "generator": generator,
                     "pad_token_id": tokenizer.pad_token_id,
                 }
                 if settings.temperature != 0:

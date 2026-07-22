@@ -317,6 +317,7 @@ def _routes_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
             "runtime_observation",
             "declared_route_compliance",
             "experiment",
+            "maintainer_exception",
         )
     )
 
@@ -368,6 +369,83 @@ def _validate_selection_mechanism(value: Any) -> dict[str, Any]:
             f"route selection mechanism requires non-empty {context_field}"
         )
     return mechanism
+
+
+def _validate_route_exception_shape(
+    value: Any, route: dict[str, Any]
+) -> dict[str, Any]:
+    exception = _as_object(value, "route maintainer_exception")
+    if exception.get("actor") != "maintainer" or exception.get("approved") is not True:
+        raise WorkflowError("route exception requires explicit maintainer approval")
+    if exception.get("public_policy_change") is not False:
+        raise WorkflowError("route exception cannot claim a public policy change")
+    if exception.get("precedent") is not False:
+        raise WorkflowError("route exception must be explicitly non-precedential")
+    for name in ("task_key", "exact_base", "authority_reference", "reason"):
+        if not isinstance(exception.get(name), str) or not exception[name]:
+            raise WorkflowError(f"route exception requires non-empty {name}")
+    try:
+        identity = _identity(exception.get("subject"), exception["exact_base"])
+    except WorkflowError:
+        raise WorkflowError(
+            "route exception subject does not match its exact base"
+        ) from None
+    if identity["base"] != exception["exact_base"]:
+        raise WorkflowError("route exception subject does not match its exact base")
+    paths = [
+        normalized_path(path)
+        for path in _as_list(exception.get("owned_paths"), "route exception paths")
+    ]
+    if not paths or len(paths) != len(set(paths)):
+        raise WorkflowError(
+            "route exception paths must be non-empty and duplicate-free"
+        )
+    selection = _as_object(
+        exception.get("authorized_selection"),
+        "route exception authorized_selection",
+    )
+    if set(selection) != {"model", "effort"} or (
+        selection.get("model") != route.get("selected_model")
+        or selection.get("effort") != route.get("selected_effort")
+    ):
+        raise WorkflowError("route exception does not authorize the selected route")
+    return exception
+
+
+def _route_exception_matches_task(task: dict[str, Any]) -> bool:
+    route = task.get("route")
+    if not isinstance(route, dict):
+        return False
+    exception = route.get("maintainer_exception")
+    if not isinstance(exception, dict):
+        return False
+    try:
+        exact_base = task["exact_base"]
+        identity = _identity(task.get("subject"), exact_base)
+        authorization = _as_object(
+            task.get("maintainer_authorization"), "task maintainer_authorization"
+        )
+        normalized_owned_paths = {
+            normalized_path(path)
+            for path in _as_list(task.get("owned_paths"), "owned_paths")
+        }
+        exception_paths = {
+            normalized_path(path)
+            for path in _as_list(exception.get("owned_paths"), "route exception paths")
+        }
+        return (
+            route.get("selected_model") != route.get("declared_model")
+            or route.get("selected_effort") != route.get("declared_effort")
+        ) and (
+            exception.get("task_key") == task.get("task_key")
+            and exception.get("exact_base") == exact_base
+            and _identity(exception.get("subject"), exact_base) == identity
+            and exception_paths == normalized_owned_paths
+            and exception.get("authority_reference")
+            == authorization.get("authority_reference")
+        )
+    except (KeyError, WorkflowError):
+        return False
 
 
 def _has_authoritative_decision(
@@ -508,8 +586,18 @@ def validate_route(route: Any, task_class: str | None = None) -> None:
         raise WorkflowError(
             "selected reasoning effort is required; prompt text is not route evidence"
         )
-    if selected_model != declared_model or selected_effort != declared_effort:
-        raise WorkflowError("selected route does not match the declared route")
+    selection_mismatch = (
+        selected_model != declared_model or selected_effort != declared_effort
+    )
+    exception = route.get("maintainer_exception")
+    if selection_mismatch:
+        if exception is None:
+            raise WorkflowError("selected route does not match the declared route")
+        _validate_route_exception_shape(exception, route)
+    elif exception is not None:
+        raise WorkflowError(
+            "route exception is forbidden when the selected route matches"
+        )
     _validate_selection_mechanism(route.get("selection_mechanism"))
     observation = _as_object(route.get("runtime_observation"), "runtime_observation")
     availability = observation.get("availability")
@@ -591,6 +679,8 @@ def validate_route(route: Any, task_class: str | None = None) -> None:
         raise WorkflowError(
             "non-experimental and observational runs cannot claim predeclaration"
         )
+    if exception is not None and label != "NOT_EXPERIMENT":
+        raise WorkflowError("route exception is forbidden for route experiments")
     if task_class in PUBLIC_ROUTE:
         expected_route, efforts = PUBLIC_ROUTE[task_class]
         if label == "EXPERIMENTAL":
@@ -1026,6 +1116,13 @@ def validate_task(task: Any, *, exact_base: str | None = None) -> dict[str, Any]
         )
     ):
         raise WorkflowError("task maintainer authorization provenance is incomplete")
+    if task["route"].get("maintainer_exception") is not None and not (
+        _route_exception_matches_task(task)
+    ):
+        raise WorkflowError(
+            "route exception is not bound to the task, subject, owned paths, "
+            "authorization, and selected route"
+        )
     result = copy.deepcopy(task)
     result["owned_paths"] = owned_paths
     result["review_triggers"] = triggers
@@ -1479,7 +1576,9 @@ def _activate_root_writer(
 ) -> dict[str, Any]:
     """Activate the root task as the default implementation writer."""
 
-    if task["route"]["declared_route_compliance"] == "FAIL":
+    if task["route"][
+        "declared_route_compliance"
+    ] == "FAIL" and not _route_exception_matches_task(task):
         raise WorkflowError("observed route mismatch blocks implementation")
     key = task["task_key"]
     reference = f"root:{key}"
@@ -2490,6 +2589,8 @@ def _create_dispatch_intent(
     if not writer:
         raise WorkflowError("read-only task class cannot dispatch a writer")
     exception = _require_writer_exception(state, task, record, "subagent")
+    if task["route"].get("maintainer_exception") is not None:
+        raise WorkflowError("route exceptions apply only to the root task")
     if task["route"]["declared_route_compliance"] == "FAIL":
         raise WorkflowError("observed route mismatch blocks implementation")
     if "writer" in record and record["writer"] is not writer:

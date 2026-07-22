@@ -457,6 +457,125 @@ pre,
   min-width: 0;
 }
 
+.mode-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  margin-bottom: 0.8rem;
+  border: 1px solid var(--line-strong);
+  border-left-width: 4px;
+  border-radius: 8px;
+  padding: 0.75rem 0.9rem;
+  background: var(--panel);
+}
+
+.mode-banner strong {
+  flex: none;
+  font-size: 0.67rem;
+  letter-spacing: 0.1em;
+}
+
+.mode-banner span {
+  color: var(--text-soft);
+  font-size: 0.72rem;
+}
+
+.mode-banner.is-demo { border-left-color: var(--amber); }
+.mode-banner.is-demo strong { color: var(--amber); }
+.mode-banner.is-real { border-left-color: var(--green); }
+.mode-banner.is-real strong { color: var(--green); }
+.mode-banner.is-unconfigured { border-left-color: var(--muted-dark); }
+.mode-banner.is-unconfigured strong { color: var(--text-soft); }
+
+.mode-hidden {
+  display: none !important;
+}
+
+.setup-card {
+  padding: 1rem;
+}
+
+.setup-grid,
+.compact-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.setup-grid label,
+.compact-grid label,
+.subform label {
+  display: grid;
+  gap: 0.3rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.wide-field { grid-column: 1 / -1; }
+
+.field-help {
+  margin: 0.8rem 0;
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.subform {
+  display: grid;
+  gap: 0.55rem;
+  border-left: 2px solid var(--violet-bright);
+  padding: 0.65rem;
+  background: rgba(124, 77, 255, 0.04);
+}
+
+.form-stack details {
+  margin: 0;
+}
+
+.compact-grid {
+  margin-top: 0.7rem;
+}
+
+.recipe-controls {
+  border-bottom: 1px solid var(--line);
+  padding: 0.85rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.button-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.operation-rail {
+  display: grid;
+  grid-template-columns: 10px auto minmax(0, 1fr);
+  gap: 0.55rem;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  padding: 0.75rem 1rem;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.operation-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted-dark);
+}
+
+.operation-rail.is-running .operation-dot {
+  background: var(--violet-bright);
+  box-shadow: 0 0 0 4px rgba(124, 77, 255, 0.14);
+  animation: operation-pulse 1.2s ease-in-out infinite;
+}
+
+.operation-rail.is-failed .operation-dot { background: var(--red); }
+
+@keyframes operation-pulse {
+  50% { opacity: 0.45; }
+}
+
 .notice {
   margin-bottom: 0.85rem;
   border: 1px solid rgba(124, 77, 255, 0.35);
@@ -901,14 +1020,52 @@ pre,
   overflow: hidden;
 }
 
-.preview-row {
+.dataset-analysis {
   display: grid;
-  grid-template-columns: 70px 78px minmax(0, 1fr);
-  gap: 0.8rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin-top: 0.8rem;
+}
+
+.analysis-block {
+  display: grid;
+  gap: 0.25rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.7rem;
+  background: rgba(8, 13, 20, 0.56);
+}
+
+.analysis-block strong {
+  color: var(--text-soft);
+  font-size: 0.7rem;
+}
+
+.analysis-block span {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.65rem;
+}
+
+.preview-row {
+  display: block;
+  margin: 0;
   border-bottom: 1px solid var(--line);
+  border-width: 0 0 1px;
+  border-radius: 0;
   padding: 0.72rem;
   color: var(--text-soft);
   font-size: 0.7rem;
+}
+
+.preview-row summary {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  text-transform: uppercase;
+}
+
+.preview-text {
+  max-height: 16rem;
+  white-space: pre-wrap;
 }
 
 .preview-row:last-child {
@@ -1215,6 +1372,10 @@ pre,
   padding: 1rem;
 }
 
+.bounded-output {
+  max-height: 18rem;
+}
+
 .export-row {
   border-bottom: 0;
 }
@@ -1329,6 +1490,7 @@ summary {
 
 pre {
   overflow: auto;
+  max-height: 420px;
   margin: 0.7rem 0 0;
   color: #aab2c1;
   font-family: "SFMono-Regular", Consolas, monospace;
@@ -1871,6 +2033,10 @@ pre {
 }
 
 @media (max-width: 720px) {
+  .dataset-analysis {
+    grid-template-columns: 1fr;
+  }
+
   .app-frame {
     display: block;
   }
@@ -1931,6 +2097,14 @@ pre {
     display: block;
     padding-inline: 0.1rem;
   }
+
+  .setup-grid,
+  .compact-grid,
+  .recipe-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .wide-field { grid-column: 1; }
 
   .panel-heading h2 {
     font-size: 1.75rem;

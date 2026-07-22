@@ -12,18 +12,23 @@ import secrets
 import socket
 import sys
 from typing import Any, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
-from temper_ml.app_services.datasets import DatasetAdapterError
+from temper_ml.app_services.consumer_journey import (
+    ConsumerJourneyError,
+    ConsumerJourneyService,
+)
+from temper_ml.app_services.datasets import DatasetAdapterError, DatasetPreflightError
 from temper_ml.app_services.errors import ApplicationServiceError
-from temper_ml.app_services.fixture_journey import FixtureJourneyService
 from temper_ml.domain.records import RecordValidationError, parse_identity
 from temper_ml.runtime.fixture_inference import FixtureInferenceError
+from temper_ml.runtime.library_backend import LibraryRuntimeError
 from temper_ml.runtime.preflight import PreflightError
 from temper_ml.runtime.recipe_resolution import RecipeResolutionError
 
 
 MAX_REQUEST_BYTES = 1024 * 1024
+MAX_FILE_REQUEST_BYTES = 256 * 1024 * 1024
 REJECT_BODY_DRAIN_TIMEOUT_SECONDS = 0.25
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
 ASSET_TYPES = {
@@ -35,7 +40,7 @@ ASSET_TYPES = {
 class TemperUiServer(HTTPServer):
     """Single-user loopback server with one service-owned journey session."""
 
-    journey: FixtureJourneyService
+    journey: ConsumerJourneyService
     csrf_token: str
     public_host: str
 
@@ -94,6 +99,10 @@ class TemperUiHandler(BaseHTTPRequestHandler):
         ):
             self._reject_post(HTTPStatus.FORBIDDEN, "csrf_token_invalid")
             return
+        path = urlsplit(self.path).path
+        if path == "/api/v1/dataset/import-file":
+            self._import_file()
+            return
         if self.headers.get_content_type() != "application/json":
             self._reject_post(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "content_type_invalid")
             return
@@ -109,16 +118,30 @@ class TemperUiHandler(BaseHTTPRequestHandler):
         if not isinstance(value, dict):
             self._error(HTTPStatus.BAD_REQUEST, "json_body_invalid")
             return
-        path = urlsplit(self.path).path
         try:
             result = self._dispatch(path, value)
             self._success(
                 {"result": result, "workspace": self.server.journey.workspace()}
             )
+        except DatasetPreflightError as exc:
+            self._error(
+                HTTPStatus.CONFLICT,
+                exc.code,
+                {
+                    "analysis": exc.analysis.to_view(),
+                    "action": (
+                        "Adjust field mapping, length policy, or split weights and "
+                        "retry."
+                    ),
+                },
+            )
+        except ConsumerJourneyError as exc:
+            self._error(HTTPStatus.CONFLICT, exc.code, exc.details)
         except (
             ApplicationServiceError,
             DatasetAdapterError,
             FixtureInferenceError,
+            LibraryRuntimeError,
             PreflightError,
             RecipeResolutionError,
         ) as exc:
@@ -133,23 +156,59 @@ class TemperUiHandler(BaseHTTPRequestHandler):
     def _dispatch(self, path: str, body: Mapping[str, Any]) -> dict[str, object]:
         journey = self.server.journey
         if path == "/api/v1/setup":
-            _require_fields(body, ())
-            return journey.setup_project()
+            _allow_fields(
+                body,
+                (
+                    "mode",
+                    "model_source",
+                    "tokenizer_source",
+                    "display_name",
+                    "model_family",
+                    "architecture",
+                    "revision",
+                    "license",
+                    "target",
+                ),
+            )
+            return journey.setup_project(
+                mode=_optional_text(body, "mode", "fixture_demo"),
+                model_source=_optional_nullable_text(body, "model_source"),
+                tokenizer_source=_optional_nullable_text(body, "tokenizer_source"),
+                display_name=_optional_text(body, "display_name", "Local model"),
+                model_family=_optional_text(body, "model_family", "local-causal-lm"),
+                architecture=_optional_text(body, "architecture", "causal-lm"),
+                revision=_optional_text(body, "revision", "local-revision"),
+                license_name=_optional_text(
+                    body, "license", "user-confirmed-local-license"
+                ),
+                target=_optional_text(body, "target", "native_local"),
+            )
         if path == "/api/v1/dataset/import":
-            _allow_fields(body, ("format", "source"))
+            _allow_fields(body, ("format", "source", "options"))
             source_format = _optional_text(body, "format", "fixture")
             source = body.get("source")
             if source is not None and not isinstance(source, str):
                 raise ValueError("source")
+            options = body.get("options", {})
+            if not isinstance(options, Mapping):
+                raise ValueError("options")
             return journey.import_dataset(
-                source_format=source_format, source_text=source
+                source_format=source_format,
+                source_text=source,
+                options=options,
             )
         if path == "/api/v1/candidates/resolve":
-            _require_fields(body, ())
-            return journey.resolve_candidates()
+            _allow_fields(body, ("options",))
+            options = body.get("options", {})
+            if not isinstance(options, Mapping):
+                raise ValueError("options")
+            return journey.resolve_candidates(options)
         if path == "/api/v1/runs/launch":
             _require_fields(body, ())
             return journey.launch_candidates()
+        if path == "/api/v1/runs/cancel":
+            _require_fields(body, ())
+            return journey.cancel_run()
         if path == "/api/v1/playground/compare":
             _allow_fields(body, ("prompt", "maximum_tokens", "seed"))
             return journey.compare(
@@ -272,7 +331,59 @@ class TemperUiHandler(BaseHTTPRequestHandler):
             )
         raise ApplicationServiceError("route_not_found")
 
-    def _content_length(self) -> int | None:
+    def _import_file(self) -> None:
+        if self.headers.get_content_type() != "application/octet-stream":
+            self._reject_post(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "content_type_invalid")
+            return
+        length = self._content_length(maximum=MAX_FILE_REQUEST_BYTES)
+        if length is None:
+            return
+        try:
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            source_format = _query_text(query, "format")
+            options_text = _query_text(query, "options", default="{}")
+            options = json.loads(options_text)
+            if not isinstance(options, dict):
+                raise ValueError("options")
+            data = self.rfile.read(length)
+            if len(data) != length:
+                raise OSError("incomplete request body")
+            result = self.server.journey.import_dataset(
+                source_format=source_format,
+                source_bytes=data,
+                options=options,
+            )
+            self._success(
+                {"result": result, "workspace": self.server.journey.workspace()}
+            )
+        except DatasetPreflightError as exc:
+            self._error(
+                HTTPStatus.CONFLICT,
+                exc.code,
+                {
+                    "analysis": exc.analysis.to_view(),
+                    "action": (
+                        "Adjust field mapping, length policy, or split weights and "
+                        "retry."
+                    ),
+                },
+            )
+        except ConsumerJourneyError as exc:
+            self._error(HTTPStatus.CONFLICT, exc.code, exc.details)
+        except (
+            ApplicationServiceError,
+            DatasetAdapterError,
+            LibraryRuntimeError,
+        ) as exc:
+            self._error(HTTPStatus.CONFLICT, exc.code)
+        except (RecordValidationError, TypeError, ValueError):
+            self._error(HTTPStatus.BAD_REQUEST, "request_invalid")
+        except (OSError, UnicodeError):
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "filesystem_error")
+        except Exception:
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error")
+
+    def _content_length(self, *, maximum: int = MAX_REQUEST_BYTES) -> int | None:
         raw = self.headers.get("Content-Length")
         try:
             length = int(raw) if raw is not None else -1
@@ -281,7 +392,7 @@ class TemperUiHandler(BaseHTTPRequestHandler):
         if length < 0:
             self._error(HTTPStatus.LENGTH_REQUIRED, "content_length_required")
             return None
-        if length > MAX_REQUEST_BYTES:
+        if length > maximum:
             self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request_too_large")
             return None
         return length
@@ -326,8 +437,16 @@ class TemperUiHandler(BaseHTTPRequestHandler):
     def _success(self, data: object) -> None:
         self._json(HTTPStatus.OK, {"ok": True, "data": data})
 
-    def _error(self, status: HTTPStatus, code: str) -> None:
-        self._json(status, {"ok": False, "error": {"code": code}})
+    def _error(
+        self,
+        status: HTTPStatus,
+        code: str,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        error: dict[str, object] = {"code": code}
+        if details:
+            error["details"] = dict(details)
+        self._json(status, {"ok": False, "error": error})
 
     def _json(self, status: HTTPStatus, value: object) -> None:
         payload = json.dumps(
@@ -394,7 +513,7 @@ def create_ui_server(
             (TemperUiServer,),
             {"address_family": socket.AF_INET6},
         )
-    journey = FixtureJourneyService(project_root)
+    journey = ConsumerJourneyService(project_root)
     journey.reconcile_pending_operations()
     server = server_type((host, port), TemperUiHandler)
     server.journey = journey
@@ -452,6 +571,28 @@ def _optional_text(body: Mapping[str, Any], field: str, default: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(field)
     return value
+
+
+def _optional_nullable_text(body: Mapping[str, Any], field: str) -> str | None:
+    value = body.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(field)
+    return value
+
+
+def _query_text(
+    query: Mapping[str, list[str]], field: str, *, default: str | None = None
+) -> str:
+    values = query.get(field)
+    if values is None:
+        if default is None:
+            raise ValueError(field)
+        return default
+    if len(values) != 1 or not values[0]:
+        raise ValueError(field)
+    return values[0]
 
 
 def _optional_int(body: Mapping[str, Any], field: str, default: int) -> int:

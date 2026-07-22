@@ -15,6 +15,17 @@ Route declarations, selection, observation, compliance, and experiment labels ar
 5. Set observation availability to `OBSERVED` only when that telemetry exposes both values. Otherwise set it to `UNAVAILABLE`, keep observed values `UNVERIFIED`, and set declared-route compliance to `UNVERIFIED`.
 6. When observation is available, set compliance to `PASS` for an exact match and `FAIL` for a mismatch. A mismatch blocks the run from being treated as route-compliant.
 
+An exact-task maintainer route exception may authorize a selected-route mismatch
+without rewriting the declared route or its compliance result. The executable
+record must bind the maintainer approval to the task key, exact base, immutable
+subject, complete owned-path set, selected model and effort, and the same
+authority reference as the task authorization. It must include a non-empty
+reason and state both `public_policy_change: false` and `precedent: false`.
+Changing any binding invalidates the exception. Exceptions apply only to the
+bound root task, are forbidden on experiment records, never qualify as matched
+trial evidence, do not authorize a reviewer or additional writer, and do not
+change the default route.
+
 Codex configuration and telemetry receipts are operationally private. Never stage profiles, host metadata, OpenTelemetry endpoints, tokens, raw events, task IDs, or conversation IDs. The supported selection and telemetry surfaces are documented in the [Codex configuration guide](https://learn.chatgpt.com/docs/config-file/config-basic) and [monitoring guidance](https://learn.chatgpt.com/docs/agent-approvals-security#monitoring-and-telemetry).
 
 ## Ultra trial shape
